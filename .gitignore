@@ -1,0 +1,17 @@
+# Captured traffic contains session tokens and account identifiers - never commit it.
+captures/
+*.jsonl
+*.mitm
+
+__pycache__/
+*.pyc
+
+# Account records and sessions hold LF_AC / userToken - never commit them.
+roster/accounts/
+roster/scratch/
+roster/*.json
+id/*.xml
+bot/output/*.xml
+bot/backup/*.xml
+# Frida captures contain the live appSecret and cookies.
+tools/frida/*.capture.txt
