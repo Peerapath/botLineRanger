@@ -6237,15 +6237,21 @@ def playMainStageUp31(end=150, exportID=True):
 # เครื่องมือ API อยู่ที่ ../tools (rangers_api / rewards / gacha / device_session)
 # ยิงตรงไปที่ rangers-api.line-apps.com ด้วย LF_AC ที่อ่านจาก shared_prefs บนเครื่อง
 # ไม่ต้องใช้ proxy และไม่ต้องเปิดเกมค้างไว้ ดู tools/device_session.py สำหรับที่มาของอัลกอริทึม
-TOOLSDIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
+#
+# ราก path ของ tools/ และ roster/: เมื่อ frozen (PyInstaller) โมดูลถูกฝังใน _internal/_MEIPASS
+# แต่ build.bat วาง tools/ และเขียน roster/ ไว้ข้าง exe จึงต้องอิง sys.executable ไม่ใช่ __file__
+if getattr(sys, "frozen", False):
+    _APP_ROOT = os.path.dirname(sys.executable)
+else:
+    _APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOOLSDIR = os.path.join(_APP_ROOT, "tools")
 
 # {unitCode: {"grade": ..., "summonEnergy": ...}} - ข้อมูลกลางของเกม ไม่ใช่ของบัญชีใคร
 # ตัวเดียวกันคนละบัญชีค่าเท่ากันเสมอ จึงไม่ต้องล้างตอนสลับ ID (ต่างจาก LFACCACHE)
 # เก็บลงไฟล์ด้วยเพราะการอ่านสเปกต้องเอาตัวไปวางในทีมทีละ 5 (ดู apiUnitSpecs) บัญชี 227 ตัว
 # ใช้เวลาเกือบ 2 นาที ถ้าไม่เก็บไว้ข้ามโปรเซส ทุกครั้งที่เปิดบอทใหม่จะต้องไล่วางใหม่หมด
 UNITSPECCACHE = {}
-UNITSPECPATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "roster", "unit_specs.json")
+UNITSPECPATH = os.path.join(_APP_ROOT, "roster", "unit_specs.json")
 
 
 UNITSPECLOADED = False

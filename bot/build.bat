@@ -162,6 +162,10 @@ REM copy src + README
 xcopy "src" "dist\BotLineRanger\src" /E /H /C /I /Y >nul
 if exist README.md copy /Y README.md dist\BotLineRanger >nul
 
+REM copy tools/ (API layer: rangers_api/rewards/gacha/device_session imported as loose .py at runtime via sys.path)
+if not exist "dist\BotLineRanger\tools" mkdir "dist\BotLineRanger\tools"
+xcopy "..\tools\*.py" "dist\BotLineRanger\tools\" /C /I /Y >nul
+
 REM clean logs and temp files
 if exist "dist\BotLineRanger\src\log" del /Q "dist\BotLineRanger\src\log\*" 2>nul
 if exist "dist\BotLineRanger\src\image\screen" del /Q "dist\BotLineRanger\src\image\screen\*" 2>nul
