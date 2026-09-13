@@ -1,0 +1,16 @@
+# Core automation / image processing
+pure-python-adb
+uiautomator2
+opencv-python
+numpy
+pytesseract
+
+# GUI
+customtkinter
+
+# Network / updater
+requests
+psutil
+
+# Security / config encryption
+cryptography

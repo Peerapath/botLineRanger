@@ -1,0 +1,293 @@
+@echo off
+setlocal ENABLEDELAYEDEXPANSION
+
+REM ===============================================================================
+REM Enhanced Security Build Script for BotLineRanger
+REM - High security compilation with obfuscation
+REM - URL and sensitive data encryption
+REM - Strip debug symbols and optimize
+REM ===============================================================================
+
+cd /d %~dp0
+title Building BotLineRanger [SECURE MODE]
+
+set ENTRY=main.py
+set ICON=src\image\home\BotLineRanger_128.ico
+set NAME=BotLineRanger
+
+echo.
+echo ===============================================================================
+echo  BotLineRanger - Secure Build Process
+echo ===============================================================================
+echo.
+
+REM ลบ build / dist / cache เก่า
+echo [1/8] Cleaning old builds...
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+if exist __pycache__ rmdir /s /q __pycache__
+timeout /t 1 /nobreak >nul
+
+REM ตรวจสอบว่ามี config_secure.py หรือไม่
+echo [2/8] Checking security configuration...
+if not exist config_secure.py (
+    echo ERROR: config_secure.py not found!
+    echo Please ensure config_secure.py exists before building.
+    pause
+    exit /b 1
+)
+
+REM ====================================
+REM Pre-build: ดึง version และเช็คกับ server
+REM ====================================
+for /f "tokens=*" %%v in ('python get_version.py main.py') do set VERSION=%%v
+echo    - Version: %VERSION%
+
+echo [2.5/8] Checking version on server...
+python server_version.py check %VERSION%
+set CHECK_RESULT=!errorlevel!
+if !CHECK_RESULT! equ 0 (
+    echo.
+    echo    WARNING: Version %VERSION% already exists on server!
+    set /p CONTINUE_BUILD="    Continue build anyway? (Y/N): "
+    if /i "!CONTINUE_BUILD!" neq "Y" (
+        echo Build cancelled by user.
+        pause
+        exit /b 0
+    )
+) else if !CHECK_RESULT! equ 2 (
+    echo.
+    echo    WARNING: Could not reach server to check version.
+    set /p CONTINUE_BUILD="    Continue build without check? (Y/N): "
+    if /i "!CONTINUE_BUILD!" neq "Y" (
+        echo Build cancelled.
+        pause
+        exit /b 1
+    )
+)
+
+echo [3/8] Scanning and excluding unused modules...
+python find_unused_modules.py
+
+REM ===============================
+REM PyArmor Obfuscation
+REM ===============================
+echo [3.5/9] Obfuscating source code with PyArmor...
+
+REM ลบ output เก่าของ PyArmor
+if exist dist_pyarmor rmdir /s /q dist_pyarmor
+
+pyarmor gen --output dist_pyarmor ^
+    main.py botLineRanger.py config_secure.py hwid.py protection.py ADB.py nemu_capture.py
+
+if %errorlevel% neq 0 (
+    echo ERROR: PyArmor obfuscation failed!
+    pause
+    exit /b 1
+)
+echo    - PyArmor obfuscation complete
+echo    - Obfuscated files in dist_pyarmor\
+
+REM โหลด exclude_modules.txt
+set EXCLUDE_ARGS=
+for /f "usebackq delims=" %%m in ("exclude_modules.txt") do (
+    set EXCLUDE_ARGS=!EXCLUDE_ARGS! --exclude-module %%m
+)
+
+echo [4/9] Building main executable with enhanced security...
+echo    - Source: PyArmor obfuscated files (dist_pyarmor\)
+echo    - Optimization level: 0 (numpy compatibility)
+echo    - Symbol stripping: DISABLED (Windows compatibility)
+echo    - UPX compression: ENABLED
+echo    - Traceback: DISABLED
+echo    - Config encryption: ENABLED
+echo.
+
+REM ===============================
+REM Build main .exe with spec file
+REM (PyInstaller reads from dist_pyarmor\ via spec)
+REM ===============================
+pyinstaller ^
+ --clean ^
+ --noconfirm ^
+ BotLineRanger.spec
+
+if %errorlevel% neq 0 (
+    echo ERROR: Main build failed!
+    pause
+    exit /b 1
+)
+
+REM ===============================
+REM Build updater with spec file
+REM ===============================
+echo [5/9] Building updater executable...
+pyinstaller ^
+ --clean ^
+ --noconfirm ^
+ updater.spec
+
+if %errorlevel% neq 0 (
+    echo ERROR: Updater build failed!
+    pause
+    exit /b 1
+)
+
+echo [6/9] Organizing build output...
+
+REM สร้าง main folder ถ้ายังไม่มี
+if not exist "dist\BotLineRanger" mkdir "dist\BotLineRanger"
+
+REM ย้าย BotLineRanger.exe
+if exist "dist\BotLineRanger.exe" (
+    echo    - Moving BotLineRanger.exe
+    move /Y "dist\BotLineRanger.exe" "dist\BotLineRanger\BotLineRanger.exe" >nul
+)
+
+REM ย้าย updater.exe
+if exist "dist\updater.exe" (
+    echo    - Moving updater.exe
+    move /Y "dist\updater.exe" "dist\BotLineRanger\updater.exe" >nul
+)
+
+REM สร้าง sub-folders
+echo    - Creating directory structure
+mkdir "dist\BotLineRanger\input" 2>nul
+mkdir "dist\BotLineRanger\output" 2>nul
+mkdir "dist\BotLineRanger\execute" 2>nul
+mkdir "dist\BotLineRanger\backup" 2>nul
+mkdir "dist\BotLineRanger\login failed" 2>nul
+
+REM copy src + README
+xcopy "src" "dist\BotLineRanger\src" /E /H /C /I /Y >nul
+if exist README.md copy /Y README.md dist\BotLineRanger >nul
+
+REM clean logs and temp files
+if exist "dist\BotLineRanger\src\log" del /Q "dist\BotLineRanger\src\log\*" 2>nul
+if exist "dist\BotLineRanger\src\image\screen" del /Q "dist\BotLineRanger\src\image\screen\*" 2>nul
+
+REM ====================================
+REM Security: Reset sensitive config
+REM ====================================
+echo [7/9] Applying security configurations...
+set "CONFIG_FILE=dist\BotLineRanger\src\config.ini"
+
+if exist "%CONFIG_FILE%" (
+    echo    - Resetting email in config.ini
+    python reset_config.py "%CONFIG_FILE%"
+)
+
+REM อัปเดตเวอร์ชันใน latest_version.json จาก main.py
+echo    - Syncing version from main.py to latest_version.json
+python update_version.py main.py default_config\latest_version.json
+
+REM ลบไฟล์ที่ไม่จำเป็นออกจาก dist เพื่อความปลอดภัย
+echo    - Removing unnecessary files...
+del /Q "dist\BotLineRanger\config_secure.py" 2>nul
+del /Q "dist\BotLineRanger\protection.py" 2>nul
+del /Q "dist\BotLineRanger\*.spec" 2>nul
+
+REM ====================================
+REM Step 8: Create ZIP archives
+REM ====================================
+echo [8/9] Creating ZIP archives...
+
+REM VERSION is already set at the pre-build step
+echo    - Version: %VERSION%
+
+REM ลบ zip เก่า (ถ้ามี)
+if exist "dist\BotLineRanger.zip" del /Q "dist\BotLineRanger.zip"
+if exist "dist\BotLineRanger_%VERSION%.zip" del /Q "dist\BotLineRanger_%VERSION%.zip"
+
+REM สร้าง zip ใหม่
+echo    - Creating BotLineRanger.zip
+powershell -Command "Compress-Archive -Path 'dist\BotLineRanger\*' -DestinationPath 'dist\BotLineRanger.zip' -Force"
+
+echo    - Creating BotLineRanger_%VERSION%.zip
+powershell -Command "Compress-Archive -Path 'dist\BotLineRanger\*' -DestinationPath 'dist\BotLineRanger_%VERSION%.zip' -Force"
+
+REM คัดลอกไฟล์ zip ไปยังโฟลเดอร์ Version
+echo    - Copying BotLineRanger_%VERSION%.zip to Version folder
+if not exist "Version" mkdir "Version"
+copy "dist\BotLineRanger_%VERSION%.zip" "Version\" /Y
+
+REM ====================================
+REM Step 8.5: Compute EXE Checksum
+REM ====================================
+echo.
+echo [8.5] Computing EXE SHA-256 checksum for server registration...
+echo -------------------------------------------------------------------------------
+certutil -hashfile "dist\BotLineRanger\BotLineRanger.exe" SHA256
+echo -------------------------------------------------------------------------------
+
+REM ดึง hash จาก certutil (findstr ตัดบรรทัดที่มี ':' ออก เหลือเฉพาะ hash)
+set "EXE_HASH="
+for /f "tokens=*" %%h in ('certutil -hashfile "dist\BotLineRanger\BotLineRanger.exe" SHA256 ^| findstr /v ":"') do (
+    if not defined EXE_HASH set "EXE_HASH=%%h"
+)
+set "EXE_HASH=!EXE_HASH: =!"
+echo    - EXE Hash: !EXE_HASH!
+
+echo.
+set /p UPLOAD_HASH="Upload version %VERSION% + exe_hash to server? (Y/N): "
+if /i "!UPLOAD_HASH!"=="Y" (
+    python server_version.py register %VERSION% !EXE_HASH!
+    set REG_RESULT=!errorlevel!
+    if !REG_RESULT! equ 0 (
+        echo    [OK] Version + exe_hash registered on server.
+    ) else if !REG_RESULT! equ 1 (
+        echo.
+        echo    Version %VERSION% already exists on server.
+        set /p OVERWRITE="    Overwrite existing exe_hash? (Y/N): "
+        if /i "!OVERWRITE!"=="Y" (
+            python server_version.py update %VERSION% !EXE_HASH!
+            if !errorlevel! equ 0 (
+                echo    [OK] exe_hash updated on server.
+            ) else (
+                echo    [ERROR] Failed to update exe_hash.
+            )
+        ) else (
+            echo    Skipped upload.
+        )
+    ) else (
+        echo    [ERROR] Failed to register version. You can upload manually via /exe-versions page.
+    )
+) else (
+    echo    Skipped server upload. You can upload manually via /exe-versions page later.
+)
+
+echo.
+echo ===============================================================================
+echo  Build Completed Successfully!
+echo ===============================================================================
+echo.
+echo Security Features Applied:
+echo  [x] Fernet AES encryption for URLs and secrets
+echo  [x] HMAC-SHA256 signed API requests
+echo  [x] JWT session tokens (15 min expiry)
+echo  [x] Hardware ID (HWID) binding
+echo  [x] Challenge-response authentication
+echo  [x] 5-minute heartbeat with strict failure policy
+echo  [x] Anti-debugging detection (IsDebuggerPresent, NtQuery, timing)
+echo  [x] Anti-RE tool detection (process and window scanning)
+echo  [x] Module integrity and function tamper detection
+echo  [x] Background protection guard (2-minute interval)
+echo  [x] Python bytecode optimization (level 0 - numpy compatible)
+echo  [x] UPX compression enabled
+echo  [x] Traceback disabled
+echo  [x] Sensitive config reset
+echo  [x] Unnecessary modules excluded
+echo  [x] Version synced to latest_version.json
+echo  [x] ZIP archives created
+echo  [x] PyArmor obfuscation (Basic license)
+echo.
+echo Output:
+echo  - dist\BotLineRanger\
+echo  - dist\BotLineRanger.zip
+echo  - dist\BotLineRanger_%VERSION%.zip
+echo.
+echo WARNING: This is a secured build. Reverse engineering is difficult but
+echo          not impossible. Keep your source code and keys private!
+echo.
+echo ===============================================================================
+pause

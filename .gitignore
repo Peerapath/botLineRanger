@@ -15,3 +15,6 @@ bot/output/*.xml
 bot/backup/*.xml
 # Frida captures contain the live appSecret and cookies.
 tools/frida/*.capture.txt
+
+# Build-time secret tool: holds plaintext master_password/api_url. Keep local only.
+bot/encrypt_config.py
