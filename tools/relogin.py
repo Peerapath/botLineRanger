@@ -18,7 +18,9 @@ import html
 import os
 import re
 import secrets
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -189,3 +191,64 @@ def iter_targets(root, done, force, limit):
         if limit is not None and len(out) >= limit:
             break
     return out
+
+
+def atomic_write(full_path, text):
+    d = os.path.dirname(full_path)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        os.replace(tmp, full_path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def backup_once(full_path, root, backup_root):
+    rel = os.path.relpath(full_path, root)
+    dest = os.path.join(backup_root, rel)
+    if os.path.exists(dest):
+        return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(full_path, dest)
+
+
+def process_file(full_path, root, pool, backup_root):
+    rel = os.path.relpath(full_path, root).replace("\\", "/")
+    try:
+        acct = read_account(full_path)
+    except (BadFile, OSError):
+        return {"rel": rel, "status": "bad_file", "rsn": "", "level": ""}
+    try:
+        guest_cookie = decrypt_lfac(acct["udid"], acct["enc"])
+    except Exception:
+        return {"rel": rel, "status": "bad_file", "rsn": "", "level": ""}
+
+    cc = pool.get()
+    try:
+        status, result, lf_ac = login(cc, acct["udid"], guest_cookie, acct["nation"], acct["language"])
+        if status == 401 and not result:
+            if pool.is_proven():
+                return {"rel": rel, "status": "rejected", "rsn": "", "level": ""}
+            cc = pool.renew(cc)
+            status, result, lf_ac = login(cc, acct["udid"], guest_cookie, acct["nation"], acct["language"])
+            if status == 401 and not result:
+                return {"rel": rel, "status": "rejected", "rsn": "", "level": ""}
+    except Transient:
+        return {"rel": rel, "status": "error", "rsn": "", "level": ""}
+    if not result or not lf_ac:
+        return {"rel": rel, "status": "error", "rsn": "", "level": ""}
+
+    pool.mark_proven()
+    backup_once(full_path, root, backup_root)
+    new_text = replace_enc(acct["text"], acct["udid"], lf_ac)
+    atomic_write(full_path, new_text)
+    # ตรวจซ้ำ: ถอดจากไฟล์ที่เขียนแล้วต้องได้ lf_ac เดิม ไม่ตรง = คืนข้อความเดิม
+    check = read_account(full_path)
+    if decrypt_lfac(check["udid"], check["enc"]) != lf_ac:
+        atomic_write(full_path, acct["text"])
+        return {"rel": rel, "status": "error", "rsn": "", "level": ""}
+    return {"rel": rel, "status": "ok",
+            "rsn": result.get("rsn", ""), "level": result.get("level", "")}

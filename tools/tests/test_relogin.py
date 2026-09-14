@@ -154,3 +154,70 @@ def test_iter_targets_skips_ok_unless_force(tmp_path):
 def test_parse_log_missing_file_returns_empty(tmp_path):
     missing = str(tmp_path / "nope.csv")
     assert relogin.parse_log(missing) == {}
+
+
+def _write_guest_xml(path, udid, lf_ac):
+    import account_file
+    path.write_text(account_file.build_pref_xml(lf_ac, udid, "TH", "en"),
+                    encoding="utf-8")
+
+
+def test_process_file_ok_overwrites_and_backs_up(tmp_path, monkeypatch):
+    import account_file
+    udid = account_file.new_udid()
+    src = tmp_path / "acc" / "a.xml"
+    src.parent.mkdir()
+    _write_guest_xml(src, udid, "OLD-DEAD-LFAC")
+    original = src.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(relogin, "login",
+        lambda cc, u, gc, nation, language="en": (200, {"rsn": "111", "level": 3}, "FRESH-LFAC-VALUE"))
+
+    class DummyPool:
+        def get(self): return "ccval"
+        def is_proven(self): return True
+        def mark_proven(self): pass
+        def renew(self, old): return "cc2"
+
+    backup = tmp_path / "acc_backup"
+    res = relogin.process_file(str(src), str(tmp_path / "acc"), DummyPool(), str(backup))
+    assert res["status"] == "ok" and res["rsn"] == "111" and res["level"] == 3
+    # ไฟล์ถูกเขียนโทเค็นใหม่ (ถอดได้ FRESH-LFAC-VALUE)
+    from device_session import decrypt_lfac
+    acct = relogin.read_account(str(src))
+    assert decrypt_lfac(acct["udid"], acct["enc"]) == "FRESH-LFAC-VALUE"
+    # ไฟล์สำรอง = ต้นฉบับเป๊ะ
+    assert (backup / "a.xml").read_text(encoding="utf-8") == original
+
+
+def test_process_file_rejected_when_401_and_cc_proven(tmp_path, monkeypatch):
+    import account_file
+    udid = account_file.new_udid()
+    src = tmp_path / "acc" / "b.xml"
+    src.parent.mkdir()
+    _write_guest_xml(src, udid, "OLD")
+    before = src.read_text(encoding="utf-8")
+    monkeypatch.setattr(relogin, "login",
+        lambda *a, **k: (401, None, None))
+
+    class ProvenPool:
+        def get(self): return "cc"
+        def is_proven(self): return True
+        def renew(self, old): raise AssertionError("must not renew when proven")
+        def mark_proven(self): pass
+
+    res = relogin.process_file(str(src), str(tmp_path / "acc"), ProvenPool(), str(tmp_path / "b_backup"))
+    assert res["status"] == "rejected"
+    assert src.read_text(encoding="utf-8") == before   # ไฟล์ไม่ถูกแตะ
+
+
+def test_process_file_bad_file(tmp_path):
+    src = tmp_path / "acc" / "c.xml"
+    src.parent.mkdir()
+    src.write_text("<map></map>", encoding="utf-8")
+
+    class P:
+        def get(self): return "cc"
+        def is_proven(self): return True
+    res = relogin.process_file(str(src), str(tmp_path / "acc"), P(), str(tmp_path / "bk"))
+    assert res["status"] == "bad_file"
