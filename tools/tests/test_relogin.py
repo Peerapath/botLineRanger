@@ -273,3 +273,28 @@ def test_stop_tracker_ok_resets_rejected_streak():
     for _ in range(9):
         assert t.record("rejected") is None
     assert t.record("rejected") == "maintenance"  # ครบ 10 อีกรอบ
+
+
+def test_run_logs_error_when_process_file_raises(tmp_path, monkeypatch):
+    root = tmp_path / "acc"
+    root.mkdir()
+    (root / "a.xml").write_text("x", encoding="utf-8")
+
+    class DummyPool:
+        def get(self): return "cc"
+        def is_proven(self): return True
+        def mark_proven(self): pass
+        def renew(self, old): return "cc2"
+
+    monkeypatch.setattr(relogin, "CcPool", lambda: DummyPool())
+
+    def boom(*a, **k):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(relogin, "process_file", boom)
+    counts = relogin.run(str(root), workers=1, limit=None, force=False)
+    assert counts.get("error") == 1
+    import csv as _csv
+    with open(str(root) + ".relogin.csv", encoding="utf-8", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert rows and rows[0]["status"] == "error"

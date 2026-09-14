@@ -327,13 +327,20 @@ def run(root, workers, limit, force):
     def worker(path):
         if stop_reason[0]:
             return None
-        res = process_file(path, root, pool, backup_root)
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        try:
+            res = process_file(path, root, pool, backup_root)
+        except Exception:
+            res = {"rel": rel, "status": "error", "rsn": "", "level": ""}
         with log_lock:
             counts[res["status"]] = counts.get(res["status"], 0) + 1
-            writer.writerow([res["rel"], res["status"], res["rsn"], res["level"],
-                             time.strftime("%Y-%m-%dT%H:%M:%S")])
-            log_fh.flush()
             done_n[0] += 1
+            try:
+                writer.writerow([res["rel"], res["status"], res["rsn"], res["level"],
+                                 time.strftime("%Y-%m-%dT%H:%M:%S")])
+                log_fh.flush()
+            except Exception:
+                pass
             if done_n[0] % 100 == 0:
                 print("[%d/%d] %s" % (done_n[0], total, _fmt_summary(counts)))
         reason = tracker.record(res["status"])
@@ -344,10 +351,12 @@ def run(root, workers, limit, force):
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(worker, p) for p in targets]
+            cancelled = False
             for _ in concurrent.futures.as_completed(futures):
-                if stop_reason[0]:
+                if stop_reason[0] and not cancelled:
                     for f in futures:
                         f.cancel()
+                    cancelled = True
     finally:
         log_fh.close()
 
