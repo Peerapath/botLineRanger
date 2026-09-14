@@ -16,12 +16,17 @@ Flow (each new random deviceId = a new account):
                                            -> a fresh userToken; this is the `cc` cookie
                                               (/auth/v3.0/token is DELETE-only - it revokes)
   5. GET  /auth/v3.5/authorization         signed, X-Linegame-UserToken -> signedIn
-  6. GET  /v12.3/login                     Cookie: cc=...; udid=...;
-                                           -> uid/mid/rsn + Set-Cookie: LF_AC (game session)
+  6. GET  /v12.3/signup/platform           Cookie: cc=...; udid=...;, LF_AC=; udid=...;
+                                           -> CREATES the rangers player: uid/mid/rsn +
+                                              starter ruby/coin/level + Set-Cookie: LF_AC
 
-Step 6 is GET (POST returns 405) and its cookie jar matters: `udid` is the game's own
-device uuid (the same value that becomes _DEVICE_UUID_KEY on disk) and, for an account
-that already has a session, `guestCookie` = the first 16 chars of the previous LF_AC.
+Step 6 is the fresh-account create call. A brand-new guest has no rangers player yet, so
+GET /v12.3/login returns 401 (that endpoint is for RETURNING users - it needs a prior
+session as the continuity credential; see tools/relogin.py). /signup/platform is what the
+native client actually hits on first login: not certificate-pinned, no X-LINEGAME-APPSECRET,
+just the cc+udid cookie jar with an empty LF_AC to signal "no session yet". `udid` is the
+game's own device uuid (the value that becomes _DEVICE_UUID_KEY on disk). Verified live
+2026-09-14: fresh guest -> HTTP 200, isNew=true, level 1, ruby 20, coin 500, LF_AC returned.
 
 Two files come out per account:
   roster/accounts/account-<gameId>-<dev>.json   deviceId, udid, refreshUserToken, uid,
@@ -74,8 +79,8 @@ LANG = "en"
 # Device fingerprint copied from a real client. The DeviceId is randomised per
 # account; the rest only has to look like a plausible install.
 UA_SDK = "android;12;V417IR;GOOGLEPLAY;en"
-UA_GAME = "LGRGS/12.2.4 (Linux; U; Android 12; en-US; ASUSAI2501B Build/V417IR)"
-APP_VERSION = "LGRGS/12.2.4;android/12"
+UA_GAME = "LGRGS/12.3.0 (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)"
+APP_VERSION = "LGRGS/12.3.0;android/12"
 
 # Terms the server currently requires. If these fall out of date the auth step
 # returns the up-to-date list in its error body - copy it back in here.
@@ -278,9 +283,65 @@ def game_login(cc: str, udid: str, guest_cookie: str | None = None) -> dict:
             "lf_ac": lf_ac, "tutorialStep": result.get("tutorialStep"), "cc": cc}
 
 
+def signup_platform(cc: str, udid: str, user_type: str = "LINE") -> dict | None:
+    """GET /v12.3/signup/platform - creates the rangers PLAYER for a brand-new guest.
+
+    This is the endpoint the native client hits on a genuine first login (a fresh guest
+    has no player yet, so /v12.3/login returns 401). It is NOT certificate-pinned and
+    carries no X-LINEGAME-APPSECRET: the same cc+udid cookie jar as a relogin, plus an
+    empty LF_AC to signal "no session yet". Response body already includes the starter
+    ruby/coin/level and a Set-Cookie: LF_AC for every subsequent authenticated call.
+    Verified live 2026-09-14: fresh guest -> HTTP 200, isNew=true, level 1, ruby 20.
+    """
+    cookie = "cc=%s; udid=%s;, LF_AC=; udid=%s;" % (cc, udid, udid)
+    ts_ms = str(int(time.time() * 1000))
+    headers = {
+        "App-Version": APP_VERSION,
+        "userType": user_type,
+        "Nation-Code": NATION,
+        "Accept-Language": LANG,
+        "User-Agent": UA_GAME,
+        "marketId": "",
+        "useLGC": "true",
+        "X-LINEGAME-MCC": "000",
+        "X-LINEGAME-MNC": "00",
+        "X-LINEGAME-TIMESTAMP": ts_ms,
+        "Host": RANGERS_HOST,
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip",
+        "Cookie": cookie,
+    }
+    req = urllib.request.Request("https://" + RANGERS_HOST + "/v12.3/signup/platform",
+                                 headers=headers, method="GET")
+    st, res, cookies = _do(req)
+    lf_ac = _cookie_value(cookies, "LF_AC")
+    if not isinstance(res, dict) or "result" not in res:
+        print("  signup    : FAILED HTTP %s %s" % (st, json.dumps(res, ensure_ascii=False)[:200]))
+        return None
+    result = res["result"]
+    ruby = (result.get("ruby") or {}).get("total")
+    coin = (result.get("coin") or {}).get("total")
+    print("  signup    : HTTP %s  uid=%s mid=%s rsn=%s isNew=%s level=%s ruby=%s coin=%s" % (
+        st, result.get("id"), result.get("mid"), result.get("rsn"),
+        result.get("isNew"), result.get("level"), ruby, coin))
+    return {"uid": result.get("id"), "mid": result.get("mid"), "rsn": result.get("rsn"),
+            "lf_ac": lf_ac, "tutorialStep": result.get("tutorialStep"), "cc": cc,
+            "level": result.get("level"), "ruby": ruby, "coin": coin,
+            "isNew": result.get("isNew")}
+
+
 def exchange_and_login(device_id: str, guest: dict, udid: str) -> dict | None:
+    """Fresh guest: refresh -> authorize -> SIGN UP (create the player, get LF_AC).
+
+    A brand-new guest has no rangers player, so the create call is /signup/platform, not
+    /login (which is for returning users and 401s here). If signup ever reports the player
+    already exists, fall back to /login so a re-run of an already-created account still works.
+    """
     cc = refresh_token(device_id, guest["refreshUserToken"])
     authorize(device_id, cc)
+    session = signup_platform(cc, udid)
+    if session:
+        return session
     return game_login(cc, udid)
 
 
@@ -387,7 +448,8 @@ def resume_pending(write_xml_dir=None):
         except SystemExit as err:
             print("  %s" % err)
             continue
-        session = game_login(cc, acct["udid"])
+        authorize(acct["deviceId"], cc)
+        session = signup_platform(cc, acct["udid"]) or game_login(cc, acct["udid"])
         if session:
             done.append(_finish(acct, session, write_xml_dir))
     print("completed %d/%d" % (len(done), len(pending)))

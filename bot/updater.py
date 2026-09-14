@@ -17,7 +17,7 @@ else:
 TEMP_FILE = os.path.join(APP_DIR, "update.zip")
 
 # 👉 URL Release zip จาก GitHub
-DOWNLOAD_URL = "https://github.com/Peerapath/BotLineRanger/releases/latest/download/BotLineRanger.zip"
+DOWNLOAD_URL = "https://github.com/Peerapath/botLineRanger/releases/download/a0.0.1/BotLineRanger.zip"
 
 CONFIG_URL = "https://raw.githubusercontent.com/Peerapath/BotLineRanger/refs/heads/main/config.ini"
 CONFIG_PATH = os.path.join(APP_DIR, "src", "config.ini")

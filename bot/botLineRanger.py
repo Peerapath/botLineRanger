@@ -1,9 +1,15 @@
 # botLineRanger.py
+# จำกัด thread pool ของ OpenBLAS/OMP ก่อน import numpy/cv2 (ทั้งคู่ลิงก์ OpenBLAS)
+# สำคัญมากตอนรัน headless หลายร้อย/พันโปรเซส: ดีฟอลต์ OpenBLAS จอง thread = จำนวน core (เช่น 28)
+# ต่อทุกโปรเซส -> 1024 โปรเซส x 28 thread = หมื่นกว่า thread + buffer -> OOM
+# ("OpenBLAS error: Memory allocation still failed"). งาน headless ไม่ใช้ BLAS เลย 1 thread พอ
+import os
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_MAIN_FREE"):
+    os.environ.setdefault(_v, "1")
+
 from datetime import datetime
 from ppadb.client import Client as AdbClient
-import cv2
-import numpy as np
-import os
 from time import sleep
 import time
 import configparser
@@ -16,13 +22,51 @@ import sys
 import html
 import json
 import random
-import pytesseract
 import difflib
-import uiautomator2 as u2
 import atexit
-import nemu_capture
-import main as mai
-pytesseract.pytesseract.tesseract_cmd = r"src\Tesseract-OCR\tesseract.exe"
+import importlib
+from bot_version import CURRENT_VERSION   # แทน 'import main as mai' เดิม (เลี่ยง customtkinter ใน worker)
+
+
+class _LazyModule:
+    """โหลดโมดูลจริงตอนถูกใช้ครั้งแรก (attribute access) ไม่ใช่ตอน import
+
+    cv2/numpy/pytesseract/nemu_capture ลิงก์ OpenBLAS (จอง thread pool = จำนวน core ต่อโปรเซส)
+    และกินแรม ~47MB/โปรเซส งาน headless (login/relogin/API) ไม่แตะรูปภาพเลยจึงไม่ควรโหลดมันมา
+    เมื่อรันหลายร้อย/พันโปรเซส proxy นี้ทำให้ headless worker ไม่โหลด lib พวกนี้ = ไม่มี OpenBLAS
+    ส่วน device flow (จับภาพ/OCR/หา template) ใช้เหมือนเดิมทุกอย่าง โหลดตอนเรียกใช้ครั้งแรกเอง
+    """
+    def __init__(self, name, on_load=None):
+        object.__setattr__(self, "_lm_name", name)
+        object.__setattr__(self, "_lm_on_load", on_load)
+        object.__setattr__(self, "_lm_mod", None)
+
+    def _lm_load(self):
+        mod = object.__getattribute__(self, "_lm_mod")
+        if mod is None:
+            mod = importlib.import_module(object.__getattribute__(self, "_lm_name"))
+            object.__setattr__(self, "_lm_mod", mod)
+            cb = object.__getattribute__(self, "_lm_on_load")
+            if cb:
+                cb(mod)
+        return mod
+
+    def __getattr__(self, attr):        # เรียกเฉพาะตอนหา attr ไม่เจอ = ครั้งแรกที่ใช้จริง
+        return getattr(self._lm_load(), attr)
+
+    def __setattr__(self, attr, value):
+        setattr(self._lm_load(), attr, value)
+
+
+def _cfg_tesseract(mod):
+    mod.pytesseract.tesseract_cmd = r"src\Tesseract-OCR\tesseract.exe"
+
+
+cv2 = _LazyModule("cv2")
+np = _LazyModule("numpy")
+pytesseract = _LazyModule("pytesseract", _cfg_tesseract)
+nemu_capture = _LazyModule("nemu_capture")
+u2 = _LazyModule("uiautomator2")   # 24MB - ใช้เฉพาะ device flow (tap) headless ไม่แตะ = ไม่โหลด
 
 
 ####################################################### function ########################################################
@@ -83,6 +127,8 @@ HIGHERSTAGE = 0
 RANGERSCONFIG = {}
 LFACCACHE = None            # LF_AC ของ session ปัจจุบัน ล้างทิ้งใน force_stop_LINE_Rangers()
 IMPORTEDENCLFAC = None      # _ENC_LF_AC_KEY ของไฟล์ที่ import เข้าเครื่อง = token เก่า ห้ามเอาไปยิง API
+HEADLESS = False            # True = โหมด headless แท้: mint LF_AC เองจากไฟล์ ไม่แตะ device/เกม
+_HEADLESSCCPOOL = None      # guest cc (relogin.CcPool) mint ครั้งเดียวใช้ทั้งรอบ renew ตอนโดน 401
 LASTGACHASTATUS = ""        # ผลกาชารอบล่าสุด ใช้เขียนลง log สรุป session
 GEARS = {}
 
@@ -207,7 +253,7 @@ class Region:
 
 
 def setUp(deviceSerial):
-    print(f"========= Setup And Config v{mai.CURRENT_VERSION} =========")
+    print(f"========= Setup And Config v{CURRENT_VERSION} =========")
     global GACHARANGER, GACHARANGERGROUP, TAP_DURATION, RBTKPOSITION, UPDATERBTK, RBTK, DEVICE, DEVICESERIAL, STAGEEND, AUTOUSEITEM, \
         CHANGEID, AUTOMODE, LOSTCOUNT, GIFTBOX, BUYFRIEND, HIGHERSTAGE, RANGERSCONFIG, GEARS, \
         RANGERINTEAM, MAXMINERALCOST, CLOSEPOPUP, RSELCTIONEVENT, AUTOTEAM, ACCEPTPASS, \
@@ -235,6 +281,41 @@ def setUp(deviceSerial):
     except Exception as e:
         U2DEVICE = None
         log(f"เชื่อม uiautomator2 ไม่ได้ ({e.__class__.__name__}: {e}) -> tap() ถอยไปใช้ adb input swipe")
+
+    _loadBotConfig()
+
+
+def setUpHeadless(deviceSerial):
+    """เตรียมโหมด headless แท้: โหลด config แล้วตั้ง DEVICESERIAL จาก argument โดยไม่แตะ adb
+
+    ใช้แทน setUp() ตอนรัน headless — flow นี้ไม่เปิดเกม ไม่อ่านโทเค็นจากเครื่อง จึงไม่ต้องมี
+    emulator เลย DEVICESERIAL ยังจำเป็นสำหรับตั้งชื่อไฟล์ split-ID ต่อเครื่อง (src/split-ID/<serial>.txt)
+    จึงแปลง ':' เป็น '_' ให้ตรงรูปแบบเดิมที่ setUp() ใช้ (DEVICE.serial.replace(":", "_"))
+    """
+    global DEVICE, DEVICESERIAL, U2DEVICE, HEADLESS, HIGHERSTAGE, RBTK
+    HEADLESS = True
+    DEVICE = None
+    U2DEVICE = None
+    HIGHERSTAGE = 0
+    RBTK = ""
+    DEVICESERIAL = deviceSerial.replace(":", "_")
+    print(f"========= Setup Headless v{CURRENT_VERSION} ({DEVICESERIAL}) =========")
+    _loadBotConfig()
+
+
+def _loadBotConfig():
+    """โหลดค่าจาก src/config.ini + configRangers.ini + configGears.ini ลง globals
+
+    แยกออกจาก setUp() เพื่อให้ setUpHeadless() เรียกใช้ได้โดยไม่ต้องต่อ device (โหมด headless
+    ยังต้องใช้ค่าพวก GACHARANGER/GACHARANGERGROUP/RGACHACYCLES/RANGERSCONFIG ในขั้นกาชา)
+    """
+    global GACHARANGER, GACHARANGERGROUP, TAP_DURATION, RBTKPOSITION, UPDATERBTK, STAGEEND, AUTOUSEITEM, \
+        CHANGEID, AUTOMODE, LOSTCOUNT, GIFTBOX, BUYFRIEND, HIGHERSTAGE, RANGERSCONFIG, GEARS, \
+        RANGERINTEAM, MAXMINERALCOST, CLOSEPOPUP, RSELCTIONEVENT, AUTOTEAM, ACCEPTPASS, \
+        ACCEPT7DAY, RGACHACYCLES, RGACHAMODE, RSTOPWHENFOUND, TIMEINTERVAL, RUSERUBY, EXCHANGEGACHATICKET, \
+        GSELECTIONEVENT, GSTOPWHENFOUND, GUSE200RUBY, GGACHAMODE, GGACHACYCLES, \
+        BUYLEONARD9, BUYRUBY, BUYTICKET, cooldowncapturescreen, timeoutopengame, current_gacha_cycles, \
+        usenemu, _nemu_next_try
 
     config = configparser.ConfigParser()
     with open("src\config.ini", "r", encoding="utf-8") as f:
@@ -1708,6 +1789,8 @@ def getMissions(goHome=True):
 def force_stop_LINE_Rangers():
     global LFACCACHE
     LFACCACHE = None   # token ตายพร้อมกับ session ทุกทางที่เปิดเกมใหม่ต้องผ่านตรงนี้
+    if HEADLESS:
+        return         # headless ไม่มีเกมให้ปิด แค่ล้าง cache เพื่อบังคับ relogin ไฟล์ถัดไป
     DEVICE.shell(f"am force-stop com.linecorp.LGRGS")
     wait(0.5)
 
@@ -1720,6 +1803,14 @@ def log(values:object, end="\n", flush=True):
 
 def getGameID():
     global GAMEID
+    if HEADLESS:
+        # headless: rsn มาจาก relogin แล้ว (getLFACHeadless ตั้ง GAMEID ให้) ไม่มี device ให้อ่าน
+        if not GAMEID:
+            try:
+                GAMEID = apiGetPlayer().get("rsn") or ""
+            except Exception as e:
+                log(f"headless getGameID via API failed: {e}")
+        return GAMEID
     log("Get Game ID")
     char = ""
     try:
@@ -2912,7 +3003,7 @@ def exportFileFromGameToBackup(text:str=""):
         getGameID()
     # path ปลายทาง
     if text != "":
-        filename = f"{GAMEID}_{text}.xml"
+        filename = f"{text}.xml"
     else:
         filename = f"{GAMEID}.xml"
     path = os.path.join("backup", filename)
@@ -2925,27 +3016,6 @@ def exportFileFromGameToBackup(text:str=""):
 
     log(f"Export File: {path}")
     return path
-
-
-def exportFileFromGameWithGameIDToOutput(text:str=""):
-    if GAMEID == "":
-        getGameID()
-    # path ปลายทาง
-    if text != "":
-        filename = f"{GAMEID}_{text}.xml"
-    else:
-        filename = f"{GAMEID}.xml"
-    path = os.path.join("output", filename)
-    # copy ด้วยสิทธิ์ root ไปโฟลเดอร์ sdcard (ที่ adb ดึงได้)
-    DEVICE.shell("su -c 'cp /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml /sdcard/_LINE_COCOS_PREF_KEY.xml'")
-    # ค่อยดึงออกมาที่เครื่อง
-    DEVICE.pull("/sdcard/_LINE_COCOS_PREF_KEY.xml", path)
-    # ลบไฟล์ชั่วคราวใน sdcard ได้
-    DEVICE.shell("rm /sdcard/_LINE_COCOS_PREF_KEY.xml")
-
-    log(f"Export File: {path}")
-    return path
-
 
 def exportFileFromGameToOutput(text:str=""):
     # path ปลายทาง
@@ -3092,6 +3162,9 @@ def reImportFileInExecute():
     log(f"Re Import File: {path}")
     if not os.path.exists(path):
         raise FileNotFoundError(f"File not found: {path}")
+
+    if HEADLESS:
+        return   # headless: ไฟล์อยู่ใน execute อยู่แล้ว ไม่ต้อง push ลง device (getLFAC จะ relogin เอง)
 
     # push ไฟล์ไปยัง tmp ก่อน
     tmp_path = "/data/local/tmp/_LINE_COCOS_PREF_KEY.xml"
@@ -3260,21 +3333,22 @@ def importFileFromInputToExecute():
     with open(file_path, encoding="utf-8", errors="replace") as importedPref:
         IMPORTEDENCLFAC = _prefValue(importedPref.read(), "_ENC_LF_AC_KEY")
 
-    # push ไฟล์ไปยัง tmp ก่อน
-    tmp_path = "/data/local/tmp/_LINE_COCOS_PREF_KEY.xml"
-    DEVICE.push(file_path, tmp_path)
+    if not HEADLESS:
+        # push ไฟล์ไปยัง tmp ก่อน
+        tmp_path = "/data/local/tmp/_LINE_COCOS_PREF_KEY.xml"
+        DEVICE.push(file_path, tmp_path)
 
-    # ตั้ง permission rw-rw-rw- (666)
-    DEVICE.shell(f"su -c 'chmod 666 {tmp_path}'")
+        # ตั้ง permission rw-rw-rw- (666)
+        DEVICE.shell(f"su -c 'chmod 666 {tmp_path}'")
 
-    # ลบไฟล์เดิมถ้ามี
-    DEVICE.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+        # ลบไฟล์เดิมถ้ามี
+        DEVICE.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
 
-    # copy ไฟล์จาก tmp กลับไป shared_prefs
-    DEVICE.shell(f"su -c 'cp {tmp_path} /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+        # copy ไฟล์จาก tmp กลับไป shared_prefs
+        DEVICE.shell(f"su -c 'cp {tmp_path} /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
 
-    # ลบไฟล์ tmp ทิ้ง
-    DEVICE.shell(f"su -c 'rm {tmp_path}'")
+        # ลบไฟล์ tmp ทิ้ง
+        DEVICE.shell(f"su -c 'rm {tmp_path}'")
 
     return FILENAME
 
@@ -3983,58 +4057,6 @@ def startBotPlayMainStage30_100_150(deviceSerial):
     force_stop_LINE_Rangers()
     print("========== End ==========", flush=True)
 
-
-
-def startBotGenID(deviceSerial):
-    global CHANGEID, GAMEID
-    fileGameId = "0123456789"  # เซ็ตค่าเริ่มต้น
-
-    while fileGameId != "":
-        GAMEID = ""
-        _tutorialGenID = False
-        print("========= Start =========", flush=True)
-        print(">>> startBotGenID <<<", flush=True)
-        # ลูนเล่นสเตจหลัก
-        setUp(deviceSerial)
-        log(f"Bot running on {deviceSerial}")
-
-        force_stop_LINE_Rangers()
-        removeAllFiles(showLog=False)
-        while True:
-            try:
-                if GAMEID == "":
-                    openLineRangers(genid=True)
-                    while True:
-                        if exists(r"src\image\home\setup complete.png"):
-                            break
-                        existsClick(r"src\image\home\ok.png", timeout=0.1)
-                        waitLoading()
-                    # GAMEID = textOCR(Region(334, 239, 289, 58), psm=13, crop=False)
-                    GAMEID = getGameID()
-
-                if _tutorialGenID == False:
-                    _tutorialGenID = tutorialGenID()
-                if _tutorialGenID == "error login":
-                    break
-                
-                asd
-                
-                exportFileFromGameWithGameIDToOutput()
-                force_stop_LINE_Rangers()
-                break
-            except TimeoutError as e:
-                captureScreenError(str(e))
-                log(f"Restart bot due to timeout: {e}")
-                continue   # << วน while True ใหม่
-            except Exception as e:
-                captureScreenError(str(e))
-                log(f"Unexpected error: {e}")
-                traceback.print_exc()
-
-        print("========== End ==========", flush=True)
-    
-    force_stop_LINE_Rangers()
-    print("========== End ==========", flush=True)
 
 def clearSpecialQuest():
     log(f"Clear Special Quest")
@@ -6338,6 +6360,8 @@ def getLFAC(timeout=60):
     ทันที (401) จึงต้องเทียบกับ IMPORTEDENCLFAC แล้วรอจนกว่าเกมจะเขียนค่าใหม่ทับ
     """
     global LFACCACHE
+    if HEADLESS:
+        return getLFACHeadless()
     if LFACCACHE:
         return LFACCACHE
 
@@ -6371,6 +6395,86 @@ def getLFAC(timeout=60):
                 f"(_DEVICE_UUID_KEY={'มี' if deviceUuid else 'ไม่มี'}) - "
                 f"เกมยังล๊อกอินเข้าเกมไม่สำเร็จ ต้องให้ถึงหน้าโฮมก่อน")
         sleep(3)
+
+
+def getLFACHeadless():
+    """โหมด headless: mint LF_AC สดจากไฟล์ execute/FILENAME ผ่าน /v12.3/login โดยไม่แตะ device/เกม
+
+    ระบุตัวผู้เล่นจากโทเค็นเก่าที่ฝังในไฟล์ (guestCookie) + cc ของ guest ที่ mint จาก API แล้ว
+    ขอ LF_AC ใหม่กลับมา จากนั้น:
+      - cache ลง LFACCACHE (ทุก API ที่วิ่งผ่าน getLFAC จึงทำงานต่อได้ทันที)
+      - ตั้ง GAMEID จาก rsn ที่ /login คืนมา (getGameID โหมด headless อ่านจากตรงนี้)
+      - เขียนโทเค็นสดกลับลง execute/FILENAME เพื่อให้ไฟล์ที่ export ออกมามีโทเค็นใช้งานได้จริง
+    cc mint ครั้งเดียวใช้ทั้งรอบ (_HEADLESSCCPOOL) renew เมื่อโดน 401 ตรรกะเดียวกับ tools/relogin.py
+    """
+    global LFACCACHE, GAMEID, _HEADLESSCCPOOL
+    if LFACCACHE:
+        return LFACCACHE
+    if not FILENAME:
+        raise Exception("headless: ยังไม่มีไฟล์ที่ import (FILENAME ว่าง)")
+
+    if TOOLSDIR not in sys.path:
+        sys.path.insert(0, TOOLSDIR)
+    import relogin
+    from device_session import decrypt_lfac
+
+    file_path = os.path.join("execute", FILENAME)
+    acct = relogin.read_account(file_path)
+    guestCookie = decrypt_lfac(acct["udid"], acct["enc"])
+
+    if _HEADLESSCCPOOL is None:
+        _HEADLESSCCPOOL = relogin.CcPool()   # mint guest cc ตัวแรก (ยิง /auth ครั้งเดียวต่อรอบ)
+    cc = _HEADLESSCCPOOL.get()
+    status, result, lfAc = relogin.login(cc, acct["udid"], guestCookie, acct["nation"], acct["language"])
+    if status == 401 and not result:
+        cc = _HEADLESSCCPOOL.renew(cc)       # cc อาจหมดอายุ ลองสร้างใหม่แล้วยิงซ้ำครั้งเดียว
+        status, result, lfAc = relogin.login(cc, acct["udid"], guestCookie, acct["nation"], acct["language"])
+    if not result or not lfAc:
+        raise Exception(
+            f"headless relogin ล้มเหลว (HTTP {status}) - ไฟล์นี้ล๊อกอินไม่ผ่าน "
+            f"(บัญชีอาจถูกแบน/ไฟล์เสีย หรือเซิร์ฟเวอร์ปิดปรับปรุง)")
+
+    _HEADLESSCCPOOL.mark_proven()
+    # เขียนโทเค็นสดกลับลงไฟล์ (แทนที่เฉพาะค่า _ENC_LF_AC_KEY คงไบต์อื่นไว้) ไฟล์ที่ export จะใช้ได้จริง
+    try:
+        relogin.atomic_write(file_path, relogin.replace_enc(acct["text"], acct["udid"], lfAc))
+    except Exception as e:
+        log(f"headless: เขียนโทเค็นกลับไฟล์ไม่ได้ (ยังส่ง API ต่อได้): {e}")
+
+    LFACCACHE = "LF_AC=" + lfAc
+    GAMEID = result.get("rsn") or GAMEID
+    log(f"headless LF_AC ready (rsn={GAMEID}, lv={result.get('level')})")
+    return LFACCACHE
+
+
+def getLFACFromFile(rel_path=""):
+    """คืน cookie 'LF_AC=...' ถอดจากไฟล์ _LINE_COCOS_PREF_KEY.xml ใน input โดยไม่แตะเครื่อง
+
+    rel_path คือ path relative กับ input (รองรับ subfolder) ไม่ส่งมา = หยิบ .xml ไฟล์แรกที่เจอ
+    token ในไฟล์คือของ session ตอน export ถ้าเกมถูกเปิดใหม่หลังจากนั้นแล้วจะตาย (401)
+    จึงไม่เก็บลง LFACCACHE กันไปปนกับ token สดของ getLFAC()
+    """
+    if not rel_path:
+        for root, dirs, files in os.walk("input"):
+            xmlFiles = sorted(file for file in files if file.endswith(".xml"))
+            if xmlFiles:
+                rel_path = os.path.relpath(os.path.join(root, xmlFiles[0]), "input")
+                break
+        else:
+            raise Exception("no .xml file in input")
+
+    file_path = os.path.join("input", rel_path)
+    with open(file_path, encoding="utf-8", errors="replace") as prefFile:
+        xml = prefFile.read()
+    deviceUuid = _prefValue(xml, "_DEVICE_UUID_KEY")
+    encLFAC = _prefValue(xml, "_ENC_LF_AC_KEY")
+    if not deviceUuid or not encLFAC:
+        raise Exception(
+            f"{file_path}: ไม่มี {'_DEVICE_UUID_KEY' if not deviceUuid else '_ENC_LF_AC_KEY'} "
+            f"- ไฟล์นี้ยังไม่เคยล๊อกอินเข้าเกม")
+
+    device_session, _rewards, _gacha = _importApiTools()
+    return "LF_AC=" + device_session.decrypt_lfac(deviceUuid, encLFAC)
 
 
 def apiGetPlayer():
@@ -6785,7 +6889,7 @@ def logSession(startTime, status, gameId, level, rangerNames, gachaStatus,
                 pass
 
 
-def startBotGenIDLevel1(deviceSerial=""):
+def startBotGenID_API(deviceSerial=""):
     """สร้าง ID ใหม่ เล่นด่าน 1 จนถึง minLevel แล้วรับของ + สุ่มกาชาผ่าน API
 
     โครงเดิมมาจาก startBotGenID(): ล้าง shared_prefs แล้วเปิดเกมโหมด genid ให้ได้
@@ -6812,6 +6916,9 @@ def startBotGenIDLevel1(deviceSerial=""):
         exportedFile = ""
         lastError = ""
         usedAttempts = 0
+        gachaDone = False
+        accountId = ""
+        
         print("========= Start =========", flush=True)
         print(">>> genIDLevel1 <<<", flush=True)
         
@@ -6831,38 +6938,61 @@ def startBotGenIDLevel1(deviceSerial=""):
                 if openLineRangers(skipLoadingScreen=True) == "authentication_failed":
                     raise Exception("Authentication failed - cannot open game with this ID")
                 force_stop_LINE_Rangers()
-                # ---------- ส่วน API ----------
-                # ถึงตรงนี้ ID เกิดแล้ว ห้ามให้อะไรพังจนไม่ได้ export ไฟล์ ครอบ try ไว้ทั้งก้อน
-                gachaUnits = []
+
+                lfacReady = False
                 try:
-                    apiAcceptAllRewards()                   # ใช้ api รับของแจกทั้งหมด
-                    gachaUnits = apiGachaWithTicket()       # ใช้ api ใช้ตั๋วสุ่มกาชา 1 ครั้ง
-                    gachaStatus = LASTGACHASTATUS
+                    getLFAC(timeout=60)
+                    lfacReady = True
                 except Exception as e:
                     gachaStatus = "error"
                     lastError = str(e)
-                    log(f"API step failed (ID ยังใช้ได้ ส่งออกต่อ): {e}")
-                    traceback.print_exc()
+                    log(f"LF_AC not ready (ID ยังใช้ได้ ส่งออกต่อ): {e}")
 
-                # unit code จาก API ตรงกับ key ใน src\configRangers.ini อยู่แล้ว จึงเทียบ
-                # แบบตรงตัว ไม่ใช้ matchGachaName() ที่ fuzzy 0.8 เพราะอันนั้นมีไว้กลบ
-                # ความเพี้ยนของ OCR ซึ่งที่นี่ไม่มี และ code ที่ต่างกันแค่ตัวเดียว
-                # (u1630e-sally กับ u1630f-sally) จะได้ ratio ~0.92 แล้วจับผิดตัว
-                # วนทุกตัวเผื่อวันหลังเปลี่ยนไปสุ่มแบบ 6+1 (index 2) จะได้ไม่ตกหล่น
-                rangerNames = ""
-                for unitCode in gachaUnits:
-                    rangerName = RANGERSCONFIG.get(unitCode.lower())   # configparser พับ key เป็นตัวเล็ก
-                    if rangerName:
-                        rangerNames = add_ranger_name(rangerNames, rangerName.replace(" ", ""))
+                force_stop_LINE_Rangers()
 
-                currentLevelValue = currentLevel()
-                if rangerNames:
-                    exportedFile = exportFileFromGameToBackup(f"Lv{currentLevelValue}_{rangerNames}")
+                # บัญชีนี้มีไฟล์อื่นในรอบเดียวกันทำไปแล้ว ไม่ต้องสุ่มซ้ำ (retry ของ session ตัวเองไม่นับ)
+                if lfacReady and not accountId:
+                    accountId = GAMEID or getGameID()
+                    if not _claimAccountThisRun(accountId):
+                        duplicateAccount = True
+                        gachaDone = True
+                        gachaStatus = "dup-account"
+                        log(f"Account {accountId} already done by another file this run - skip rewards/gacha")
+
+                if lfacReady and not gachaDone:
+                    try:
+                        apiAcceptAllRewards()                   # ใช้ api รับของแจกทั้งหมด
+                        if GACHARANGER:
+                            gachaUnits = apiGachaWithTicket(gacharangergroup=GACHARANGERGROUP, gacha_cycles=RGACHACYCLES)       # ใช้ api ใช้ตั๋วสุ่มกาชา 1 ครั้ง
+                        gachaDone = True
+                        gachaStatus = LASTGACHASTATUS
+                    except Exception as e:
+                        gachaStatus = "error"
+                        lastError = str(e)
+                        log(f"API step failed (ID ยังใช้ได้ ส่งออกต่อ): {e}")
+                        traceback.print_exc()
+                elif gachaDone and not duplicateAccount:
+                    log(f"Gacha already done this session ({gachaStatus}) - skip")
+
+                # ค่าเริ่มต้นไว้ก่อน ถ้า LF_AC ไม่มา getAccoutInfo จะไม่ถูกเรียก ตัวแปรพวกนี้จะไม่มีค่า
+                rangerNames, level, ruby, ticket, gameID = "", 0, "NA", "NA", GAMEID
+                if lfacReady:
+                    rangerNames, level, ruby, ticket, gameID = getAccoutInfo()
+                currentLevelValue = level
+                fileName = f"{rangerNames}_Rb{ruby}_Tk{ticket}_{gameID}_Lv{level}"
+
+                # backup เฉพาะที่กาชารอบนี้ได้เรนเจอร์ใน configRangers.ini เดิมเช็คแค่ gachaUnits != []
+                # สุ่มได้อะไรก็ตามก็ไป backup หมด (9 ไฟล์ มีได้ตัวเป้าหมายจริงแค่ 1)
+                # เทียบตรงตัวเหมือนตอน stop_when_found ใน apiGachaWithTicket
+                gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in gachaUnits)
+                if gotTarget:
+                    exportedFile = exportFileFromGameToBackup(text=fileName)
                 else:
-                    exportedFile = exportFileFromGameWithGameIDToOutput(f"Lv{currentLevelValue}")
+                    exportedFile = exportFileFromGameToOutput(text=fileName)
                 force_stop_LINE_Rangers()
                 sessionStatus = "OK"
                 break
+            
             except TimeoutError as e:
                 lastError = f"timeout: {e}"
                 captureScreenError(str(e))
@@ -7704,7 +7834,49 @@ def printGachaBanners(rows):
 GACHABANNERTYPES = ("ULTRA_RARE", "")
 
 
-def getGachaBanner(summary=True, includeClosed=False, types=GACHABANNERTYPES, eventOnly=True):
+def reloginFromInput(rel_path=""):
+    """relogin จากไฟล์บัญชีใน input/ แล้วคืน 'LF_AC=...' สด โดยไม่ต้องมี device/เกม
+
+    ใช้ตอนต้องการ token สำหรับ "ดึงข้อมูลอย่างเดียว" (เช่นรายการตู้กาชา) แบบ headless
+    rel_path = path เทียบกับ input/ ไม่ส่งมา = หยิบ .xml ไฟล์แรกที่เจอ (รวมโฟลเดอร์ย่อย)
+    ไม่แก้ไฟล์ต้นฉบับและไม่แตะ session globals (LFACCACHE/GAMEID) เพราะเป็นการยืม token ชั่วคราว
+    โทเค็นเก่าในไฟล์ตายแล้วก็ไม่เป็นไร relogin สร้างของสดให้ (โทเค็นเก่าใช้เป็น guestCookie)
+    """
+    global _HEADLESSCCPOOL
+    if TOOLSDIR not in sys.path:
+        sys.path.insert(0, TOOLSDIR)
+    import relogin
+    from device_session import decrypt_lfac
+
+    target = ""
+    if rel_path and os.path.isfile(os.path.join("input", rel_path)):
+        target = os.path.join("input", rel_path)
+    else:
+        for root, dirs, files in os.walk("input"):
+            xmls = sorted(f for f in files if f.endswith(".xml"))
+            if xmls:
+                target = os.path.join(root, xmls[0])
+                break
+        if not target:
+            raise Exception("ไม่พบไฟล์บัญชี .xml ในโฟลเดอร์ input")
+
+    acct = relogin.read_account(target)
+    guestCookie = decrypt_lfac(acct["udid"], acct["enc"])
+    if _HEADLESSCCPOOL is None:
+        _HEADLESSCCPOOL = relogin.CcPool()
+    cc = _HEADLESSCCPOOL.get()
+    status, result, lfAc = relogin.login(cc, acct["udid"], guestCookie, acct["nation"], acct["language"])
+    if status == 401 and not result:
+        cc = _HEADLESSCCPOOL.renew(cc)
+        status, result, lfAc = relogin.login(cc, acct["udid"], guestCookie, acct["nation"], acct["language"])
+    if not result or not lfAc:
+        raise Exception(
+            f"relogin จาก input ล้มเหลว (HTTP {status}) - ไฟล์ {os.path.basename(target)} ใช้ไม่ได้")
+    _HEADLESSCCPOOL.mark_proven()
+    return "LF_AC=" + lfAc
+
+
+def getGachaBanner(summary=True, includeClosed=False, types=GACHABANNERTYPES, eventOnly=True, cookie=None):
     """คืนรายการตู้กาชาจาก API เป็น list ของ dict — ไอดีตู้/ชื่อ/แบนเนอร์/ตัวเด่น/เวลาที่เหลือ
 
     ทั้งหมดมาจาก /gacha/info -> result.gachaGroupResponseList[].gachaGroup (endpoint เดียว
@@ -7733,7 +7905,7 @@ def getGachaBanner(summary=True, includeClosed=False, types=GACHABANNERTYPES, ev
     import rangers_api
     import pull_roster
 
-    status, data = _apiCall(rangers_api.call, getLFAC(), "/gacha/info")
+    status, data = _apiCall(rangers_api.call, cookie or getLFAC(), "/gacha/info")
     if status != 200 or not isinstance(data, dict):
         raise Exception(f"getGachaBanner failed (HTTP {status}): {str(data)[:200]}")
 
@@ -7772,20 +7944,292 @@ def getGachaBanner(summary=True, includeClosed=False, types=GACHABANNERTYPES, ev
     return rows
 
 
+
+
+def startBotLogin_API_headless(deviceSerial=""):
+    global GAMEID
+    MAXATTEMPTS = 3
+
+    # setUp ครั้งเดียวต่อ worker (โหลด config + ตั้ง HEADLESS/DEVICESERIAL) ไม่ใช่ทุกไฟล์
+    # config ไม่เปลี่ยนระหว่างไฟล์ การอ่าน .ini 3 ไฟล์ซ้ำทุกรอบเป็นงานเปล่า
+    setUpHeadless(deviceSerial)
+    log(f"Bot running headless on {deviceSerial}")
+
+    while True:
+        GAMEID = ""
+        sessionStart = time.time()
+        sessionStatus = "FAIL"
+        currentLevelValue = 0
+        gachaStatus = "-"
+        exportedFile = ""
+        lastError = ""
+        usedAttempts = 0
+        # ไฟล์ของ session นี้ หยิบครั้งเดียวแล้ว retry ด้วยไฟล์เดิม ถ้า retry ไป import ใหม่
+        # จะได้ไฟล์ถัดไปจาก split-ID แทน ไฟล์เดิมเลยไม่ถูกทำและไม่มีใครย้ายออกจาก execute
+        sessionFile = ""
+        noMoreFiles = False
+        # กาชาหักตั๋วจริง ถ้าสุ่มไปแล้วแต่ขั้นหลังพัง (เช่น pull ไฟล์ไม่ได้) retry ห้ามสุ่มซ้ำ
+        gachaDone = False
+        gachaUnits = []
+        rangerNames = ""          # logSession ใช้เสมอ แม้ login ไม่ผ่านตั้งแต่ attempt แรก
+        accountId = ""            # GAME_ID ของไฟล์นี้ ใช้กันบัญชีเดียวกันสองไฟล์สุ่มกาชาซ้ำ
+        duplicateAccount = False
+
+        print("========= Start =========", flush=True)
+        print(">>> startBotLogin (headless) <<<", flush=True)
+
+        for attempt in range(1, MAXATTEMPTS + 1):
+            usedAttempts = attempt
+            try:
+                force_stop_LINE_Rangers()   # headless: แค่ล้าง LFACCACHE บังคับ relogin ไฟล์นี้ใหม่
+                if not sessionFile:
+                    try:
+                        importFileFromInputToExecute()
+                    finally:
+                        # จองไฟล์ได้แล้วแต่ push พัง ก็ยังต้อง retry ด้วยไฟล์นี้
+                        sessionFile = FILENAME
+                    if not sessionFile:
+                        noMoreFiles = True
+                        break
+                else:
+                    reImportFileInExecute()
+
+                # headless ไม่เปิดเกม โทเค็นมาจาก getLFAC() ที่ relogin จากไฟล์เอง (ด้านล่าง)
+
+                lfacReady = False
+                try:
+                    getLFAC(timeout=60)
+                    lfacReady = True
+                except Exception as e:
+                    gachaStatus = "error"
+                    lastError = str(e)
+                    log(f"LF_AC not ready (ID ยังใช้ได้ ส่งออกต่อ): {e}")
+
+                # headless: ไม่ต้อง force_stop ตรงนี้ (ไม่มีเกม) และห้ามล้าง LFACCACHE จะได้ relogin แค่ครั้งเดียวต่อไฟล์
+
+                # บัญชีนี้มีไฟล์อื่นในรอบเดียวกันทำไปแล้ว ไม่ต้องสุ่มซ้ำ (retry ของ session ตัวเองไม่นับ)
+                if lfacReady and not accountId:
+                    accountId = GAMEID or getGameID()
+                    if not _claimAccountThisRun(accountId):
+                        duplicateAccount = True
+                        gachaDone = True
+                        gachaStatus = "dup-account"
+                        log(f"Account {accountId} already done by another file this run - skip rewards/gacha")
+
+                if lfacReady and not gachaDone:
+                    try:
+                        apiAcceptAllRewards()                   # ใช้ api รับของแจกทั้งหมด
+                        if GACHARANGER:
+                            gachaUnits = apiGachaWithTicket(gacharangergroup=GACHARANGERGROUP, gacha_cycles=RGACHACYCLES)       # ใช้ api ใช้ตั๋วสุ่มกาชา 1 ครั้ง
+                        gachaDone = True
+                        gachaStatus = LASTGACHASTATUS
+                    except Exception as e:
+                        gachaStatus = "error"
+                        lastError = str(e)
+                        log(f"API step failed (ID ยังใช้ได้ ส่งออกต่อ): {e}")
+                        traceback.print_exc()
+                elif gachaDone and not duplicateAccount:
+                    log(f"Gacha already done this session ({gachaStatus}) - skip")
+
+                # ค่าเริ่มต้นไว้ก่อน ถ้า LF_AC ไม่มา getAccoutInfo จะไม่ถูกเรียก ตัวแปรพวกนี้จะไม่มีค่า
+                rangerNames, level, ruby, ticket, gameID = "", 0, "NA", "NA", GAMEID
+                if lfacReady:
+                    rangerNames, level, ruby, ticket, gameID = getAccoutInfo()
+                currentLevelValue = level
+                fileName = f"{rangerNames}_Rb{ruby}_Tk{ticket}_{gameID}_Lv{level}"
+
+                # backup เฉพาะที่กาชารอบนี้ได้เรนเจอร์ใน configRangers.ini เดิมเช็คแค่ gachaUnits != []
+                # สุ่มได้อะไรก็ตามก็ไป backup หมด (9 ไฟล์ มีได้ตัวเป้าหมายจริงแค่ 1)
+                # เทียบตรงตัวเหมือนตอน stop_when_found ใน apiGachaWithTicket
+                gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in gachaUnits)
+                if gotTarget:
+                    exportedFile = exportFileFromExecuteToBackup(newName=fileName)
+                else:
+                    exportedFile = exportFileFromExecuteToOutput(newName=fileName)
+                force_stop_LINE_Rangers()
+                sessionStatus = "OK"
+                break
+
+            except TimeoutError as e:
+                lastError = f"timeout: {e}"
+                captureScreenError(str(e))
+                log(f"Restart bot due to timeout (attempt {attempt}): {e}")
+                continue
+            except Exception as e:
+                lastError = str(e)
+                captureScreenError(str(e))
+                log(f"Unexpected error (attempt {attempt}): {e}")
+                traceback.print_exc()
+                continue
+
+        if noMoreFiles:
+            print("========== End ==========", flush=True)
+            log(f"Not Found File ID")
+            break
+
+        if sessionStatus == "FAIL" and sessionFile and os.path.isfile(os.path.join("execute", sessionFile)):
+            # retry ครบแล้วยังไม่ผ่าน ย้ายไป login failed จะได้รู้ว่าไฟล์ไหนต้องเอากลับมาทำใหม่
+            # (ถ้าสำเร็จไฟล์ต้นฉบับยังอยู่ใน execute เหมือนเดิม เพราะตัวที่ส่งออกดึงจากเกม)
+            try:
+                exportFileFromExecuteToLoginFailed()
+                exportedFile = os.path.join("login failed", sessionFile)
+            except Exception as e:
+                log(f"move to login failed error: {e}")
+
+        if accountId and not duplicateAccount and not gachaDone:
+            # จองบัญชีไว้แต่สุ่มไม่สำเร็จ ปล่อยให้ไฟล์ซ้ำของบัญชีนี้ (ถ้ามี) ได้สุ่มแทน
+            _releaseAccountThisRun(accountId)
+
+        # log ก่อนเช็คว่ามีไฟล์เหลือไหม เดิม break ก่อนถึงตรงนี้ session สุดท้ายของทุกเครื่องเลยหาย
+        # logSession(sessionStart, sessionStatus, GAMEID, currentLevelValue, rangerNames,
+        #            gachaStatus, usedAttempts, exportedFile, lastError)
+        print("========== End ==========", flush=True)
+
+
+def _headlessCreateAccount():
+    """สร้างบัญชี guest ใหม่แบบ headless แท้ (ไม่แตะ device/เกม) เขียนไฟล์ .xml ลง execute/
+
+    ยิง Trident guest-mint -> refresh -> authorize -> GET /v12.3/signup/platform (สร้าง player
+    ฝั่ง rangers) ได้ LF_AC สดกลับมา จุดสำคัญ: ข้อสรุปเก่าที่ว่า "first-login ของ guest ใหม่ต้อง
+    เปิดเกม/ต้อง frida/ต้องมี appSecret" นั้นผิด — แค่ยิงผิด endpoint (เดิมยิง /v12.3/login ซึ่งไว้
+    สำหรับคนเก่า 401 กับบัญชีใหม่) endpoint ที่สร้าง player จริงคือ /v12.3/signup/platform ซึ่ง
+    ไม่ pinned และไม่ต้องมี appSecret ส่งแค่ cookie cc+udid เดียวกับตอน relogin (ดู tools/new_account.py)
+
+    จากนั้นสร้างไฟล์ shared_prefs (_LINE_COCOS_PREF_KEY.xml) แบบเดียวกับที่เกมเขียน วางไว้ใน
+    execute/ (ตั้ง FILENAME) เพื่อให้ exportFileFromExecuteTo* ย้ายออก output/backup ได้ตามปกติ
+    คืน dict: gameId(mid, T0FF...), rsn, lf_ac, udid, level, ruby, coin
+    """
+    global FILENAME
+    if TOOLSDIR not in sys.path:
+        sys.path.insert(0, TOOLSDIR)
+    import new_account as na
+    from account_file import build_pref_xml
+
+    device_id = na.secrets.token_hex(16)   # Trident SDK DeviceId
+    udid = na.secrets.token_hex(16)        # เกม uuid ของตัวเอง (_DEVICE_UUID_KEY = คีย์ AES ของโทเค็น)
+    guest = na.register_guest(device_id)   # mint บัญชี LINE จริง (userKey/userToken/refreshUserToken)
+    cc = na.refresh_token(device_id, guest["refreshUserToken"])
+    na.authorize(device_id, cc)
+    session = na.signup_platform(cc, udid)  # สร้าง player ฝั่ง rangers -> LF_AC + starter ruby/coin
+    if not session or not session.get("lf_ac"):
+        raise Exception("headless signup ล้มเหลว - ไม่ได้ LF_AC (บัญชีถูก mint แล้ว รันซ้ำ/--resume ได้)")
+
+    lf_ac = session["lf_ac"]
+    gameId = session.get("mid") or guest.get("userKey")
+    rsn = session.get("rsn") or ""
+
+    # เขียนไฟล์บัญชีลง execute/ ตั้งชื่อจาก gameId (ไม่ชนกันข้าม worker เพราะแต่ละบัญชี mid ไม่ซ้ำ)
+    os.makedirs("execute", exist_ok=True)
+    FILENAME = f"{gameId}.xml"
+    with open(os.path.join("execute", FILENAME), "w", encoding="utf-8") as f:
+        f.write(build_pref_xml(lf_ac, udid, na.NATION, na.LANG))
+
+    log(f"headless signup OK rsn={rsn} mid={gameId} level={session.get('level')} "
+        f"ruby={session.get('ruby')} coin={session.get('coin')}")
+    return {"gameId": gameId, "rsn": rsn, "lf_ac": lf_ac, "udid": udid,
+            "level": session.get("level"), "ruby": session.get("ruby"), "coin": session.get("coin")}
+
+
+def startBotGenID_API_headless(deviceSerial=""):
+    """สร้างไอดีใหม่แบบ headless แท้ (ไม่แตะ device/เกม) ผ่าน /v12.3/signup/platform แล้วรับของ + กาชา
+
+    โครงเทียบเท่า startBotLogin_API_headless แต่แทนที่จะ relogin จากไฟล์ input จะ MINT บัญชีใหม่เอง:
+      mint guest -> signup สร้าง player -> รับของแจก + สุ่มกาชาผ่าน API -> export ไฟล์ .xml ออก output/backup
+
+    ข้อจำกัดที่ต่างจาก genid แบบ device: บัญชีที่สร้างเริ่มที่ level 1 (ruby 20, ตั๋ว 0) การเล่นด่าน
+    เพื่อดันเลเวลทำ headless ไม่ได้ (stage/save ติด anti-cheat ฝั่งเซิร์ฟเวอร์) โหมดนี้จึงเน้น "สร้าง
+    บัญชีใช้งานได้ + กวาดของ/กาชาเท่าที่ API ทำได้" ไม่ได้ดันถึง level 3 เหมือน device genid
+    วน while True ไปเรื่อย ๆ (มีบัญชีให้สร้างไม่จำกัด) จนกว่าจะถูกสั่งหยุด (kill worker)
+    """
+    global GAMEID, LFACCACHE
+    MAXATTEMPTS = 3
+
+    setUpHeadless(deviceSerial)
+    log(f"Bot running headless (GenID) on {deviceSerial}")
+
+    while True:
+        GAMEID = ""
+        LFACCACHE = ""
+        sessionStart = time.time()
+        sessionStatus = "FAIL"
+        currentLevelValue = 0
+        gachaStatus = "-"
+        exportedFile = ""
+        lastError = ""
+        usedAttempts = 0
+        gachaDone = False
+        gachaUnits = []
+        rangerNames = ""
+        accountId = ""
+
+        print("========= Start =========", flush=True)
+        print(">>> genIDLevel1 (headless) <<<", flush=True)
+
+        for attempt in range(1, MAXATTEMPTS + 1):
+            usedAttempts = attempt
+            try:
+                # attempt ใหม่ = สร้างบัญชีใหม่สด (mint ก่อนหน้าถ้าพังหลัง signup ก็ปล่อยทิ้ง)
+                LFACCACHE = ""
+                account = _headlessCreateAccount()
+                GAMEID = account["rsn"] or account["gameId"]
+                accountId = account["gameId"]
+                LFACCACHE = "LF_AC=" + account["lf_ac"]   # ทุก API ที่วิ่งผ่าน getLFAC ใช้โทเค็นนี้ทันที
+
+                if not gachaDone:
+                    try:
+                        apiAcceptAllRewards()                   # ใช้ api รับของแจกทั้งหมด
+                        if GACHARANGER:
+                            gachaUnits = apiGachaWithTicket(gacharangergroup=GACHARANGERGROUP, gacha_cycles=RGACHACYCLES)
+                        gachaDone = True
+                        gachaStatus = LASTGACHASTATUS
+                    except Exception as e:
+                        gachaStatus = "error"
+                        lastError = str(e)
+                        log(f"API step failed (ID ยังใช้ได้ ส่งออกต่อ): {e}")
+                        traceback.print_exc()
+
+                rangerNames, level, ruby, ticket, gameID = getAccoutInfo()
+                currentLevelValue = level
+                fileName = f"{rangerNames}_Rb{ruby}_Tk{ticket}_{gameID}_Lv{level}"
+
+                # backup เฉพาะที่กาชารอบนี้ได้เรนเจอร์เป้าหมายใน configRangers.ini นอกนั้นลง output
+                gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in gachaUnits)
+                if gotTarget:
+                    exportedFile = exportFileFromExecuteToBackup(newName=fileName)
+                else:
+                    exportedFile = exportFileFromExecuteToOutput(newName=fileName)
+                sessionStatus = "OK"
+                break
+
+            except Exception as e:
+                lastError = str(e)
+                log(f"Unexpected error (attempt {attempt}): {e}")
+                traceback.print_exc()
+                continue
+
+        # สรุป session ลง stdout อย่างเดียว (โหมด headless ไม่เขียนไฟล์ log เหมือน startBotLogin_API_headless)
+        print("[SESSION] %s  status=%s attempts=%d gameId=%s Lv%s ranger=%s gacha=%s file=%s"
+              % (datetime.now().strftime("%H:%M:%S"), sessionStatus, usedAttempts, GAMEID or "-",
+                 currentLevelValue, rangerNames or "-", gachaStatus or "-", exportedFile or "-"), flush=True)
+        if lastError:
+            print("[SESSION] error: %s" % " ".join(str(lastError).split())[:200], flush=True)
+        print("========== End ==========", flush=True)
+
+
+
+
 from ADB import setup_emulators
 if __name__ == "__main__":
     try:
-        setUp("127.0.0.1:16384")
+        setUp("127.0.0.1:16416")
     except:
         setup_emulators()
-        setUp("127.0.0.1:16384")
+        setUp("127.0.0.1:16416")
 
 
-    startBotLogin_API
-    startBotCheckGameInfo_API
-    getGachaBanner()
-    randomGachaRanger
+    startBotLogin_API_headless
+    startBotGenID_API_headless
 
 
-# /storag/emulated/0/Android/data/com.linecorp.LGRGS/files/.res/u1630e-sally/u1630e-sally.png
-# u1630e-sally
+
+# <string name="_ENC_LF_AC_KEY">XlFUtmjasX4O0vMMM6Af9o5/2zDVVzXQK2bjNE+ZFXH3p/HdUJsHqam1BRwkQJlj/DNJ+DWwbBMp&#10;pba+UZZUHbFYW1hsiivxEAC8zT/SIUWsWu3yl0PDl8h/mMKo5jtNKExdeYoGSwBVzu1UuETTvBho&#10;qGPnZEdXHpwhK9pxHc0SJ+HcQNPS/qfGl/kawcyon9vvM3n0saMpjf6CT4yupsu6ppdYrSFxMHiB&#10;MPvB/wNEIEIBsH82VYYLgSSTUn+9kS0gvhKPTI3euoI4iQa0ENyH69NtLqfbdjICJ1WsEO3a/V/x&#10;oQo/1GmqCJuXnNCqDtj7llq3th49YNuA3UJk03JRzvjVgexjZYkY820sHfrYYczyTZT6PHd50X3n&#10;LPxpisIvgMWxxATs5SoFDsVYgQ==&#10;    </string>

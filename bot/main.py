@@ -1,3 +1,11 @@
+# จำกัด thread pool ของ OpenBLAS/OMP ก่อน import อะไรที่ลาก numpy/cv2 (botLineRanger)
+# บน Windows multiprocessing ใช้ spawn = child re-run ไฟล์นี้จากบนสุด บรรทัดนี้จึงรันก่อน numpy โหลด
+# ในทุก worker ด้วย กัน OpenBLAS จอง thread เท่าจำนวน core ต่อทุกโปรเซส (ดู botLineRanger.py)
+import os as _os
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_MAIN_FREE"):
+    _os.environ.setdefault(_v, "1")
+
 from tkinter import filedialog, messagebox
 import subprocess
 from multiprocessing import Process
@@ -57,7 +65,7 @@ except ImportError:
 # All available play modes (will be filtered based on subscription)
 ALL_PLAY_MODE_OPTIONS = {
     "🎮 Login": "ranger_api_Login",
-    # "🎯 GenID": "GenID",
+    "🎯 GenID": "ranger_api_GenID",
     # "🛠 Auto Setup": "AutoSetup",
 }
 
@@ -69,12 +77,12 @@ COMPOSITE_MODE_REQUIREMENTS = {
 
 WHITELIST_EMAILS = []
 
-CURRENT_VERSION = "0.0.1"
+CURRENT_VERSION = "a.0.0.1"
 USERNAME = ""
 DEVICE_ID = ""
-CONFIG_PATH = "src\config.ini"
-CONFIGRANGER_PATH = "src\configRangers.ini"
-CONFIGGEAR_PATH = "src\configGears.ini"
+CONFIG_PATH = r"src\config.ini"
+CONFIGRANGER_PATH = r"src\configRangers.ini"
+CONFIGGEAR_PATH = r"src\configGears.ini"
 CHOICE = ""
 RGACHAMODE = ""
 GGACHAMODE = ""
@@ -314,12 +322,21 @@ class EmulatorManager(ctk.CTk):
         self.check_vars = []
         self.all_selected = False
         self.bot_processes = {}
+        self.worker_procs = {}            # Login headless workers (subprocess.Popen ของ bot_worker.py)
         self.status_labels = {}
         self.control_buttons = {}
+        self._worker_monitor_job = None   # ตัวจับเวลาตัวเดียวคุมทุก worker ในโหมด Login (headless)
 
         # Config
         self.config = configparser.ConfigParser()
         self.load_config()
+
+        # จำนวน thread สำหรับโหมด Login (headless) - แต่ละ thread = 1 โปรเซสที่หยิบไฟล์จาก input/ แบ่งกันเอง
+        try:
+            self.thread_count = self.config.getint("settings", "threadcount", fallback=4)
+        except Exception:
+            self.thread_count = 4
+        self.thread_count = max(1, min(self.thread_count, 1024))
 
         self._save_job = None  # สำหรับ debounce
 
@@ -349,7 +366,7 @@ class EmulatorManager(ctk.CTk):
             button_hover_color="#555555",
             text_color="white",
             values=list(self.play_mode_options.keys()),
-            command=lambda _: [self.debounce_save(), self.update_playmode_settings()]
+            command=lambda _: [self.debounce_save(), self.update_playmode_settings(), self.render_left_panel()]
         )
 
         # reverse map and set default
@@ -447,7 +464,8 @@ class EmulatorManager(ctk.CTk):
         except Exception:
             pass
         # ทุก task ด้านล่างเป็น non-blocking (spawn background thread ภายใน)
-        self.after(0, self.start_adb)
+        # โหมด Login = แผงตั้งจำนวน thread (headless ไม่ต้องสแกน adb) โหมดอื่น = สแกน device
+        self.after(0, self.render_left_panel)
         self.after(0, self.check_for_update)
         self.after(0, self.start_server_render)
         self.after(1800000, self.verify_subscription)  # ตรวจสอบทุก 30 นาที (1800000 ms)
@@ -474,33 +492,21 @@ class EmulatorManager(ctk.CTk):
         ได้นานถึง 30 วิ ถ้าทำบน UI thread จอจะค้าง อัปเดต widget ผ่าน self.after(0, ...)
         ตามแพทเทิร์นเดียวกับที่สแกน emulator ในไฟล์นี้
 
-        getGachaBanner ต้องมีอุปกรณ์ที่ setUp แล้ว (DEVICE ไม่เป็น None) ก่อนถึงอ่าน token ได้
-        ตอนเปิดแท็บ config ยังไม่มีอุปกรณ์เชื่อมเป็นเรื่องปกติ (autoConnect=False จึงเงียบ ไม่
-        โยน error รก) ส่วนปุ่ม 🔄 (autoConnect=True) ถ้าโหลดไม่ได้เพราะยังไม่มีอุปกรณ์ จะลอง
-        เชื่อม adb ตัวแรกที่เปิดอยู่ให้อัตโนมัติแล้วลองใหม่ - ผู้ใช้กดเอง = ยอมให้เชื่อมอุปกรณ์ได้
+        headless: ไม่ต้องมี emulator/เกม - ยืม token จากไฟล์บัญชีในโฟลเดอร์ input/ ด้วย
+        reloginFromInput() (relogin สร้าง LF_AC สดจากไฟล์) แล้วเอาไปยิง /gacha/info
+        autoConnect=False (ตอนเปิดแท็บ) = ถ้าโหลดไม่ได้ก็เงียบ, True (กดปุ่ม 🔄) = log error
         """
         def work():
             try:
-                rows = getGachaBanner(summary=False)
+                cookie = reloginFromInput()          # LF_AC สดจากไฟล์ใน input/ (ไม่แตะ device)
+                rows = getGachaBanner(summary=False, cookie=cookie)
             except Exception as e:
-                if not autoConnect:
-                    return  # เปิดแท็บมายังไม่มีอุปกรณ์ = ปกติ ไม่ต้อง log
-                try:
-                    devs = client.devices()
-                    if not devs:
-                        raise Exception("ไม่พบ emulator ที่เปิดอยู่ - เปิดเครื่องแล้วกด 🔄 อีกครั้ง")
-                    # เลือกอินสแตนซ์ MuMu (127.0.0.1:PORT) ก่อน ตามที่โปรเจกต์นี้ใช้ทั้งหมด
-                    # กันไปโดนเครื่องที่ยังไม่ล๊อกอินแล้ว getLFAC() ค้าง 30 วิ
-                    serial = next((d.serial for d in devs if d.serial.startswith("127.0.0.1:")),
-                                  devs[0].serial)
-                    setUp(serial)
-                    rows = getGachaBanner(summary=False)
-                except Exception as e2:
+                if autoConnect:
                     try:
-                        log(f"refresh_gacha_banners: โหลดไม่ได้ {e2}")
+                        log(f"refresh_gacha_banners: โหลดไม่ได้ {e}")
                     except Exception:
                         pass
-                    return
+                return
             mapping = {"%s" % (", ".join(r["featured"])): r["groupId"]
                        for r in rows}
             try:
@@ -685,9 +691,9 @@ class EmulatorManager(ctk.CTk):
 
         # Mode specific
         if mode_key == "ranger_api_Login":
-            ctk.CTkLabel(self.mode_specific_frame, text="🎮 ล๊อกอินไอดีเกม และ\nทำตามเงื่อนไขที่เลือก").pack(pady=3)
-        elif mode_key == "GenID":
-            ctk.CTkLabel(self.mode_specific_frame, text="🎯 สร้างไอดีใหม่").pack(pady=3)
+            ctk.CTkLabel(self.mode_specific_frame, text="🎮 ล๊อกอินไอดีเกม").pack(pady=3)
+        elif mode_key == "ranger_api_GenID":
+            ctk.CTkLabel(self.mode_specific_frame, text="🎯 สร้างไอดีใหม่เลเวล1").pack(pady=3)
         elif mode_key == "AutoSetup":
             ctk.CTkLabel(self.mode_specific_frame, text="🛠 Auto Setup").pack(pady=3)
         else:
@@ -710,8 +716,6 @@ class EmulatorManager(ctk.CTk):
 
         # Mode specific
         if mode_key == "ranger_api_Login":
-            ctk.CTkLabel(self.mode_specific_frame, text="✨ ล๊อกอินเกม").pack(pady=3)
-            
             # gacha_ranger
             btn_gacharanger_frame = ctk.CTkFrame(self.mode_specific_frame)
             btn_gacharanger_frame.pack(fill="x", pady=3)
@@ -767,8 +771,60 @@ class EmulatorManager(ctk.CTk):
             self.rgacha_cycles.bind("<KeyRelease>", self.debounce_save)
 
 
-        elif mode_key == "GenID":
-            ctk.CTkLabel(self.mode_specific_frame, text="✨ สร้างไอดีใหม่").pack(pady=3)
+        elif mode_key == "ranger_api_GenID":
+            # gacha_ranger
+            btn_gacharanger_frame = ctk.CTkFrame(self.mode_specific_frame)
+            btn_gacharanger_frame.pack(fill="x", pady=3)
+            self.gacha_ranger = ctk.CTkCheckBox(
+                btn_gacharanger_frame,
+                text="กาชาเรนเจอร์",
+                onvalue=True, offvalue=False,
+                command=self.debounce_save
+            )
+            try:
+                if self.config.getboolean("settings", "gacharanger"):
+                    self.gacha_ranger.select()
+                else:
+                    self.gacha_ranger.deselect()
+            except Exception:
+                self.gacha_ranger.deselect()
+            self.gacha_ranger.pack(side="left", padx=(0, 5), pady=3)
+
+            # dropdown เลือกตู้กาชา (ต่อท้ายกาชาเรนเจอร์) รายการมาจาก getGachaBanner()
+            # label = "groupId : featured1, featured2" ค่าที่เซฟคือ groupId ล้วน ๆ
+            btn_gachagroup_frame = ctk.CTkFrame(self.mode_specific_frame)
+            btn_gachagroup_frame.pack(fill="x", pady=3)
+            ctk.CTkLabel(btn_gachagroup_frame, text="ตู้กาชา").pack(side="left", padx=(0, 5))
+            try:
+                saved_group = self.config.get("settings", "gacharangergroup")
+            except Exception:
+                saved_group = ""
+            # เริ่มด้วยค่าที่เซฟไว้ (หรือ placeholder) ยังไม่ยิง API ตรงนี้ เพราะ getGachaBanner()
+            # เรียก getLFAC() ที่รอ token จากเครื่องได้นานถึง 30 วิ ถ้าทำบน UI thread จอจะค้าง
+            init_label = saved_group or "(กดรีเฟรช 🔄)"
+            self.gacha_group_map = {init_label: saved_group}
+            self.gacha_group_var = ctk.StringVar(value=init_label)
+            self.gacha_group = ctk.CTkOptionMenu(
+                btn_gachagroup_frame, variable=self.gacha_group_var, width=0, height=22,
+                values=[init_label], command=lambda _: self.debounce_save())
+            self.gacha_group.pack(side="left", padx=(0, 5))
+            ctk.CTkButton(btn_gachagroup_frame, text="🔄", width=28, height=22,
+                          command=lambda: self.refresh_gacha_banners(autoConnect=True)).pack(side="left", padx=(0, 5))
+            # โหลดรายการตู้ครั้งแรกแบบ background (ไม่บล็อก UI) เผื่อเครื่องพร้อมแล้ว
+            self.refresh_gacha_banners()
+
+
+            # rgacha_cycles
+            btn_rgachacycles_frame = ctk.CTkFrame(self.mode_specific_frame)
+            btn_rgachacycles_frame.pack(fill="x", pady=3)
+            ctk.CTkLabel(btn_rgachacycles_frame, text="จำนวนรอบ").pack(side="left", padx=(0, 5))
+            self.rgacha_cycles = ctk.CTkEntry(btn_rgachacycles_frame, placeholder_text="1", width=50, height=20)
+            try:
+                self.rgacha_cycles.insert(0, self.config.get("settings", "rgachacycles"))
+            except Exception:
+                self.rgacha_cycles.insert(0, "1")
+            self.rgacha_cycles.pack(side="left")
+            self.rgacha_cycles.bind("<KeyRelease>", self.debounce_save)
 
         elif mode_key == "AutoSetup":
             ctk.CTkLabel(self.mode_specific_frame, text="🛠 Auto Setup").pack(pady=3)
@@ -890,6 +946,15 @@ class EmulatorManager(ctk.CTk):
                 p.terminate()
                 p.join(timeout=2)
         self.bot_processes.clear()
+        # หยุด Login workers (subprocess.Popen) ด้วย
+        for dev, p in list(getattr(self, "worker_procs", {}).items()):
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+        if hasattr(self, "worker_procs"):
+            self.worker_procs.clear()
 
     def _handle_kicked(self, payload):
         """
@@ -1119,10 +1184,9 @@ class EmulatorManager(ctk.CTk):
             if status_label:
                 status_label.configure(text="Stop", text_color="gray")
         else:
-            log_file = f"src/log/bot_{re.sub(r'[^a-zA-Z0-9._-]', '_', dev)}.log"
             if getattr(sys, 'frozen', False):
                 multiprocessing.set_executable(sys.executable)
-            p = Process(target=run_start_bot_with_log, args=(dev, log_file, CHOICE))
+            p = Process(target=run_bot, args=(dev, CHOICE))
             p.start()
             self.bot_processes[dev] = p
             self.monitor_bot(dev, p)
@@ -1155,11 +1219,16 @@ class EmulatorManager(ctk.CTk):
         time.sleep(0.5)
 
     def start_bot_for_selected(self):
+        # โหมด Login/GenID = headless: สปอว์นตามจำนวน thread ไม่ใช้ device
+        if self._isHeadlessThreadMode():
+            self._start_workers()
+            return
+
         self.save_config()
         # Verify subscription before starting bot
         if not self.verify_subscription_sync():
             return
-        
+
         readConfigFile()
         selected_devices = []
         for i, var in enumerate(self.check_vars):
@@ -1184,10 +1253,9 @@ class EmulatorManager(ctk.CTk):
                     return
                 else:
                     del self.bot_processes[dev]
-            log_file = f"src/log/bot_{re.sub(r'[^a-zA-Z0-9._-]', '_', dev)}.log"
             if getattr(sys, 'frozen', False):
                 multiprocessing.set_executable(sys.executable)
-            p = Process(target=run_start_bot_with_log, args=(dev, log_file, CHOICE))
+            p = Process(target=run_bot, args=(dev, CHOICE))
             p.start()
             self.bot_processes[dev] = p
             self.monitor_bot(dev, p)
@@ -1201,6 +1269,11 @@ class EmulatorManager(ctk.CTk):
 
 
     def stop_bot_for_selected(self):
+        # โหมด Login/GenID = headless: หยุดทุก worker
+        if self._isHeadlessThreadMode():
+            self._stop_workers()
+            return
+
         stopped = []
         selected_devices = []
         for idx, var in enumerate(self.check_vars):
@@ -1426,6 +1499,229 @@ class EmulatorManager(ctk.CTk):
         except Exception as e:
             print("Kill ADB failed:", e)
         ctk.CTkLabel(self.left_frame, text="❌ ไม่พบอุปกรณ์ ADB", text_color="gray").pack(pady=10)
+
+    # -----------------------------
+    # โหมด Login แบบ headless: แผงตั้งจำนวน thread + สปอว์น worker หลายโปรเซส
+    # -----------------------------
+    def _currentModeKey(self):
+        return self.play_mode_options.get(self.play_mode_var.get())
+
+    def _isLoginMode(self):
+        return self._currentModeKey() == "ranger_api_Login"
+
+    def _isGenIDMode(self):
+        return self._currentModeKey() == "ranger_api_GenID"
+
+    def _isHeadlessThreadMode(self):
+        """โหมดที่รันแบบ headless หลาย thread (ไม่ผูก device): Login + GenID
+
+        ทั้งสองโหมดไม่แตะ adb/เกม: Login relogin จากไฟล์ input, GenID mint บัญชีใหม่เอง
+        จึงใช้แผงตั้งจำนวน thread + สปอว์น worker ชุดเดียวกัน (ต่างกันแค่ฟังก์ชันที่ worker เรียก)
+        """
+        return self._currentModeKey() in ("ranger_api_Login", "ranger_api_GenID")
+
+    def render_left_panel(self):
+        """เลือกเนื้อหาแผงซ้ายตามโหมด: Login/GenID = ตั้งจำนวน thread (ไม่แตะ adb) อื่น ๆ = รายการ device"""
+        if self._isHeadlessThreadMode():
+            self._build_thread_panel()
+        else:
+            self.start_adb()
+
+    def _build_thread_panel(self):
+        # ล้างแผงซ้าย (ทั้ง device rows เดิมและ worker rows) แล้ววาดตัวตั้งจำนวน thread ใหม่
+        self.check_vars.clear()
+        for widget in self.left_frame.winfo_children():
+            widget.destroy()
+
+        isGen = self._isGenIDMode()
+        header = ctk.CTkFrame(self.left_frame, fg_color="#303030")
+        header.pack(fill="x", padx=4, pady=(6, 3))
+        ctk.CTkLabel(header, text=("🎯 จำนวน Thread สร้างไอดี" if isGen else "⚙ จำนวน Thread (headless)"),
+                     anchor="w").pack(side="left", padx=6)
+
+        ctrl = ctk.CTkFrame(self.left_frame, fg_color="#303030")
+        ctrl.pack(fill="x", padx=4, pady=3)
+        ctk.CTkButton(ctrl, text="−", width=34, fg_color="#444444", hover_color="#555555",
+                      command=lambda: self._change_thread_count(-1)).pack(side="left", padx=(6, 4), pady=4)
+        # ช่องพิมพ์เลขได้ (สูงสุด 1024) พิมพ์แล้ว Enter/คลิกออก = ปรับค่า ปุ่ม +/− ไว้ขยับทีละหน่วย
+        self.thread_count_entry = ctk.CTkEntry(ctrl, width=64, height=28, justify="center",
+                                               font=("Segoe UI", 16, "bold"))
+        self.thread_count_entry.insert(0, str(self.thread_count))
+        self.thread_count_entry.pack(side="left", padx=4)
+        self.thread_count_entry.bind("<Return>", lambda e: self._apply_thread_count_from_entry())
+        self.thread_count_entry.bind("<FocusOut>", lambda e: self._apply_thread_count_from_entry())
+        ctk.CTkButton(ctrl, text="+", width=34, fg_color="#444444", hover_color="#555555",
+                      command=lambda: self._change_thread_count(1)).pack(side="left", padx=4)
+        ctk.CTkLabel(ctrl, text="thread (สูงสุด 1024)", text_color="gray").pack(side="left", padx=4)
+
+        hint = ("แต่ละ thread สร้างบัญชีใหม่เอง (mint + signup) ส่งออกลง output/ ไม่กินไฟล์ input"
+                if isGen else "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันอัตโนมัติ")
+        ctk.CTkLabel(self.left_frame, text=hint,
+                     text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=8, pady=(2, 6))
+
+        # สรุปสถานะ worker เป็นแถวเดียว (อัปเดตเบา ไม่วาดทีละ worker แม้มีเป็นพันตัว = ลื่น)
+        self.worker_summary_label = ctk.CTkLabel(self.left_frame, text="", anchor="w",
+                                                 justify="left", wraplength=300,
+                                                 font=("Segoe UI", 14))
+        self.worker_summary_label.pack(fill="x", padx=8, pady=(4, 6))
+        self._update_worker_summary()
+
+    def _set_thread_count(self, n):
+        """ตั้งค่า thread_count (clamp 1..1024) อัปเดตช่องพิมพ์ แล้วเซฟลง config"""
+        self.thread_count = max(1, min(int(n), 1024))
+        if hasattr(self, "thread_count_entry") and self.thread_count_entry.winfo_exists():
+            self.thread_count_entry.delete(0, "end")
+            self.thread_count_entry.insert(0, str(self.thread_count))
+        try:
+            self.config.setdefault("settings", {})
+            self.config["settings"]["threadcount"] = str(self.thread_count)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                self.config.write(f)
+        except Exception as e:
+            print("save threadcount failed:", e)
+
+    def _change_thread_count(self, delta):
+        self._set_thread_count(self.thread_count + delta)
+
+    def _apply_thread_count_from_entry(self):
+        """อ่านเลขจากช่องพิมพ์ ถ้าไม่ใช่ตัวเลขให้คืนค่าเดิม"""
+        try:
+            raw = self.thread_count_entry.get().strip()
+            n = int(raw) if raw else self.thread_count
+        except (ValueError, Exception):
+            n = self.thread_count
+        self._set_thread_count(n)
+
+    def _worker_serials(self):
+        return [f"worker-{i+1}" for i in range(self.thread_count)]
+
+    def _safe_worker_cap(self, requested):
+        """จำกัดจำนวนโปรเซสจริงตาม RAM ที่ว่าง (แต่ละ worker ~90MB) กัน OOM แม้ตั้งเลขไว้สูง
+
+        ใช้ available physical RAM * 0.6 หาร 90MB ถ้าอ่าน RAM ไม่ได้ถอยไปเพดานปลอดภัย 64
+        คืน (จำนวนที่จะรันจริง, เพดานที่คำนวณได้) เพื่อเตือนผู้ใช้เมื่อถูกจำกัด
+        """
+        PER_MB = 55   # worker headless (subprocess bot_worker.py) ~45MB + เผื่อโตตอนรัน
+        cap = 64
+        try:
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                            ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(ms)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                cap = max(1, int(ms.ullAvailPhys / 1048576 * 0.6 / PER_MB))
+        except Exception:
+            pass
+        return min(requested, cap), cap
+
+    def _update_worker_summary(self):
+        """อัปเดตสรุปสถานะ worker แบบเบา (นับตัวที่ยังรัน) - ถูกกว่าวาดทีละแถว"""
+        if not hasattr(self, "worker_summary_label") or not self.worker_summary_label.winfo_exists():
+            return
+        total = len(self.worker_procs)
+        alive = sum(1 for p in self.worker_procs.values() if p.poll() is None)
+        if total:
+            self.worker_summary_label.configure(
+                text=f"▶ กำลังรัน {alive}/{total} thread",
+                text_color=whiteblue if alive else "gray")
+        else:
+            self.worker_summary_label.configure(text="กด ▶ Start เพื่อเริ่ม", text_color="gray")
+
+    def _spawn_worker(self, device, mode="ranger_api_Login"):
+        """สปอว์น 1 worker เป็น subprocess ของ bot_worker.py (ไม่ re-import main = ไม่โหลด GUI)
+
+        subprocess แทน multiprocessing เพราะบน Windows multiprocessing spawn จะ re-import main.py
+        (มี class EmulatorManager(ctk.CTk) ระดับ module) ทำให้ทุก worker โหลด customtkinter+u2 (~59MB)
+        subprocess ของไฟล์เบา bot_worker.py -> ~30-45MB/worker -> รันเป็นพันตัวได้
+
+        mode บอก worker ว่าจะรัน Login (relogin จากไฟล์) หรือ GenID (mint บัญชีใหม่) headless
+        """
+        botdir = os.path.dirname(os.path.abspath(__file__))
+        no_window = 0x08000000  # CREATE_NO_WINDOW: ไม่เด้ง console ต่อ worker (สำคัญตอนมีพันตัว)
+        if getattr(sys, 'frozen', False):
+            # frozen: exe รันสคริปต์ .py ไม่ได้ -> re-exec exe ในโหมด --worker (main.py __main__ จัดการ)
+            args = [sys.executable, "--worker", device, mode]
+        else:
+            args = [sys.executable, os.path.join(botdir, "bot_worker.py"), device, mode]
+        return subprocess.Popen(args, cwd=botdir, creationflags=no_window)
+
+    def _monitor_workers(self):
+        """ตัวจับเวลาตัวเดียวคุมทุก worker (แทน monitor ต่อโปรเซส) - ลื่นแม้มีเป็นพันตัว"""
+        for dev in [d for d, p in list(self.worker_procs.items()) if p.poll() is not None]:
+            self.worker_procs.pop(dev, None)
+        self._update_worker_summary()
+        if self.worker_procs:
+            self._worker_monitor_job = self.after(1000, self._monitor_workers)
+        else:
+            self._worker_monitor_job = None
+
+    def _start_workers(self):
+        self.save_config()
+        if not self.verify_subscription_sync():
+            return
+        readConfigFile()
+
+        # หยุด worker เก่าก่อน (กัน spawn ซ้อน)
+        self._stop_workers(silent=True)
+
+        # โหมดปัจจุบัน (Login = relogin จาก input, GenID = mint บัญชีใหม่) worker ใช้ค่านี้เลือกฟังก์ชัน
+        mode_key = self._currentModeKey() or "ranger_api_Login"
+
+        # รันตามจำนวนที่ตั้งไว้เต็ม ๆ (ปลด cap ตาม RAM แล้ว) - แค่เตือนถ้าเกินที่ RAM น่าจะรับไหว
+        run_count = self.thread_count
+        _fit, cap = self._safe_worker_cap(self.thread_count)
+        if run_count > cap:
+            print(f"เตือน: รัน {run_count} thread แต่ RAM น่าจะรับไหวราว ~{cap} "
+                  f"(แต่ละ worker ~45MB) เสี่ยงหน่วยความจำหมด/ช้า", flush=True)
+        serials = [f"worker-{i+1}" for i in range(run_count)]
+        # Login แบ่งไฟล์ input/ ให้แต่ละ worker + ล้าง lock ค้าง; GenID สร้างบัญชีใหม่เอง ไม่กินไฟล์ input
+        if mode_key != "ranger_api_GenID":
+            note_file_in_folder(serials)
+        self._update_worker_summary()
+
+        def start_with_delay(i):
+            if i >= len(serials):
+                return
+            dev = serials[i]
+            try:
+                self.worker_procs[dev] = self._spawn_worker(dev, mode_key)
+            except Exception as e:
+                print(f"spawn worker {dev} failed: {e}", flush=True)
+            self._update_worker_summary()
+            # stagger การเริ่ม เพื่อไม่ให้ยิง login พร้อมกันทั้งหมด (กันเซิร์ฟเวอร์ rate-limit)
+            self.after(int(timeInterval) if timeInterval else 300, lambda: start_with_delay(i + 1))
+
+        start_with_delay(0)
+        # ตัวจับเวลาตัวเดียวคุมทุก worker
+        if getattr(self, "_worker_monitor_job", None) is None:
+            self._monitor_workers()
+
+    def _stop_workers(self, silent=False):
+        stopped = []
+        for dev, p in list(self.worker_procs.items()):
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                    stopped.append(dev)
+                except Exception:
+                    pass
+            self.worker_procs.pop(dev, None)
+        job = getattr(self, "_worker_monitor_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._worker_monitor_job = None
+        self._update_worker_summary()
+        if not silent and not stopped:
+            print("No running workers to stop.")
 
     def monitor_bot(self, dev, p):
         if p.is_alive():
@@ -1876,25 +2172,27 @@ def open_gear_book():
     webbrowser.open(url)
 
 
-def run_start_bot_with_log(device, log_file, choice):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    f = open(log_file, "w", buffering=1, encoding="utf-8")
-    sys.stdout = f
-    sys.stderr = f
+def run_bot(device, choice):
+    """target ของ worker process - ไม่เขียน log ไฟล์แล้ว
+
+    กลบ stdout/stderr ทิ้งลง devnull: รันหลายร้อยโปรเซสพร้อมกัน ถ้าปล่อยพ่นเข้า console เดียว
+    จะรกและปนกัน (แบบ error OpenBLAS ที่เห็นก่อนหน้า) ไม่มี console ก็ยังพังตอน print
+    """
+    try:
+        devnull = open(os.devnull, "w")
+        sys.stdout = devnull
+        sys.stderr = devnull
+    except Exception:
+        pass
     try:
         if choice == "ranger_api_Login":
-            startBotLogin_API(device)
-        elif choice == "GenID":
-            # startBotGenID(device)
-            startBotGenIDLevel1(device)
+            startBotLogin_API_headless(device)   # headless แท้: mint LF_AC เองจากไฟล์ ไม่เปิดเกม/ไม่ต่อ adb
+        elif choice == "ranger_api_GenID":
+            startBotGenID_API_headless(device)   # headless แท้: mint บัญชีใหม่ผ่าน signup ไม่เปิดเกม/ไม่ต่อ adb
         elif choice == "AutoSetup":
-            # autoSetUp(device)
             startBotCheckGameInfo_API(device)
-
-    except Exception as e:
-        print("Error:", e, flush=True)
-    finally:
-        f.close()
+    except Exception:
+        pass
 
 
 
@@ -2122,6 +2420,16 @@ def note_file_in_folder(selected_devices: list):
         print(f"{device} = {count} ไฟล์")
 
 if __name__ == "__main__":
+    # โหมด worker (เฉพาะ frozen exe ที่รันสคริปต์ .py ไม่ได้): รัน Login headless แล้วออก ไม่เปิด GUI
+    # dev รันผ่าน bot_worker.py โดยตรง จึงไม่เข้าเงื่อนไขนี้
+    if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
+        try:
+            from bot_worker import run_worker
+            _mode = sys.argv[3] if len(sys.argv) > 3 else "ranger_api_Login"
+            run_worker(sys.argv[2], _mode)
+        finally:
+            sys.exit(0)
+
     # ===== Runtime Protection Checks =====
     if _HAS_PROTECTION:
         # Snapshot module hashes for integrity monitoring
