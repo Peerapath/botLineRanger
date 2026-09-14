@@ -79,3 +79,46 @@ def test_replace_enc_preserves_lf_layout():
     m = re.search(r'<string name="_ENC_LF_AC_KEY">(.*?)</string>', out, re.S)
     blob = html.unescape(m.group(1)).strip()
     assert decrypt_lfac(udid, blob) == new_lfac
+
+
+def test_login_builds_v123_cookie_and_reads_setcookie(monkeypatch):
+    seen = {}
+
+    def fake_do(req):
+        seen["cookie"] = req.headers["Cookie"]
+        seen["url"] = req.full_url
+        seen["app_version"] = req.headers["App-version"]  # urllib title-cases header keys
+        return 200, {"result": {"rsn": "1097a844", "level": 3, "isNew": False}}, ["LF_AC=NEWTOKEN123; Domain=line-apps.com"]
+
+    monkeypatch.setattr(relogin.na, "_do", fake_do)
+    st, result, lf = relogin.login("CCVAL", "UDIDVAL", "OLDLFAC", "TH")
+    assert st == 200 and lf == "NEWTOKEN123" and result["rsn"] == "1097a844"
+    assert "cc=CCVAL" in seen["cookie"]
+    assert "udid=UDIDVAL" in seen["cookie"]
+    assert "guestCookie=OLDLFAC" in seen["cookie"]
+    assert "/v12.3/login" in seen["url"]
+    assert seen["app_version"] == "LGRGS/12.3.0;android/12"
+
+
+def test_login_401_returns_none_lfac(monkeypatch):
+    monkeypatch.setattr(relogin.na, "_do",
+                        lambda req: (401, {"errorCode": 401}, []))
+    st, result, lf = relogin.login("CC", "U", "OLD", "TH")
+    assert st == 401 and lf is None and result is None
+
+
+def test_ccpool_renew_only_once_per_stale_cc(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_register(dev):
+        calls["n"] += 1
+        return {"userToken": "cc-%d" % calls["n"]}
+
+    monkeypatch.setattr(relogin.na, "register_guest", fake_register)
+    pool = relogin.CcPool()
+    first = pool.get()
+    # สอง thread เห็น cc เดิมเดียวกันแล้วขอ renew พร้อมกัน -> สร้างใหม่ครั้งเดียว
+    a = pool.renew(first)
+    b = pool.renew(first)
+    assert a == b != first
+    assert calls["n"] == 2  # ครั้งแรกตอน get(), ครั้งที่สองตอน renew()

@@ -16,13 +16,28 @@ import argparse
 import html
 import os
 import re
+import secrets
 import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from account_file import encrypt_lfac, _wrapped  # noqa: E402
 from device_session import decrypt_lfac  # noqa: E402
 
+import new_account as na  # noqa: E402
+import rangers_api  # noqa: E402
+
 ENC_RE = re.compile(r'(<string name="_ENC_LF_AC_KEY">)(.*?)(</string>)', re.S)
+
+UA_GAME = "LGRGS/%s (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)" % rangers_api.CLIENT_VERSION
+APP_VERSION = "LGRGS/%s;android/12" % rangers_api.CLIENT_VERSION
+RANGERS_HOST = rangers_api.HOST
+LOGIN_PATH = rangers_api.API + "/login"
+PROVEN_WINDOW = 60.0  # วินาที: cc ที่เพิ่งสำเร็จภายในช่วงนี้ ถือว่า 401 = ไฟล์เสียเอง
+RETRY_WAITS = (2, 4, 8)  # backoff เมื่อเจอ network error / 429 / 5xx
 
 
 class BadFile(Exception):
@@ -57,3 +72,87 @@ def replace_enc(text, udid, lf_ac):
     """แทนที่เฉพาะค่า _ENC_LF_AC_KEY ด้วย blob ใหม่ คงส่วนอื่นทุกไบต์"""
     wrapped = _wrapped(encrypt_lfac(udid, lf_ac))
     return ENC_RE.sub(lambda m: m.group(1) + wrapped + m.group(3), text, count=1)
+
+
+class Transient(Exception):
+    """error ชั่วคราวที่ retry แล้วยังไม่หาย -> ให้ตัวเรียกนับเป็น error"""
+
+
+def login(cc, udid, guest_cookie, nation, language="en"):
+    """ยิง GET /v12.3/login คืน (status, result_or_None, lf_ac_or_None).
+
+    retry เองเมื่อเจอ network error / 429 / 5xx (RETRY_WAITS). ถ้ายังไม่หายหลัง
+    retry ครบ -> raise Transient ให้ process_file นับเป็น error. 401 ไม่ retry
+    (เป็นคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว).
+    """
+    cookie = "cc=%s; udid=%s; guestCookie=%s;" % (cc, udid, guest_cookie)
+    last = None
+    for attempt in range(len(RETRY_WAITS) + 1):
+        ts_ms = str(int(time.time() * 1000))
+        headers = {
+            "App-Version": APP_VERSION,
+            "userType": "",
+            "Nation-Code": nation,
+            "Accept-Language": language,
+            "User-Agent": UA_GAME,
+            "marketId": "",
+            "useLGC": "true",
+            "X-LINEGAME-MCC": "000",
+            "X-LINEGAME-MNC": "00",
+            "X-LINEGAME-TIMESTAMP": ts_ms,
+            "Host": RANGERS_HOST,
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Cookie": cookie,
+        }
+        req = urllib.request.Request("https://" + RANGERS_HOST + LOGIN_PATH,
+                                     headers=headers, method="GET")
+        try:
+            status, res, cookies = na._do(req)
+        except urllib.error.URLError:
+            last = "network"
+            status = None
+        else:
+            if status == 429 or (isinstance(status, int) and 500 <= status < 600):
+                last = status
+            else:
+                lf_ac = na._cookie_value(cookies, "LF_AC")
+                result = res.get("result") if isinstance(res, dict) and "result" in res else None
+                if not result or not lf_ac:
+                    return status, None, None
+                return status, result, lf_ac
+        if attempt < len(RETRY_WAITS):
+            time.sleep(RETRY_WAITS[attempt])
+    raise Transient("transient after retries: %s" % last)
+
+
+class CcPool:
+    """เก็บ cc ที่ทุก thread ใช้ร่วมกัน สร้างใหม่แค่ครั้งเดียวต่อ cc ที่ตายแล้ว"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cc = None
+        self._proven_at = 0.0
+        self._mint()
+
+    def _mint(self):
+        self._cc = na.register_guest(secrets.token_hex(16))["userToken"]
+        self._proven_at = 0.0
+
+    def get(self):
+        with self._lock:
+            return self._cc
+
+    def renew(self, old_cc):
+        with self._lock:
+            if self._cc == old_cc:   # ยังไม่มีใคร renew cc ตัวนี้ -> สร้างใหม่
+                self._mint()
+            return self._cc
+
+    def mark_proven(self):
+        with self._lock:
+            self._proven_at = time.monotonic()
+
+    def is_proven(self):
+        with self._lock:
+            return (time.monotonic() - self._proven_at) < PROVEN_WINDOW
