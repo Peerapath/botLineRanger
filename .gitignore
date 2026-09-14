@@ -18,3 +18,8 @@ tools/frida/*.capture.txt
 
 # Build-time secret tool: holds plaintext master_password/api_url. Keep local only.
 bot/encrypt_config.py
+
+# Relogin batch: account inputs, backups, and its log all carry live LF_AC.
+bot/input/
+*_backup/
+*.relogin.csv
