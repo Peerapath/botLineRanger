@@ -242,13 +242,24 @@ def process_file(full_path, root, pool, backup_root):
         return {"rel": rel, "status": "error", "rsn": "", "level": ""}
 
     pool.mark_proven()
-    backup_once(full_path, root, backup_root)
-    new_text = replace_enc(acct["text"], acct["udid"], lf_ac)
-    atomic_write(full_path, new_text)
-    # ตรวจซ้ำ: ถอดจากไฟล์ที่เขียนแล้วต้องได้ lf_ac เดิม ไม่ตรง = คืนข้อความเดิม
-    check = read_account(full_path)
-    if decrypt_lfac(check["udid"], check["enc"]) != lf_ac:
-        atomic_write(full_path, acct["text"])
+
+    def _restore():
+        try:
+            atomic_write(full_path, acct["text"])
+        except OSError:
+            pass
+
+    try:
+        backup_once(full_path, root, backup_root)
+        new_text = replace_enc(acct["text"], acct["udid"], lf_ac)
+        atomic_write(full_path, new_text)
+        check = read_account(full_path)
+        verified = decrypt_lfac(check["udid"], check["enc"]) == lf_ac
+    except Exception:
+        _restore()
+        return {"rel": rel, "status": "error", "rsn": "", "level": ""}
+    if not verified:
+        _restore()
         return {"rel": rel, "status": "error", "rsn": "", "level": ""}
     return {"rel": rel, "status": "ok",
             "rsn": result.get("rsn", ""), "level": result.get("level", "")}

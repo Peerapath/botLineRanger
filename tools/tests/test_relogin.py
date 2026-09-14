@@ -221,3 +221,38 @@ def test_process_file_bad_file(tmp_path):
         def is_proven(self): return True
     res = relogin.process_file(str(src), str(tmp_path / "acc"), P(), str(tmp_path / "bk"))
     assert res["status"] == "bad_file"
+
+
+def test_process_file_write_failure_returns_error_not_raise(tmp_path, monkeypatch):
+    import account_file
+    udid = account_file.new_udid()
+    src = tmp_path / "acc" / "d.xml"
+    src.parent.mkdir()
+    _write_guest_xml(src, udid, "OLD")
+    monkeypatch.setattr(relogin, "login", lambda *a, **k: (200, {"rsn": "9", "level": 1}, "FRESH"))
+
+    def boom(*a, **k):
+        raise OSError("simulated file lock")
+
+    monkeypatch.setattr(relogin, "atomic_write", boom)
+
+    class Pool:
+        def get(self): return "cc"
+        def is_proven(self): return True
+        def mark_proven(self): pass
+        def renew(self, old): return "cc2"
+
+    res = relogin.process_file(str(src), str(tmp_path / "acc"), Pool(), str(tmp_path / "bk"))
+    assert res["status"] == "error"   # returned, not raised
+
+
+def test_backup_once_never_overwrites_existing(tmp_path):
+    root = tmp_path / "acc"
+    root.mkdir()
+    f = root / "e.xml"
+    f.write_text("NEW-CONTENT", encoding="utf-8")
+    backup = tmp_path / "bk"
+    backup.mkdir()
+    (backup / "e.xml").write_text("ORIGINAL-FIRST-BACKUP", encoding="utf-8")
+    relogin.backup_once(str(f), str(root), str(backup))
+    assert (backup / "e.xml").read_text(encoding="utf-8") == "ORIGINAL-FIRST-BACKUP"
