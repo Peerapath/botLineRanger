@@ -13,6 +13,7 @@ Standard library เท่านั้น (account_file/device_session ใช้
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import html
 import os
@@ -263,3 +264,111 @@ def process_file(full_path, root, pool, backup_root):
         return {"rel": rel, "status": "error", "rsn": "", "level": ""}
     return {"rel": rel, "status": "ok",
             "rsn": result.get("rsn", ""), "level": result.get("level", "")}
+
+
+REJECT_STOP = 10   # rejected ติดกันเท่านี้ = น่าจะเซิร์ฟเวอร์ปิดปรับปรุง -> หยุด
+ERROR_STOP = 60    # error ติดกันเท่านี้ -> หยุด (พักระหว่างทางจัดการใน run)
+
+
+class StopTracker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rejected = 0
+        self._error = 0
+
+    def record(self, status):
+        with self._lock:
+            if status == "rejected":
+                self._rejected += 1
+                self._error = 0
+            elif status == "error":
+                self._error += 1
+                self._rejected = 0
+            else:  # ok, bad_file คั่น streak การหยุด
+                self._rejected = 0
+                self._error = 0
+            if self._rejected >= REJECT_STOP:
+                return "maintenance"
+            if self._error >= ERROR_STOP:
+                return "errors"
+            return None
+
+
+def _fmt_summary(counts):
+    return " ".join("%s=%d" % (k, counts.get(k, 0))
+                    for k in ("ok", "rejected", "error", "bad_file"))
+
+
+def run(root, workers, limit, force):
+    root = os.path.abspath(root)
+    log_path = root.rstrip("/\\") + ".relogin.csv"
+    backup_root = root.rstrip("/\\") + "_backup"
+    done = parse_log(log_path)
+    targets = iter_targets(root, done, force, limit)
+    total = len(targets)
+    print("targets: %d (skipped %d already ok)" % (total, sum(1 for s in done.values() if s == "ok")))
+    if not total:
+        return {}
+
+    pool = CcPool()
+    tracker = StopTracker()
+    counts = {}
+    log_lock = threading.Lock()
+    new_log = not os.path.exists(log_path)
+    stop_reason = [None]
+
+    log_fh = open(log_path, "a", encoding="utf-8", newline="")
+    writer = csv.writer(log_fh)
+    if new_log:
+        writer.writerow(["path", "status", "rsn", "level", "time"])
+
+    done_n = [0]
+
+    def worker(path):
+        if stop_reason[0]:
+            return None
+        res = process_file(path, root, pool, backup_root)
+        with log_lock:
+            counts[res["status"]] = counts.get(res["status"], 0) + 1
+            writer.writerow([res["rel"], res["status"], res["rsn"], res["level"],
+                             time.strftime("%Y-%m-%dT%H:%M:%S")])
+            log_fh.flush()
+            done_n[0] += 1
+            if done_n[0] % 100 == 0:
+                print("[%d/%d] %s" % (done_n[0], total, _fmt_summary(counts)))
+        reason = tracker.record(res["status"])
+        if reason and not stop_reason[0]:
+            stop_reason[0] = reason
+        return res
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(worker, p) for p in targets]
+            for _ in concurrent.futures.as_completed(futures):
+                if stop_reason[0]:
+                    for f in futures:
+                        f.cancel()
+    finally:
+        log_fh.close()
+
+    if stop_reason[0] == "maintenance":
+        print("STOP: rejected %d ครั้งติดกัน — น่าจะเซิร์ฟเวอร์ปิดปรับปรุง (ทุกคำขอ 401). รันซ้ำภายหลังได้" % REJECT_STOP)
+    elif stop_reason[0] == "errors":
+        print("STOP: error ติดกันมากเกินไป — หยุดไว้ก่อน ตรวจเน็ต/เซิร์ฟเวอร์แล้วรันซ้ำ")
+    print("done: %s" % _fmt_summary(counts))
+    return counts
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("folder", help="โฟลเดอร์ที่มีไฟล์ .xml (รวมโฟลเดอร์ย่อย)")
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--force", action="store_true", help="ทำซ้ำแม้เคย ok แล้ว")
+    args = parser.parse_args(argv)
+    run(args.folder, args.workers, args.limit, args.force)
+
+
+if __name__ == "__main__":
+    main()

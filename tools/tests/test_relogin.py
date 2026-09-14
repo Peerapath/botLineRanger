@@ -256,3 +256,20 @@ def test_backup_once_never_overwrites_existing(tmp_path):
     (backup / "e.xml").write_text("ORIGINAL-FIRST-BACKUP", encoding="utf-8")
     relogin.backup_once(str(f), str(root), str(backup))
     assert (backup / "e.xml").read_text(encoding="utf-8") == "ORIGINAL-FIRST-BACKUP"
+
+
+def test_stop_tracker_stops_after_10_consecutive_rejected():
+    t = relogin.StopTracker()
+    reasons = [t.record("rejected") for _ in range(10)]
+    assert reasons[:9] == [None] * 9
+    assert reasons[9] == "maintenance"
+
+
+def test_stop_tracker_ok_resets_rejected_streak():
+    t = relogin.StopTracker()
+    for _ in range(9):
+        assert t.record("rejected") is None
+    assert t.record("ok") is None          # ok คั่น -> เริ่มนับใหม่
+    for _ in range(9):
+        assert t.record("rejected") is None
+    assert t.record("rejected") == "maintenance"  # ครบ 10 อีกรอบ
