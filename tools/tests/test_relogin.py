@@ -144,9 +144,13 @@ def test_iter_targets_skips_ok_unless_force(tmp_path):
         (root / rel).write_text("x", encoding="utf-8")
     done = {"a.xml": "ok", "c.xml": "rejected"}
     got = relogin.iter_targets(str(root), done, force=False, limit=None)
-    rels = sorted(os.path.relpath(p, str(root)).replace("\\", "/") for p in got)
-    assert rels == ["c.xml", "sub/b.xml"]        # a.xml (ok) ถูกข้าม
+    assert [os.path.relpath(p, str(root)).replace("\\", "/") for p in got] == ["c.xml", "sub/b.xml"]        # a.xml (ok) ถูกข้าม, assert actual order
     got_force = relogin.iter_targets(str(root), done, force=True, limit=None)
     assert len(got_force) == 3
     got_limit = relogin.iter_targets(str(root), {}, force=False, limit=2)
-    assert len(got_limit) == 2
+    assert [os.path.relpath(p, str(root)).replace("\\", "/") for p in got_limit] == ["a.xml", "c.xml"]  # sorted order, limit 2 → earliest 2
+
+
+def test_parse_log_missing_file_returns_empty(tmp_path):
+    missing = str(tmp_path / "nope.csv")
+    assert relogin.parse_log(missing) == {}
