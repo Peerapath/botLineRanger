@@ -122,3 +122,31 @@ def test_ccpool_renew_only_once_per_stale_cc(monkeypatch):
     b = pool.renew(first)
     assert a == b != first
     assert calls["n"] == 2  # ครั้งแรกตอน get(), ครั้งที่สองตอน renew()
+
+
+def test_parse_log_keeps_latest_status(tmp_path):
+    log = tmp_path / "x.relogin.csv"
+    log.write_text(
+        "path,status,rsn,level,time\n"
+        "a.xml,error,,,2026-09-14T10:00:00\n"
+        "a.xml,ok,111,3,2026-09-14T10:05:00\n"
+        "b.xml,rejected,,,2026-09-14T10:06:00\n",
+        encoding="utf-8",
+    )
+    done = relogin.parse_log(str(log))
+    assert done == {"a.xml": "ok", "b.xml": "rejected"}
+
+
+def test_iter_targets_skips_ok_unless_force(tmp_path):
+    root = tmp_path / "acc"
+    (root / "sub").mkdir(parents=True)
+    for rel in ("a.xml", "sub/b.xml", "c.xml"):
+        (root / rel).write_text("x", encoding="utf-8")
+    done = {"a.xml": "ok", "c.xml": "rejected"}
+    got = relogin.iter_targets(str(root), done, force=False, limit=None)
+    rels = sorted(os.path.relpath(p, str(root)).replace("\\", "/") for p in got)
+    assert rels == ["c.xml", "sub/b.xml"]        # a.xml (ok) ถูกข้าม
+    got_force = relogin.iter_targets(str(root), done, force=True, limit=None)
+    assert len(got_force) == 3
+    got_limit = relogin.iter_targets(str(root), {}, force=False, limit=2)
+    assert len(got_limit) == 2

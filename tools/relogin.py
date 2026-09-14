@@ -13,6 +13,7 @@ Standard library เท่านั้น (account_file/device_session ใช้
 from __future__ import annotations
 
 import argparse
+import csv
 import html
 import os
 import re
@@ -156,3 +157,35 @@ class CcPool:
     def is_proven(self):
         with self._lock:
             return (time.monotonic() - self._proven_at) < PROVEN_WINDOW
+
+
+def parse_log(log_path):
+    """อ่าน log เดิม คืน map rel-path -> status ล่าสุด (บรรทัดท้ายชนะ)"""
+    done = {}
+    if not os.path.exists(log_path):
+        return done
+    with open(log_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            if row.get("path"):
+                done[row["path"]] = row.get("status", "")
+    return done
+
+
+def iter_targets(root, done, force, limit):
+    """คืน path เต็มของ .xml ที่ต้องทำ เรียงตาม rel-path ข้ามที่ ok แล้ว"""
+    rels = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".xml"):
+                full = os.path.join(dirpath, name)
+                rels.append((os.path.relpath(full, root).replace("\\", "/"), full))
+    rels.sort(key=lambda t: t[0])
+    out = []
+    for rel, full in rels:
+        if not force and done.get(rel) == "ok":
+            continue
+        out.append(full)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
