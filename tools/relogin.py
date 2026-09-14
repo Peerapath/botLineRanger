@@ -140,7 +140,10 @@ class CcPool:
         self._mint()
 
     def _mint(self):
-        self._cc = na.register_guest(secrets.token_hex(16))["userToken"]
+        try:
+            self._cc = na.register_guest(secrets.token_hex(16))["userToken"]
+        except (Exception, SystemExit) as exc:
+            raise Transient("guest mint failed: %s" % type(exc).__name__)
         self._proven_at = 0.0
 
     def get(self):
@@ -267,7 +270,7 @@ def process_file(full_path, root, pool, backup_root):
 
 
 REJECT_STOP = 10   # rejected ติดกันเท่านี้ = น่าจะเซิร์ฟเวอร์ปิดปรับปรุง -> หยุด
-ERROR_STOP = 60    # error ติดกันเท่านี้ -> หยุด (พักระหว่างทางจัดการใน run)
+ERROR_STOP = 60    # error ติดกันเท่านี้ -> หยุด
 
 
 class StopTracker:
@@ -310,11 +313,15 @@ def run(root, workers, limit, force):
     if not total:
         return {}
 
-    pool = CcPool()
+    try:
+        pool = CcPool()
+    except Transient:
+        print("cannot mint an initial guest cc (game auth may be down) - aborting; rerun later")
+        return {}
     tracker = StopTracker()
     counts = {}
     log_lock = threading.Lock()
-    new_log = not os.path.exists(log_path)
+    new_log = (not os.path.exists(log_path)) or os.path.getsize(log_path) == 0
     stop_reason = [None]
 
     log_fh = open(log_path, "a", encoding="utf-8", newline="")

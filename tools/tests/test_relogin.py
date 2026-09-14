@@ -298,3 +298,32 @@ def test_run_logs_error_when_process_file_raises(tmp_path, monkeypatch):
     with open(str(root) + ".relogin.csv", encoding="utf-8", newline="") as fh:
         rows = list(_csv.DictReader(fh))
     assert rows and rows[0]["status"] == "error"
+
+
+def test_ccpool_mint_failure_raises_transient(monkeypatch):
+    import pytest
+
+    def boom(dev):
+        raise SystemExit("trident down")
+
+    monkeypatch.setattr(relogin.na, "register_guest", boom)
+    with pytest.raises(relogin.Transient):
+        relogin.CcPool()
+
+
+def test_process_file_error_when_renew_fails(tmp_path, monkeypatch):
+    import account_file
+    udid = account_file.new_udid()
+    src = tmp_path / "acc" / "f.xml"
+    src.parent.mkdir()
+    _write_guest_xml(src, udid, "OLD")
+    monkeypatch.setattr(relogin, "login", lambda *a, **k: (401, None, None))
+
+    class Pool:
+        def get(self): return "cc"
+        def is_proven(self): return False   # force the renew path
+        def renew(self, old): raise relogin.Transient("mint failed")
+        def mark_proven(self): pass
+
+    res = relogin.process_file(str(src), str(tmp_path / "acc"), Pool(), str(tmp_path / "bk"))
+    assert res["status"] == "error"   # renew failure surfaced, not swallowed
