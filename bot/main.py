@@ -337,6 +337,7 @@ class EmulatorManager(ctk.CTk):
         except Exception:
             self.thread_count = 4
         self.thread_count = max(1, min(self.thread_count, 1024))
+        self._worker_seq = 0   # ลำดับ worker ที่สปอว์น ใช้แจก proxy วน (ดู _worker_env)
 
         self._save_job = None  # สำหรับ debounce
 
@@ -1633,6 +1634,19 @@ class EmulatorManager(ctk.CTk):
         else:
             self.worker_summary_label.configure(text="กด ▶ Start เพื่อเริ่ม", text_color="gray")
 
+    def _worker_env(self):
+        """env ให้ worker คุม rate limit ร่วมกันทั้งเครื่อง (ดู tools/ratelimit.py):
+        งบ req/s ต่อ IP, proxy แจกวนตามลำดับ worker, และโฟลเดอร์ lock file ที่ทุก worker ใช้ร่วมกัน"""
+        if TOOLSDIR not in sys.path:
+            sys.path.insert(0, TOOLSDIR)
+        import ratelimit
+        rps = self.config.get("settings", "apirps", fallback="80").strip() or "80"
+        proxies = ratelimit.parse_proxies(self.config.get("settings", "apiproxies", fallback=""))
+        index = self._worker_seq
+        self._worker_seq += 1
+        rl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ratelimit")
+        return ratelimit.spawn_env(os.environ, rps, proxies, index, rl_dir)
+
     def _spawn_worker(self, device, mode="ranger_api_Login"):
         """สปอว์น 1 worker เป็น subprocess ของ bot_worker.py (ไม่ re-import main = ไม่โหลด GUI)
 
@@ -1649,7 +1663,7 @@ class EmulatorManager(ctk.CTk):
             args = [sys.executable, "--worker", device, mode]
         else:
             args = [sys.executable, os.path.join(botdir, "bot_worker.py"), device, mode]
-        return subprocess.Popen(args, cwd=botdir, creationflags=no_window)
+        return subprocess.Popen(args, cwd=botdir, creationflags=no_window, env=self._worker_env())
 
     def _monitor_workers(self):
         """ตัวจับเวลาตัวเดียวคุมทุก worker (แทน monitor ต่อโปรเซส) - ลื่นแม้มีเป็นพันตัว"""
