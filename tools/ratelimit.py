@@ -235,6 +235,138 @@ def bucket_for(host: str) -> IpBucket:
         return b
 
 
+# --- endpoint quotas (cross-process, sliding window) ------------------------------------------
+
+AUTH_QUOTA = os.environ.get("LGRGS_AUTH_QUOTA") or "2/60"   # "<calls>/<seconds>", "0" = off
+
+
+class SlidingQuota:
+    """At most `limit` sends per `window` seconds, shared by every process on this box that goes
+    out through the same proxy (= egress IP). State file holds the send timestamps of the last
+    `limit` calls. A sliding window never exceeds a server-side FIXED window of the same size,
+    so it is safe whichever the server uses.
+
+    Measured 2026-09-23: game-api.line.me /auth/v3.8/authentication allows exactly 2 calls per
+    IP per ~60 s regardless of pacing (the 3rd is HTTP 429), so guest minting must queue here.
+    """
+
+    def __init__(self, name, limit, window, rl_dir=None, proxy=None, clock=time.time, sleep=time.sleep,
+                 margin=1.0):
+        self.limit = int(limit)
+        self.window = float(window)
+        self.margin = float(margin)          # extra wait so clock skew never lands us on the edge
+        self._clock = clock
+        self._sleep = sleep
+        proxy = PROXY if proxy is None else proxy
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        self.path = os.path.join(rl_dir or rl_dir_(), "quota-%s-%s.txt" % (_proxy_id(proxy), safe))
+        self._disabled = self.limit <= 0 or self.window <= 0
+        self._fails = 0
+        if not self._disabled:
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            except OSError:
+                pass
+
+    def acquire(self) -> None:
+        while not self._disabled:
+            try:
+                wait = self._take()
+            except LockTimeout:
+                self._sleep(self.window / max(1, self.limit))
+                continue
+            except OSError as exc:
+                self._fails += 1
+                try:
+                    os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                except OSError:
+                    pass
+                if self._fails < 3:
+                    self._sleep(0.05)
+                    continue
+                print("ratelimit: quota %s disabled after %d failures (%s)" % (self.path, self._fails, exc),
+                      file=sys.stderr)
+                self._disabled = True
+                return
+            self._fails = 0
+            if wait <= 0:
+                return
+            self._sleep(wait + random.uniform(0, 0.25))
+
+    def _take(self) -> float:
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
+        with os.fdopen(fd, "r+") as fh:
+            _lock(fh)
+            try:
+                fh.seek(0)
+                now = self._clock()
+                stamps = []
+                for tok in fh.read().split():
+                    try:
+                        stamps.append(float(tok))
+                    except ValueError:
+                        pass
+                stamps = sorted(t for t in stamps if now - t < self.window)
+                if len(stamps) < self.limit:
+                    stamps.append(now)
+                    wait = 0.0
+                else:
+                    wait = stamps[0] + self.window - now + self.margin
+                fh.seek(0)
+                fh.truncate()
+                fh.write(" ".join("%.3f" % t for t in stamps[-self.limit:]))
+                fh.flush()
+            finally:
+                _unlock(fh)
+        return wait
+
+
+_QUOTAS: dict = {}
+
+
+def quota_for(name: str, spec: str) -> SlidingQuota:
+    """Process-wide SlidingQuota for `name` from a "<calls>/<seconds>" spec ("0" = disabled)."""
+    with _BUCKETS_LOCK:
+        q = _QUOTAS.get(name)
+        if q is None:
+            limit, window = 0, 1
+            if spec and spec.strip() not in ("0", ""):
+                parts = spec.split("/")
+                if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
+                    raise ValueError("quota spec must be <calls>/<seconds>, got %r" % spec)
+                limit, window = int(parts[0]), int(parts[1])
+            q = _QUOTAS[name] = SlidingQuota(name, limit, window)
+        return q
+
+
+def auth_quota() -> SlidingQuota:
+    """The shared quota for game-api.line.me /auth/v3.8/authentication (LGRGS_AUTH_QUOTA)."""
+    return quota_for("linegame-auth", AUTH_QUOTA)
+
+
+class locked_file:
+    """`with locked_file(path) as fh:` - the file opened r+ (created if missing) under the same
+    cross-process lock the buckets use. Used to share a minted cc between worker processes."""
+
+    def __init__(self, path):
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
+        self._fh = os.fdopen(fd, "r+", encoding="utf-8")
+        _lock(self._fh)
+        return self._fh
+
+    def __exit__(self, *exc):
+        try:
+            _unlock(self._fh)
+        finally:
+            self._fh.close()
+        return False
+
+
 # --- proxy / env helpers --------------------------------------------------------------------
 
 def _split_proxy(proxy):

@@ -212,3 +212,47 @@ def test_do_net_budget_never_exceeds_max_attempts(monkeypatch, wired):
     with pytest.raises(TimeoutError):
         na._do(_req("c=1"))
     assert wired.acquired == 2 and wired.sleeps == [(0, None)]
+
+
+class FakeQuota:
+    def __init__(self):
+        self.acquired = 0
+
+    def acquire(self):
+        self.acquired += 1
+
+
+def test_do_queues_authentication_through_auth_quota(monkeypatch, wired):
+    q = FakeQuota()
+    monkeypatch.setattr(ratelimit, "auth_quota", lambda: q)
+    _script(monkeypatch, [(429, b"<html>429</html>", _headers()), (200, OK, _headers())])
+    req = urllib.request.Request("https://game-api.line.me" + na.AUTH_PATH, data=b"x", method="POST")
+    st, _, _ = na._do(req)
+    assert st == 200 and q.acquired == 2                 # once per attempt
+    assert wired.sleeps == [(0, str(na._AUTH_429_WAIT))]  # auth 429 waits a chunk of the window
+
+
+def test_do_other_paths_do_not_touch_auth_quota(monkeypatch, wired):
+    q = FakeQuota()
+    monkeypatch.setattr(ratelimit, "auth_quota", lambda: q)
+    _script(monkeypatch, [(429, b"<html>", _headers()), (200, OK, _headers())])
+    st, _, _ = na._do(_req("c=1"))
+    assert st == 200 and q.acquired == 0 and wired.sleeps == [(0, None)]
+
+
+def test_register_guest_is_a_single_authentication_call(monkeypatch):
+    calls = []
+
+    def fake_game_call(path, device_id, body, **kw):
+        calls.append(path)
+        return 200, {"userToken": "UT", "refreshUserToken": "RT", "userKey": "T0FF"}, []
+    monkeypatch.setattr(na, "game_call", fake_game_call)
+    res = na.register_guest("d" * 32)
+    assert res["userToken"] == "UT" and calls == [na.AUTH_PATH]
+
+
+def test_register_guest_raises_systemexit_with_status(monkeypatch):
+    monkeypatch.setattr(na, "game_call", lambda *a, **k: (429, "<html>429</html>", []))
+    with pytest.raises(SystemExit) as info:
+        na.register_guest("d" * 32)
+    assert "HTTP 429" in str(info.value)

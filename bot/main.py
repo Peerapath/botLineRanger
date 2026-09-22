@@ -1666,8 +1666,33 @@ class EmulatorManager(ctk.CTk):
         # _APP_ROOT/.ratelimit (TOOLSDIR = _APP_ROOT/tools): รากของ repo ตอนรันจากซอร์ส, ข้าง exe ตอน
         # frozen. ใช้ __file__ ไม่ได้เพราะ PyInstaller onefile ชี้ไป temp ต่อการเปิด -> GUI สองตัว
         # ไม่แชร์ bucket และโฟลเดอร์หายตอนโปรแกรมปิด
-        rl_dir = os.path.join(os.path.dirname(TOOLSDIR), ".ratelimit")
-        return ratelimit.spawn_env(os.environ, rps, good_proxies, index, rl_dir)
+        rl_dir = self._rl_dir()
+        env = ratelimit.spawn_env(os.environ, rps, good_proxies, index, rl_dir)
+        env["LGRGS_CC_FILE"] = os.path.join(rl_dir, "cc.txt")   # cc ร่วมที่ GUI mint ไว้ (ดู _prepare_shared_cc)
+        return env
+
+    @staticmethod
+    def _rl_dir():
+        return os.path.join(os.path.dirname(TOOLSDIR), ".ratelimit")
+
+    def _prepare_shared_cc(self):
+        """mint guest cc หนึ่งตัวใน GUI แล้วเก็บลงไฟล์ร่วม ให้ worker ทุกตัวใช้แทนการ mint เอง
+
+        game-api.line.me ให้ mint ได้แค่ 2 ครั้ง/นาที/IP (วัด 2026-09-23) ถ้า worker 16 ตัว mint พร้อมกัน
+        จะล้มเกือบหมด ("guest mint failed") cc ตัวเดียวใช้ได้กับทุกบัญชี จึง mint ที่นี่ครั้งเดียว
+        (ใช้ของเดิมในไฟล์ถ้าอายุไม่เกิน 10 นาที) worker renew ผ่านไฟล์เดียวกันเมื่อโดน 401
+        """
+        if TOOLSDIR not in sys.path:
+            sys.path.insert(0, TOOLSDIR)
+        import relogin
+        try:
+            relogin.CcPool(share_file=os.path.join(self._rl_dir(), "cc.txt"), max_age=600)
+            return True
+        except Exception as e:
+            messagebox.showerror("mint guest ไม่สำเร็จ",
+                                 f"ขอ cc จาก LINE ไม่ได้: {e}\n\n"
+                                 "ถ้าเป็น HTTP 429 ให้รอ 1 นาทีแล้วกดเริ่มใหม่ (โควตา 2 ครั้ง/นาที/IP)")
+            return False
 
     def _spawn_worker(self, device, mode="ranger_api_Login"):
         """สปอว์น 1 worker เป็น subprocess ของ bot_worker.py (ไม่ re-import main = ไม่โหลด GUI)
@@ -1708,6 +1733,9 @@ class EmulatorManager(ctk.CTk):
 
         # โหมดปัจจุบัน (Login = relogin จาก input, GenID = mint บัญชีใหม่) worker ใช้ค่านี้เลือกฟังก์ชัน
         mode_key = self._currentModeKey() or "ranger_api_Login"
+        # Login/Stage ใช้ cc ร่วมตัวเดียว (mint ที่นี่) GenID mint ต่อบัญชีเองผ่านคิวโควตาใน tools/
+        if mode_key != "ranger_api_GenID" and not self._prepare_shared_cc():
+            return
 
         # รันตามจำนวนที่ตั้งไว้เต็ม ๆ (ปลด cap ตาม RAM แล้ว) - แค่เตือนถ้าเกินที่ RAM น่าจะรับไหว
         run_count = self.thread_count

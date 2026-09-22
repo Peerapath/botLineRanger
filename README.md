@@ -355,6 +355,14 @@ license API คืน `ranger_api_Stage` มาใน `allowed_modes` (อีเ
 | `LGRGS_RL_DIR` | `%TEMP%/lgrgs-ratelimit` | โฟลเดอร์ lock file (บอทตั้งเป็นโฟลเดอร์ `.ratelimit` ข้างโปรแกรม: รากของ repo ตอนรันจากซอร์ส หรือข้าง exe ตอน build) |
 | `LGRGS_PROXY` | ว่าง | `host:port[:user:pass]` ออกทาง proxy ตัวนี้ (bucket แยกต่อ proxy) |
 | `LGRGS_MAX_RETRY` | 8 | จำนวนครั้งสูงสุดต่อ call (รวมครั้งแรก) ที่ rangers_api/new_account ยิงซ้ำเองเมื่อเจอ 429/503/app-429 — ตั้ง 1 เมื่อจะวัดพฤติกรรมดิบของเซิร์ฟเวอร์ |
+| `LGRGS_AUTH_QUOTA` | `2/60` | โควตา `POST /auth/v3.8/authentication` (mint guest) ต่อ IP: game-api ให้ 2 ครั้ง/~60 วิ (วัด 2026-09-23) worker ทุกตัวเข้าคิวผ่านไฟล์เดียวกัน `0` = ปิด |
+| `LGRGS_CC_FILE` | ว่าง | ไฟล์ cc ร่วมข้ามโปรเซส (บอทตั้งเป็น `.ratelimit/cc.txt`) GUI mint ครั้งเดียว worker หยิบใช้/renew ผ่านไฟล์นี้แทน mint เอง |
+
+**โควตา mint guest ของ LINE (คนละตัวกับ rangers-api):** `game-api.line.me` ให้ยิง `/auth/v3.8/authentication`
+ได้แค่ **2 ครั้งต่อ IP ต่อ ~60 วิ** ไม่ว่าจะเว้นระยะแค่ไหน (`check`/`refresh`/`authorize`/`signup` ไม่นับ)
+`register_guest` จึงเหลือ auth ครั้งเดียว (ตัด `check` + `auth(bare)` ที่เปลืองโควตาเปล่า) และทุก mint เข้าคิว
+`ratelimit.auth_quota()`; โหมด Login/Stage ไม่ mint ใน worker เลย GUI mint cc ตัวเดียวลง `.ratelimit/cc.txt`
+ให้ทุก worker ใช้ร่วม ส่วน GenID สร้างได้สูงสุด ~2 บัญชี/นาที/IP (เพิ่ม IP ผ่าน `apiproxies` ได้ IP ละ 2/นาที)
 
 บอท GUI อ่าน `config.ini [settings] apirps` และ `apiproxies` (คั่นด้วยจุลภาค แจกวนให้ worker ทีละตัว)
 แล้วส่งเป็น env ให้ worker ทุกตัว ตรวจว่าตัวคุมทำงานด้วย

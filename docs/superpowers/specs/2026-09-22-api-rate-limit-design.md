@@ -176,3 +176,18 @@ Integration (ทำมือหลัง implement): รันสคริปต
 - โหมด Stage/Login/GenID ที่ 300 worker บน IP เดียว ไม่มี error จาก HTTP 429 หรือ `errorCode 429` ใน log
 - loop ใน `tutorial.py` / `gifts.py` วิ่งจบโดยไม่ต้องใส่ `sleep` เอง
 - ตั้ง `apiproxies` 2 ตัวแล้ว worker ครึ่งหนึ่งออกทาง proxy แต่ละตัว (ดูจาก access log ของ proxy)
+
+## ภาคผนวก 2026-09-23: โควตา mint guest ของ game-api.line.me (ชั้นที่ 3)
+
+ชน rate limit อีกตัวตอนรัน Login 16 worker: `POST /auth/v3.8/authentication/GUEST` (Trident mint guest) ให้
+**2 ครั้งต่อ IP ต่อหน้าต่าง ~60 วิ** ไม่ขึ้นกับระยะห่าง (เว้น 5 วิ ก็ได้แค่ 2 แล้วครั้งที่ 3 = HTTP 429 HTML)
+หน้าต่างรีเซ็ตใน ~60 วิ ยิง 429 ซ้ำไม่ยืดเวลา `check`/`refresh`/`authorize`/`signup` ไม่นับ และ `auth(terms)`
+ครั้งเดียวได้บัญชีใช้งานได้ครบ (ไม่ต้อง `check` + `auth(bare)`)
+
+แก้ (branch `fix/linegame-auth-quota`):
+- `new_account.register_guest` เหลือ auth ครั้งเดียว; `_do` เข้าคิว `ratelimit.auth_quota()` (`SlidingQuota` ข้ามโปรเซส
+  ไฟล์ `quota-<proxy_id>-linegame-auth.txt`, env `LGRGS_AUTH_QUOTA=2/60`) ก่อนยิงทุก attempt และถ้ายัง 429 รอ 16 วิ
+- `relogin.CcPool(share_file, max_age)`: cc ร่วมข้ามโปรเซสในไฟล์ (env `LGRGS_CC_FILE`) renew ผ่านล็อกไฟล์
+  ถ้าโปรเซสอื่น renew แล้วใช้ของเขา; ข้อความ error มี HTTP status จริง
+- `bot/main.py`: โหมด Login/Stage GUI mint cc ครั้งเดียวลง `.ratelimit/cc.txt` (ใช้ของเดิมถ้าอายุ < 10 นาที)
+  ก่อน spawn แล้วส่ง `LGRGS_CC_FILE` ให้ worker; GenID ยัง mint ต่อบัญชีแต่เข้าคิวโควตา (เพดาน ~2 บัญชี/นาที/IP)
