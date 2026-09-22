@@ -175,6 +175,10 @@ def game_call(path: str, device_id: str, body: bytes | None, *,
 # The per-account min-gap limit answers HTTP 400 + errorCode 429; ratelimit.is_app_429 catches it.
 _RETRY_STATUSES = (429, 503)
 _MAX_ATTEMPTS = max(1, int(os.environ.get("LGRGS_MAX_RETRY", "8")))
+# Network errors (connect/read failures) get their own, smaller budget: relogin.login and the
+# bot loop over thousands of accounts, so 8 x 25 s timeouts per call would stall a worker for
+# minutes when the network or proxy is down. 3 tries still absorbs a blip.
+_NET_ATTEMPTS = max(1, int(os.environ.get("LGRGS_NET_RETRY") or "3"))
 _BACKOFF_BASE = 0.5
 _BACKOFF_CAP = 8.0
 
@@ -237,6 +241,7 @@ def _do(req):
     # headers; the unredirected ones a handler added live elsewhere and must not be carried over.
     template = (req.full_url, req.data, dict(req.headers), req.get_method())
     raw, status, resp_headers, parsed = b"", 0, None, {}
+    net_fail = 0
     for attempt in range(_MAX_ATTEMPTS):
         ratelimit.PACER.wait(key)
         bucket.acquire()
@@ -248,9 +253,10 @@ def _do(req):
         except urllib.error.HTTPError as err:
             raw, status, resp_headers = err.read(), err.code, err.headers
         except (urllib.error.URLError, OSError, TimeoutError):
-            if attempt == _MAX_ATTEMPTS - 1:
+            net_fail += 1
+            if net_fail >= _NET_ATTEMPTS or attempt == _MAX_ATTEMPTS - 1:
                 raise
-            _retry_sleep(attempt)               # network blip: back off and retry
+            _retry_sleep(net_fail - 1)          # network blip: back off and retry (own small budget)
             continue
         ratelimit.PACER.done(key)               # the server stamps rejected calls too
         parsed = _parse(raw, resp_headers)

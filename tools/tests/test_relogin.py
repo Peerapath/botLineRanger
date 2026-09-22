@@ -336,3 +336,16 @@ def test_login_app_429_after_retries_is_transient(monkeypatch):
     import pytest
     with pytest.raises(relogin.Transient):
         relogin.login("CC", "U", "OLD", "TH")
+
+
+def test_login_network_error_is_transient_immediately(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(relogin.time, "sleep", lambda s: sleeps.append(s))
+
+    def fake_do(req):
+        raise TimeoutError("read timed out")
+    monkeypatch.setattr(relogin.na, "_do", fake_do)
+    import pytest
+    with pytest.raises(relogin.Transient):
+        relogin.login("CC", "U", "OLD", "TH")
+    assert sleeps == []                      # no second retry loop on top of na._do's own

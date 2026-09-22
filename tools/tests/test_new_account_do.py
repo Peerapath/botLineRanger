@@ -164,3 +164,51 @@ def test_do_builds_a_fresh_request_for_every_attempt(monkeypatch, wired):
     monkeypatch.setattr(na, "_open", fake_open)
     st, _, _ = na._do(_req("c=1"))
     assert st == 200 and len(seen) == 2
+
+
+def test_do_fresh_request_keeps_data_and_content_type(monkeypatch, wired):
+    seen = []
+
+    def fake_open(req):
+        seen.append(req)
+        if len(seen) == 1:
+            req.set_proxy("10.0.0.1:8080", "https")
+            req.add_unredirected_header("Proxy-Authorization", "Basic x")
+            raise urllib.error.HTTPError(req.full_url, 400, "err", _headers(), io.BytesIO(APP429))
+        return FakeResp(200, OK, _headers())
+    monkeypatch.setattr(na, "_open", fake_open)
+    req = urllib.request.Request("https://game-api.line.me/auth/v3.5/check/GUEST", data=b"payload",
+                                 headers={"Content-Type": "application/x-msgpack",
+                                          "X-Linegame-Authorization": 'ts="1", si="abc"'}, method="POST")
+    st, _, _ = na._do(req)
+    assert st == 200 and len(seen) == 2 and seen[1] is not seen[0]
+    assert seen[1].data == b"payload" and seen[1].get_method() == "POST"
+    assert seen[1].get_header("Content-type") == "application/x-msgpack"
+    assert seen[1].get_header("X-linegame-authorization") == 'ts="1", si="abc"'
+    assert seen[1].host == "game-api.line.me" and not seen[1].has_header("Proxy-authorization")
+
+
+def test_do_network_errors_have_their_own_budget(monkeypatch, wired):
+    monkeypatch.setattr(na, "_NET_ATTEMPTS", 3)
+    calls = {"n": 0}
+
+    def fake_open(req):
+        calls["n"] += 1
+        raise urllib.error.URLError("down")
+    monkeypatch.setattr(na, "_open", fake_open)
+    with pytest.raises(urllib.error.URLError):
+        na._do(_req("c=1"))
+    assert calls["n"] == 3 and wired.acquired == 3
+    assert wired.sleeps == [(0, None), (1, None)] and wired.dones == []
+
+
+def test_do_net_budget_never_exceeds_max_attempts(monkeypatch, wired):
+    monkeypatch.setattr(na, "_NET_ATTEMPTS", 10)
+    monkeypatch.setattr(na, "_MAX_ATTEMPTS", 2)
+
+    def fake_open(req):
+        raise TimeoutError("read timed out")
+    monkeypatch.setattr(na, "_open", fake_open)
+    with pytest.raises(TimeoutError):
+        na._do(_req("c=1"))
+    assert wired.acquired == 2 and wired.sleeps == [(0, None)]
