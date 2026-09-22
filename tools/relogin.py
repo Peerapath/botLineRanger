@@ -134,19 +134,78 @@ def login(cc, udid, guest_cookie, nation, language="en"):
 
 
 class CcPool:
-    """เก็บ cc ที่ทุก thread ใช้ร่วมกัน สร้างใหม่แค่ครั้งเดียวต่อ cc ที่ตายแล้ว"""
+    """เก็บ cc ที่ทุก thread ใช้ร่วมกัน สร้างใหม่แค่ครั้งเดียวต่อ cc ที่ตายแล้ว
 
-    def __init__(self):
+    share_file (หรือ env LGRGS_CC_FILE): ไฟล์ที่เก็บ cc ร่วมกันข้ามโปรเซส เพราะ game-api ให้ mint guest
+    ได้แค่ 2 ครั้ง/นาที/IP - worker 16 ตัว mint พร้อมกันจะล้มเกือบหมด GUI จึง mint ครั้งเดียวลงไฟล์นี้
+    แล้ว worker หยิบไปใช้ ตอน renew ก็ล็อกไฟล์ก่อน: ถ้าโปรเซสอื่น renew ไปแล้ว (ค่าในไฟล์ไม่ใช่ cc เก่า)
+    ใช้ของเขาแทนการ mint ซ้ำ. max_age: อายุสูงสุด (วินาที) ของ cc ในไฟล์ที่ยอมใช้ต่อ None = ไม่จำกัด
+    """
+
+    def __init__(self, share_file=None, max_age=None):
         self._lock = threading.Lock()
         self._cc = None
         self._proven_at = 0.0
-        self._mint()
+        self._share = share_file if share_file is not None else (os.environ.get("LGRGS_CC_FILE") or None)
+        cc, fresh = self._load_shared(max_age)
+        if cc and fresh:
+            self._cc = cc
+        else:
+            self._mint(cc)      # cc = the stale value (or None): mint unless another process replaced it
 
-    def _mint(self):
+    @staticmethod
+    def _parse(text):
+        parts = text.split()
+        if not parts:
+            return None, 0.0
         try:
-            self._cc = na.register_guest(secrets.token_hex(16))["userToken"]
+            return parts[0], float(parts[1]) if len(parts) > 1 else 0.0
+        except ValueError:
+            return parts[0], 0.0
+
+    def _load_shared(self, max_age):
+        """(cc ในไฟล์ร่วม หรือ None, ยังใหม่พอตาม max_age ไหม)"""
+        if not self._share:
+            return None, False
+        try:
+            with ratelimit.locked_file(self._share) as fh:
+                fh.seek(0)
+                cc, stamp = self._parse(fh.read())
+        except OSError:
+            return None, False
+        fresh = bool(cc) and (max_age is None or time.time() - stamp <= max_age)
+        return cc, fresh
+
+    def _register(self):
+        try:
+            return na.register_guest(secrets.token_hex(16))["userToken"]
         except (Exception, SystemExit) as exc:
-            raise Transient("guest mint failed: %s" % type(exc).__name__)
+            raise Transient("guest mint failed: %s: %s" % (type(exc).__name__, str(exc).strip()[:200]))
+
+    def _mint(self, old_cc):
+        """mint cc ใหม่แทน old_cc; ผ่านไฟล์ร่วมถ้ามี (คนแรกที่ล็อกได้ mint คนอื่นรับของเขา)"""
+        if self._share:
+            while True:
+                try:
+                    with ratelimit.locked_file(self._share) as fh:
+                        fh.seek(0)
+                        current, _stamp = self._parse(fh.read())
+                        if current and current != old_cc:
+                            self._cc = current          # อีกโปรเซส renew ไปแล้ว
+                        else:
+                            self._cc = self._register()
+                            fh.seek(0)
+                            fh.truncate()
+                            fh.write("%s %.0f" % (self._cc, time.time()))
+                            fh.flush()
+                    self._proven_at = 0.0
+                    return
+                except ratelimit.LockTimeout:
+                    time.sleep(1.0)                     # อีกโปรเซสกำลัง mint อยู่ (รอคิวโควตา) รอต่อ
+                    continue
+                except OSError:
+                    break                               # ไฟล์ร่วมใช้ไม่ได้: mint ส่วนตัวแทน
+        self._cc = self._register()
         self._proven_at = 0.0
 
     def get(self):
@@ -156,7 +215,7 @@ class CcPool:
     def renew(self, old_cc):
         with self._lock:
             if self._cc == old_cc:   # ยังไม่มีใคร renew cc ตัวนี้ -> สร้างใหม่
-                self._mint()
+                self._mint(old_cc)
             return self._cc
 
     def mark_proven(self):

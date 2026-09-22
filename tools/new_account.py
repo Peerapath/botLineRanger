@@ -181,6 +181,7 @@ _MAX_ATTEMPTS = max(1, int(os.environ.get("LGRGS_MAX_RETRY", "8")))
 _NET_ATTEMPTS = max(1, int(os.environ.get("LGRGS_NET_RETRY") or "3"))
 _BACKOFF_BASE = 0.5
 _BACKOFF_CAP = 8.0
+_AUTH_429_WAIT = 16   # seconds between retries of a 429'd authentication (quota window is ~60 s)
 
 # HTTP status of the most recent signup_platform call - lets the bot's error message say WHY a
 # headless signup failed (429 rate-limit vs a real rejection) instead of a bare "no LF_AC".
@@ -240,11 +241,18 @@ def _do(req):
     # plaintext HTTPHandler inside the CONNECT tunnel. req.headers holds only the caller's
     # headers; the unredirected ones a handler added live elsewhere and must not be carried over.
     template = (req.full_url, req.data, dict(req.headers), req.get_method())
+    # The account-minting call has its own hard per-IP quota (2 per ~60 s, see ratelimit.auth_quota):
+    # queue every attempt through it, and when the server still says 429 wait a good chunk of the
+    # window instead of the usual sub-second backoff (a 429 there costs nothing but time).
+    is_auth = "/auth/v3.8/authentication" in req.full_url
+    quota = ratelimit.auth_quota() if is_auth else None
     raw, status, resp_headers, parsed = b"", 0, None, {}
     net_fail = 0
     for attempt in range(_MAX_ATTEMPTS):
         ratelimit.PACER.wait(key)
         bucket.acquire()
+        if quota is not None:
+            quota.acquire()
         attempt_req = urllib.request.Request(template[0], data=template[1],
                                              headers=template[2], method=template[3])
         try:
@@ -262,26 +270,30 @@ def _do(req):
         parsed = _parse(raw, resp_headers)
         limited = status in _RETRY_STATUSES or ratelimit.is_app_429(status, parsed) is not None
         if limited and attempt < _MAX_ATTEMPTS - 1:
-            _retry_sleep(attempt, resp_headers.get("Retry-After"))  # rate-limited: wait, retry
+            retry_after = resp_headers.get("Retry-After")
+            if is_auth and status == 429 and not retry_after:
+                retry_after = str(_AUTH_429_WAIT)
+            _retry_sleep(attempt, retry_after)  # rate-limited: wait, retry
             continue
         break
     set_cookies = resp_headers.get_all("Set-Cookie") if hasattr(resp_headers, "get_all") else None
     return status, parsed, (set_cookies or [])
 
 
+AUTH_PATH = "/auth/v3.8/authentication/GUEST"   # the ONLY call that spends the per-IP auth quota
+
+
 def register_guest(device_id: str) -> dict:
-    # 1. check (informational - a fresh deviceId is always "not exists")
-    st, res, _ = game_call("/auth/v3.5/check/GUEST", device_id, mp_map([("uuid", device_id)]))
-    print("  check     : HTTP %s %s" % (st, _err(res)))
+    """Mint a LINE guest with ONE authentication call.
 
-    # 2. authenticate without terms -> server demands ToS agreement
-    st, res, _ = game_call("/auth/v3.8/authentication/GUEST", device_id,
-                           mp_map([("uuid", device_id), ("country", COUNTRY)]))
-    print("  auth(bare): HTTP %s %s" % (st, _err(res)))
-
-    # 3. authenticate WITH terms -> mints the account
+    game-api.line.me allows just 2 /auth/v3.8/authentication calls per IP per ~60 s (measured
+    2026-09-23), so the old informational `check` and the terms-less `auth(bare)` round trips are
+    gone: `check` is free but useless for a fresh id, and `auth(bare)` only ever answered
+    AUTH_401_0105 while spending half the quota. `_do` queues this call through
+    ratelimit.auth_quota() so parallel workers wait instead of failing.
+    """
     terms = urllib.parse.quote(json.dumps({"agreements": AGREEMENTS}, separators=(",", ":")), safe="")
-    st, res, _ = game_call("/auth/v3.8/authentication/GUEST", device_id,
+    st, res, _ = game_call(AUTH_PATH, device_id,
                            mp_map([("uuid", device_id), ("termsResult", terms), ("country", COUNTRY)]))
     if not isinstance(res, dict) or "userToken" not in res:
         raise SystemExit("  auth(terms) FAILED HTTP %s: %s" % (st, json.dumps(res, ensure_ascii=False)[:400]))

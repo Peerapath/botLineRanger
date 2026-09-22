@@ -337,3 +337,70 @@ def test_bucket_lock_timeout_warns_once(tmp_path, capsys):
     b.acquire()
     assert b._disabled is False and clk.slept == [0.1, 0.1]
     assert capsys.readouterr().err.count("bucket lock timeout") == 1
+
+
+def _quota(tmp_path, limit=2, window=60.0):
+    clk = FakeClock()
+    q = ratelimit.SlidingQuota("t", limit, window, rl_dir=str(tmp_path), proxy="",
+                               clock=clk.now, sleep=clk.sleep, margin=1.0)
+    return q, clk
+
+
+def test_quota_allows_limit_then_waits_for_oldest_to_expire(tmp_path):
+    q, clk = _quota(tmp_path, limit=2, window=60.0)
+    q.acquire(); clk.t += 10
+    q.acquire(); clk.t += 10           # two sends at t=1000 and t=1010
+    assert clk.slept == []
+    q.acquire()                         # third: oldest (1000) + 60 + margin 1 - now (1020) = 41 (+jitter <= 0.25)
+    assert len(clk.slept) == 1 and 41.0 <= clk.slept[0] <= 41.3
+    with open(q.path) as fh:
+        stamps = [float(x) for x in fh.read().split()]
+    assert len(stamps) == 2 and abs(stamps[-1] - clk.t) < 0.01   # file keeps 3 decimals
+
+
+def test_quota_file_name_and_disabled_spec(tmp_path):
+    q, _ = _quota(tmp_path)
+    assert os.path.basename(q.path) == "quota-direct-t.txt"
+    q0, clk = _quota(tmp_path, limit=0)
+    for _ in range(5):
+        q0.acquire()
+    assert clk.slept == []
+
+
+def test_quota_is_shared_across_instances_via_file(tmp_path):
+    a, clk_a = _quota(tmp_path, limit=1, window=30.0)
+    b, clk_b = _quota(tmp_path, limit=1, window=30.0)
+    a.acquire()
+    clk_b.t = clk_a.t + 5
+    b.acquire()                         # sees a's stamp in the same file -> waits 30 + 1 - 5 = 26
+    assert len(clk_b.slept) == 1 and 26.0 <= clk_b.slept[0] <= 26.3
+
+
+def test_quota_for_parses_spec_and_caches(monkeypatch, tmp_path):
+    monkeypatch.setenv("LGRGS_RL_DIR", str(tmp_path))
+    monkeypatch.setattr(ratelimit, "_QUOTAS", {})
+    q = ratelimit.quota_for("x", "2/60")
+    assert (q.limit, q.window) == (2, 60.0) and ratelimit.quota_for("x", "9/9") is q
+    off = ratelimit.quota_for("off", "0")
+    assert off._disabled is True
+    with pytest.raises(ValueError):
+        ratelimit.quota_for("bad", "two/60")
+
+
+def test_auth_quota_uses_env_spec(monkeypatch, tmp_path):
+    monkeypatch.setenv("LGRGS_RL_DIR", str(tmp_path))
+    monkeypatch.setattr(ratelimit, "_QUOTAS", {})
+    monkeypatch.setattr(ratelimit, "AUTH_QUOTA", "3/120")
+    q = ratelimit.auth_quota()
+    assert (q.limit, q.window) == (3, 120.0)
+    assert os.path.basename(q.path) == "quota-direct-linegame-auth.txt"
+
+
+def test_locked_file_creates_and_round_trips(tmp_path):
+    path = str(tmp_path / "sub" / "cc.txt")
+    with ratelimit.locked_file(path) as fh:
+        assert fh.read() == ""
+        fh.seek(0); fh.write("abc 123"); fh.flush()
+    with ratelimit.locked_file(path) as fh:
+        fh.seek(0)
+        assert fh.read() == "abc 123"

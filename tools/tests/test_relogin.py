@@ -349,3 +349,65 @@ def test_login_network_error_is_transient_immediately(monkeypatch):
     with pytest.raises(relogin.Transient):
         relogin.login("CC", "U", "OLD", "TH")
     assert sleeps == []                      # no second retry loop on top of na._do's own
+
+
+def _fake_register(seq):
+    """register_guest stand-in: pops userTokens from seq in order."""
+    def fake(device_id):
+        return {"userToken": seq.pop(0)}
+    return fake
+
+
+def test_ccpool_loads_shared_cc_without_minting(tmp_path, monkeypatch):
+    share = tmp_path / "cc.txt"
+    share.write_text("SHARED 1790000000")
+    monkeypatch.setattr(relogin.na, "register_guest", lambda d: (_ for _ in ()).throw(AssertionError("must not mint")))
+    pool = relogin.CcPool(share_file=str(share))
+    assert pool.get() == "SHARED"
+
+
+def test_ccpool_env_share_file(tmp_path, monkeypatch):
+    share = tmp_path / "cc.txt"
+    share.write_text("FROMENV 1790000000")
+    monkeypatch.setenv("LGRGS_CC_FILE", str(share))
+    monkeypatch.setattr(relogin.na, "register_guest", lambda d: (_ for _ in ()).throw(AssertionError("must not mint")))
+    assert relogin.CcPool().get() == "FROMENV"
+
+
+def test_ccpool_mints_and_writes_when_share_file_empty(tmp_path, monkeypatch):
+    share = tmp_path / "cc.txt"
+    monkeypatch.setattr(relogin.na, "register_guest", _fake_register(["NEW1"]))
+    pool = relogin.CcPool(share_file=str(share))
+    assert pool.get() == "NEW1"
+    cc, stamp = share.read_text().split()
+    assert cc == "NEW1" and float(stamp) > 1700000000
+
+
+def test_ccpool_max_age_forces_fresh_mint(tmp_path, monkeypatch):
+    share = tmp_path / "cc.txt"
+    share.write_text("OLD 1000")                     # ancient timestamp
+    monkeypatch.setattr(relogin.na, "register_guest", _fake_register(["FRESH"]))
+    pool = relogin.CcPool(share_file=str(share), max_age=600)
+    assert pool.get() == "FRESH" and share.read_text().split()[0] == "FRESH"
+
+
+def test_ccpool_renew_uses_other_process_cc_instead_of_minting(tmp_path, monkeypatch):
+    share = tmp_path / "cc.txt"
+    share.write_text("A 1790000000")
+    calls = []
+    monkeypatch.setattr(relogin.na, "register_guest", lambda d: calls.append(d) or {"userToken": "MINE"})
+    pool = relogin.CcPool(share_file=str(share))
+    assert pool.get() == "A"
+    share.write_text("B 1790000001")                 # another worker renewed already
+    assert pool.renew("A") == "B" and calls == []
+    assert pool.renew("B") == "MINE" and len(calls) == 1   # nobody renewed B yet -> we mint and publish
+    assert share.read_text().split()[0] == "MINE"
+
+
+def test_ccpool_mint_error_carries_http_text(monkeypatch):
+    monkeypatch.setattr(relogin.na, "register_guest",
+                        lambda d: (_ for _ in ()).throw(SystemExit("  auth(terms) FAILED HTTP 429: too many")))
+    import pytest
+    with pytest.raises(relogin.Transient) as info:
+        relogin.CcPool()
+    assert "SystemExit" in str(info.value) and "HTTP 429" in str(info.value)
