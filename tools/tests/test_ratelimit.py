@@ -156,8 +156,8 @@ def test_bucket_unwritable_dir_disables_without_raising(tmp_path, capsys):
 
 def test_bucket_burst_below_one_is_clamped(tmp_path):
     b, clk = _bucket(tmp_path, rate=10.0, burst=0)
-    b.acquire()                                  # burst 0 could never reach 1 token -> would hang
     assert b.burst == 1
+    b.acquire()                                  # burst 0 could never reach 1 token -> would hang
 
 
 def test_bucket_lock_timeout_paces_and_stays_armed(tmp_path, monkeypatch):
@@ -287,3 +287,53 @@ def test_spawn_env_round_robins_proxies():
     assert e0["LGRGS_RPS_BUDGET"] == "80" and e0["LGRGS_RL_DIR"] == "D:/bot/.ratelimit"
     assert e0["PATH"] == "x" and base == {"PATH": "x"}          # copy, not mutation
     assert ratelimit.spawn_env(base, 0, [], 5, "d")["LGRGS_PROXY"] == ""
+
+
+def test_bucket_transient_oserror_does_not_disable(tmp_path):
+    b, clk = _bucket(tmp_path, rate=10.0, burst=3)
+    calls = {"n": 0}
+
+    def flaky_take():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise OSError("sharing violation")
+        return 0.0
+    b._take = flaky_take
+    b.acquire()
+    assert b._disabled is False and calls["n"] == 3
+    assert clk.slept == [0.05, 0.05]
+
+
+def test_bucket_disables_only_after_three_consecutive_failures(tmp_path, capsys):
+    b, clk = _bucket(tmp_path, rate=10.0, burst=3)
+
+    def always_fail():
+        raise OSError("gone")
+    b._take = always_fail
+    b.acquire()
+    assert b._disabled is True and clk.slept == [0.05, 0.05]
+    assert "bucket disabled after 3 failures" in capsys.readouterr().err
+    b.acquire()                                  # stays a no-op afterwards
+    assert clk.slept == [0.05, 0.05]
+
+
+def test_bucket_host_is_sanitized_in_filename(tmp_path):
+    clk = FakeClock()
+    b = ratelimit.IpBucket("game-api.line.me:443", rate=10.0, burst=3, rl_dir=str(tmp_path),
+                           proxy="", clock=clk.now, sleep=clk.sleep)
+    assert os.path.basename(b.path) == "bucket-direct-game-api.line.me_443.txt"
+
+
+def test_bucket_lock_timeout_warns_once(tmp_path, capsys):
+    b, clk = _bucket(tmp_path, rate=10.0, burst=3)
+    calls = {"n": 0}
+
+    def timing_out_take():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise ratelimit.LockTimeout("held")
+        return 0.0
+    b._take = timing_out_take
+    b.acquire()
+    assert b._disabled is False and clk.slept == [0.1, 0.1]
+    assert capsys.readouterr().err.count("bucket lock timeout") == 1

@@ -26,15 +26,16 @@ import base64
 import hashlib
 import os
 import random
+import re
 import sys
 import tempfile
 import threading
 import time
 import urllib.parse
 
-MIN_GAP_MS = int(os.environ.get("LGRGS_MIN_GAP_MS", "350"))
-RPS_BUDGET = float(os.environ.get("LGRGS_RPS_BUDGET", "80"))
-BURST = int(os.environ.get("LGRGS_RPS_BURST", "20"))
+MIN_GAP_MS = int(os.environ.get("LGRGS_MIN_GAP_MS") or "350")
+RPS_BUDGET = float(os.environ.get("LGRGS_RPS_BUDGET") or "80")
+BURST = int(os.environ.get("LGRGS_RPS_BURST") or "20")
 PROXY = os.environ.get("LGRGS_PROXY", "")
 
 
@@ -112,9 +113,9 @@ if os.name == "nt":
             try:
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
                 return
-            except OSError:
+            except OSError as exc:
                 if time.monotonic() >= deadline:
-                    raise LockTimeout("bucket file stayed locked for %.1fs" % _LOCK_TIMEOUT_S)
+                    raise LockTimeout("bucket file stayed locked for %.1fs" % _LOCK_TIMEOUT_S) from exc
                 time.sleep(random.uniform(0.001, 0.005))
 
     def _unlock(fh):
@@ -146,24 +147,46 @@ class IpBucket:
         self._clock = clock
         self._sleep = sleep
         proxy = PROXY if proxy is None else proxy
-        self.path = os.path.join(rl_dir or rl_dir_(), "bucket-%s-%s.txt" % (_proxy_id(proxy), host))
+        safe_host = re.sub(r"[^A-Za-z0-9._-]", "_", host)     # "host:port" is not a valid file name
+        self.path = os.path.join(rl_dir or rl_dir_(), "bucket-%s-%s.txt" % (_proxy_id(proxy), safe_host))
         self._disabled = self.rate <= 0
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        except OSError:
-            pass            # os.open in _take() reports it, and acquire() disables the bucket
+        self._fails = 0             # consecutive file/lock failures; 3 in a row disable the bucket
+        self._warned_timeout = False
+        if not self._disabled:
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            except OSError:
+                pass            # os.open in _take() reports it, and acquire() disables the bucket
 
     def acquire(self) -> None:
         while not self._disabled:
             try:
                 wait = self._take()
-            except LockTimeout:
-                self._sleep(1.0 / self.rate)     # fail closed: pace at the budget, keep the cap armed
+            except LockTimeout as exc:
+                # fail closed: pace at the budget and keep the cap armed; say so once
+                if not self._warned_timeout:
+                    self._warned_timeout = True
+                    print("ratelimit: bucket lock timeout, pacing at budget (%s: %s)" % (self.path, exc),
+                          file=sys.stderr)
+                self._sleep(1.0 / self.rate)
                 continue
             except OSError as exc:
-                print("ratelimit: bucket disabled (%s: %s)" % (self.path, exc), file=sys.stderr)
+                # Transient file trouble (AV scan, sharing violation, lock dir wiped mid-run) must
+                # not switch the cap off for the rest of the process: recreate the dir and retry,
+                # and only three consecutive failures disable the bucket.
+                self._fails += 1
+                try:
+                    os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                except OSError:
+                    pass
+                if self._fails < 3:
+                    self._sleep(0.05)
+                    continue
+                print("ratelimit: bucket disabled after %d failures (%s: %s)" % (self._fails, self.path, exc),
+                      file=sys.stderr)
                 self._disabled = True
                 return
+            self._fails = 0
             if wait <= 0:
                 return
             self._sleep(wait + random.uniform(0, 0.005))
