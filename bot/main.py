@@ -338,6 +338,7 @@ class EmulatorManager(ctk.CTk):
             self.thread_count = 4
         self.thread_count = max(1, min(self.thread_count, 1024))
         self._worker_seq = 0   # ลำดับ worker ที่สปอว์น ใช้แจก proxy วน (ดู _worker_env)
+        self._warned_api_config = False   # เตือน config rate limit ผิดรูปแบบครั้งเดียวต่อรอบ
 
         self._save_job = None  # สำหรับ debounce
 
@@ -1642,10 +1643,31 @@ class EmulatorManager(ctk.CTk):
         import ratelimit
         rps = self.config.get("settings", "apirps", fallback="80").strip() or "80"
         proxies = ratelimit.parse_proxies(self.config.get("settings", "apiproxies", fallback=""))
+        # ตรวจค่าตรงนี้ ไม่งั้น worker (CREATE_NO_WINDOW) จะตายเงียบตอน import ratelimit
+        # และผู้ใช้เห็นแค่ "0/N thread" โดยไม่รู้สาเหตุ -> ใช้ค่าเริ่มต้นแทนแล้วเตือนครั้งเดียว
+        bad = []
+        try:
+            float(rps)
+        except ValueError:
+            bad.append("apirps = %r (ต้องเป็นตัวเลข เช่น 80)" % rps)
+            rps = "80"
+        good_proxies = []
+        for proxy in proxies:
+            try:
+                ratelimit.proxy_parts(proxy)
+                good_proxies.append(proxy)
+            except ValueError:
+                bad.append("apiproxies: %r (ต้องเป็น host:port หรือ host:port:user:pass)" % proxy)
+        if bad and not self._warned_api_config:
+            self._warned_api_config = True
+            messagebox.showwarning("config.ini", "ค่าตั้ง rate limit ผิดรูปแบบ ใช้ค่าเริ่มต้นแทน:\n" + "\n".join(bad))
         index = self._worker_seq
         self._worker_seq += 1
-        rl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ratelimit")
-        return ratelimit.spawn_env(os.environ, rps, proxies, index, rl_dir)
+        # _APP_ROOT/.ratelimit (TOOLSDIR = _APP_ROOT/tools): รากของ repo ตอนรันจากซอร์ส, ข้าง exe ตอน
+        # frozen. ใช้ __file__ ไม่ได้เพราะ PyInstaller onefile ชี้ไป temp ต่อการเปิด -> GUI สองตัว
+        # ไม่แชร์ bucket และโฟลเดอร์หายตอนโปรแกรมปิด
+        rl_dir = os.path.join(os.path.dirname(TOOLSDIR), ".ratelimit")
+        return ratelimit.spawn_env(os.environ, rps, good_proxies, index, rl_dir)
 
     def _spawn_worker(self, device, mode="ranger_api_Login"):
         """สปอว์น 1 worker เป็น subprocess ของ bot_worker.py (ไม่ re-import main = ไม่โหลด GUI)

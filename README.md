@@ -352,7 +352,7 @@ license API คืน `ranger_api_Stage` มาใน `allowed_modes` (อีเ
 | `LGRGS_MIN_GAP_MS` | 350 | ช่วงห่างขั้นต่ำต่อไอดี |
 | `LGRGS_RPS_BUDGET` | 80 | งบ req/s ต่อ IP (0 = ปิด bucket) |
 | `LGRGS_RPS_BURST` | 20 | ความลึกของ bucket |
-| `LGRGS_RL_DIR` | `%TEMP%/lgrgs-ratelimit` | โฟลเดอร์ lock file (บอทตั้งเป็น `bot/.ratelimit`) |
+| `LGRGS_RL_DIR` | `%TEMP%/lgrgs-ratelimit` | โฟลเดอร์ lock file (บอทตั้งเป็นโฟลเดอร์ `.ratelimit` ข้างโปรแกรม: รากของ repo ตอนรันจากซอร์ส หรือข้าง exe ตอน build) |
 | `LGRGS_PROXY` | ว่าง | `host:port[:user:pass]` ออกทาง proxy ตัวนี้ (bucket แยกต่อ proxy) |
 | `LGRGS_MAX_RETRY` | 8 | จำนวนครั้งสูงสุดต่อ call (รวมครั้งแรก) ที่ rangers_api/new_account ยิงซ้ำเองเมื่อเจอ 429/503/app-429 — ตั้ง 1 เมื่อจะวัดพฤติกรรมดิบของเซิร์ฟเวอร์ |
 
