@@ -127,6 +127,10 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
     # 429/503 (per-IP overload), and the per-account HTTP 400 + errorCode 429 min-gap rejection.
     # Before every attempt: keep the per-account gap, then take a per-IP token.
     for attempt in range(MAX_ATTEMPTS):
+        # wait first, then stamp: a bucket wait can take seconds at 300 workers and the
+        # X-LINEGAME-TIMESTAMP / timeID headers must reflect the actual send time
+        ratelimit.PACER.wait(cookie)
+        bucket.acquire()
         now = int(time.time() * 1000)
         headers = {
             "Host": HOST,
@@ -143,8 +147,6 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
             "Accept-Encoding": "gzip",
             "Connection": "keep-alive",
         }
-        ratelimit.PACER.wait(cookie)
-        bucket.acquire()
         conn = _get_conn()
         try:
             conn.request(method, url, body=data, headers=headers)
@@ -157,7 +159,9 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
             _drop_conn()
             if attempt == MAX_ATTEMPTS - 1:
                 raise
-            continue               # dropped socket: reconnect and retry right away
+            if attempt >= 1:
+                _retry_sleep(attempt - 1)   # repeated socket failures: back off, don't hammer
+            continue               # first drop = stale keep-alive socket: reconnect right away
         ratelimit.PACER.done(cookie)   # the server stamps rejected calls too
         parsed = _decode(raw, enc)
         limited = status in RETRY_STATUSES or ratelimit.is_app_429(status, parsed) is not None
