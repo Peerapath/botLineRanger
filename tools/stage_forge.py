@@ -65,7 +65,8 @@ from Crypto.Util.Padding import pad  # noqa: E402
 
 LAST_STAGE = 150
 # The rangers server rate-limits: pause between stages (plus jitter, so parallel accounts do not
-# march in lockstep). rangers_api.call already backs off on the 429/503 it returns when pushed.
+# march in lockstep). rangers_api.call already backs off on 429/503 and on the per-account
+# HTTP 400 + errorCode 429 (tools/ratelimit.py), so this delay is just a polite per-account pace.
 DEFAULT_DELAY = 3.0
 ERR_AREA_LOCKED = 102200         # enter: the stage's whole area is not open yet
 ERR_STAGE_LOCKED = 102201        # enter: previous stage not cleared

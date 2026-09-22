@@ -323,3 +323,18 @@ def test_clear_stage_reposts_same_battlesn_after_app_429(monkeypatch):
     cleared, info = sf.clear_stage("LF_AC=t", "st02", "40cf0a20", pt=1)
     assert cleared and info["step"] == "save" and len(posted) == 2
     assert posted[0].split("?")[0] == posted[1].split("?")[0]   # same /stage/save/<battleSn>/st02
+
+
+def test_enter_plain_failure_falls_back_to_tutorial_route(monkeypatch):
+    calls = []
+
+    def fake_call(cookie, path, method="GET", body=None, api=None):
+        calls.append(path)
+        if path.startswith("/tutorial/stage/enter/"):
+            return 200, {"result": {"battleSn": 777, "enemyTowerHp": 100,
+                                    "rsaKeyBase": {"modulus": "3", "exponent": "3"}}}
+        return 200, {}                          # fresh guest: main route gives no battle, no error
+    monkeypatch.setattr(sf, "call", fake_call)
+    status, result, error = sf.enter("LF_AC=t", "st01")
+    assert (status, error) == (200, None) and result["battleSn"] == 777
+    assert calls == ["/stage/enter/st01", "/tutorial/stage/enter/st01?tutorialType=START"]

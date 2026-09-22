@@ -6,7 +6,7 @@ report how many nginx 429 / app-429 (HTTP 400 + errorCode 429) slipped through t
 With the limiter on (default env) both counts must be 0 and the throughput ~LGRGS_RPS_BUDGET.
 Set LGRGS_RPS_BUDGET=0 LGRGS_MIN_GAP_MS=0 to see the raw server behaviour again.
 
-Exit: 0 = no 429 of either kind, 1 = at least one slipped through, 2 = no usable token to probe with.
+Exit code 0 = no app-429, no nginx-429 and no call exceptions; 1 = at least one of those appeared; 2 = no usable tokens or the guest mint failed.
 """
 from __future__ import annotations
 
@@ -45,7 +45,11 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     xmls = sorted(glob.glob(os.path.join(args.xml_dir, "*.xml")))[:args.workers]
-    pool = relogin.CcPool()
+    try:
+        pool = relogin.CcPool()
+    except Exception as exc:
+        print("guest mint failed: %s" % exc)
+        return 2
     with cf.ThreadPoolExecutor(10) as ex:
         tokens = [t for t in ex.map(lambda x: fresh_token(x, pool), xmls) if t]
     print("tokens: %d/%d" % (len(tokens), len(xmls)))
@@ -66,6 +70,7 @@ def main(argv=None):
             except Exception as exc:
                 # A call that failed even after rangers_api own retries: count it, keep hammering.
                 kind, err = "exc", "%s: %s" % (type(exc).__name__, exc)
+                time.sleep(0.05)  # don't spin hot when the failure happens before the bucket wait
             with lock:
                 counts[kind] = counts.get(kind, 0) + 1
                 if err:
@@ -82,7 +87,7 @@ def main(argv=None):
               % (len(tokens), total, total / max(time.time() - t0, 1e-9), counts))
         if errs:
             print("exc samples: %s" % sorted(errs)[:3])
-    return 0 if not counts.get("app429") and not counts.get("nginx429") else 1
+    return 0 if not any(counts.get(k) for k in ("app429", "nginx429", "exc")) else 1
 
 
 if __name__ == "__main__":

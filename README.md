@@ -359,3 +359,8 @@ license API คืน `ranger_api_Stage` มาใน `allowed_modes` (อีเ
 บอท GUI อ่าน `config.ini [settings] apirps` และ `apiproxies` (คั่นด้วยจุลภาค แจกวนให้ worker ทีละตัว)
 แล้วส่งเป็น env ให้ worker ทุกตัว ตรวจว่าตัวคุมทำงานด้วย
 `python tools/ratelimit_probe.py --xml-dir bot/input --workers 150 --seconds 10` (ต้องได้ 0 ทั้ง 429 สองแบบ)
+exit code 0 = ไม่มี 429 ทั้งสองแบบและไม่มี call ที่ throw, 1 = มี, 2 = ไม่มี token ใช้ได้/mint guest ไม่สำเร็จ
+- ถ้ามี `bot/src/config.ini` อยู่แล้ว โปรแกรมไม่ merge คีย์ใหม่ให้ ต้องเติม `apirps` / `apiproxies` ใน `[settings]` เอง
+  (ไม่เติมก็ใช้ค่าเริ่มต้น 80 / ต่อตรง)
+- `tools/device_session.py::player_summary` และ `tools/pull_roster.py` ยิง `urlopen` ตรง ไม่ผ่านตัวคุมและไม่ใช้
+  `LGRGS_PROXY` (ไม่อยู่ใน flow ของบอท ใช้เป็นเครื่องมือมือเท่านั้น)
