@@ -1,5 +1,10 @@
 r"""Create a brand-new LINE Rangers guest account, fully headless (no app/emulator).
 
+After login it also auto-confirms the tutorial (all 67 steps via /tutorial/confirm/<STEP>) so the
+guest lands PAST the tutorial and is immediately usable - it already has 5 starter units and can
+enter/play stages. Two steps (SALLY, YELLOW_STONE) stay pending (tutorial gacha/evolve, non-blocking).
+Disable with --no-skip-tutorial. See tools/tutorial.py for the step list.
+
 The whole account-creation chain runs through the LINE Game "Trident" SDK's
 bootstrap endpoints, which are NOT certificate-pinned. Every /auth/v3.* request is
 signed with X-Linegame-Authorization, whose scheme was reverse-engineered from
@@ -50,6 +55,7 @@ import glob
 import gzip
 import json
 import os
+import random
 import secrets
 import sys
 import time
@@ -59,6 +65,9 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ratelimit  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -158,21 +167,104 @@ def game_call(path: str, device_id: str, body: bytes | None, *,
     return _do(req)
 
 
-def _do(req):
-    try:
-        resp = urllib.request.urlopen(req, timeout=25)
-        raw, status, resp_headers = resp.read(), resp.status, resp.headers
-    except urllib.error.HTTPError as err:
-        raw, status, resp_headers = err.read(), err.code, err.headers
-    if resp_headers.get("Content-Encoding") == "gzip":
+# 429/503 backoff-retry for the account-creation path (mint/refresh/authorize/signup/login all
+# funnel through _do). Same policy as tools/rangers_api.py, kept self-contained so this module
+# stays standard-library only. Under thousands of concurrent workers these bootstrap endpoints
+# rate-limit too; without a retry ~half of signups failed outright. Bounded + exponential +
+# jittered so the retries don't become their own load spike; honor Retry-After when sent.
+# The per-account min-gap limit answers HTTP 400 + errorCode 429; ratelimit.is_app_429 catches it.
+_RETRY_STATUSES = (429, 503)
+_MAX_ATTEMPTS = max(1, int(os.environ.get("LGRGS_MAX_RETRY", "8")))
+# Network errors (connect/read failures) get their own, smaller budget: relogin.login and the
+# bot loop over thousands of accounts, so 8 x 25 s timeouts per call would stall a worker for
+# minutes when the network or proxy is down. 3 tries still absorbs a blip.
+_NET_ATTEMPTS = max(1, int(os.environ.get("LGRGS_NET_RETRY") or "3"))
+_BACKOFF_BASE = 0.5
+_BACKOFF_CAP = 8.0
+
+# HTTP status of the most recent signup_platform call - lets the bot's error message say WHY a
+# headless signup failed (429 rate-limit vs a real rejection) instead of a bare "no LF_AC".
+LAST_SIGNUP_HTTP = None
+
+
+def _retry_sleep(attempt, retry_after=None):
+    delay = None
+    if retry_after:
+        try:
+            delay = min(float(retry_after), _BACKOFF_CAP * 2)
+        except (TypeError, ValueError):
+            delay = None
+    if delay is None:
+        delay = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
+    time.sleep(delay + random.uniform(0, _BACKOFF_BASE))
+
+
+def _build_opener(url):
+    """urllib opener that tunnels through the http proxy `url`; None = plain urlopen."""
+    if not url:
+        return None
+    return urllib.request.build_opener(urllib.request.ProxyHandler({"http": url, "https": url}))
+
+
+_OPENER = _build_opener(ratelimit.proxy_url())
+
+
+def _open(req):
+    if _OPENER is not None:
+        return _OPENER.open(req, timeout=25)
+    return urllib.request.urlopen(req, timeout=25)
+
+
+def _parse(raw, resp_headers):
+    if resp_headers is not None and resp_headers.get("Content-Encoding") == "gzip":
         try:
             raw = gzip.decompress(raw)
         except OSError:
             pass
     try:
-        parsed = json.loads(raw) if raw else {}
+        return json.loads(raw) if raw else {}
     except ValueError:
-        parsed = raw.decode("utf-8", "replace")
+        return raw.decode("utf-8", "replace")
+
+
+def _do(req):
+    # Per-account pacing keys on the Cookie (login carries cc/udid/guestCookie); cookie-less
+    # bootstrap calls (auth/signup) key on the URL. The per-IP bucket is per destination host
+    # because game-api.line.me and rangers-api.line-apps.com have separate limits.
+    key = req.get_header("Cookie") or req.full_url
+    host = req.host
+    bucket = ratelimit.bucket_for(host)
+    # Send a FRESH Request per attempt: urllib's ProxyHandler mutates the one it is given
+    # (set_proxy rewrites host/type/selector, add_unredirected_header adds Proxy-Authorization),
+    # so reusing it would send attempt 2 with an absolute-form URI and attempt 3+ through the
+    # plaintext HTTPHandler inside the CONNECT tunnel. req.headers holds only the caller's
+    # headers; the unredirected ones a handler added live elsewhere and must not be carried over.
+    template = (req.full_url, req.data, dict(req.headers), req.get_method())
+    raw, status, resp_headers, parsed = b"", 0, None, {}
+    net_fail = 0
+    for attempt in range(_MAX_ATTEMPTS):
+        ratelimit.PACER.wait(key)
+        bucket.acquire()
+        attempt_req = urllib.request.Request(template[0], data=template[1],
+                                             headers=template[2], method=template[3])
+        try:
+            resp = _open(attempt_req)
+            raw, status, resp_headers = resp.read(), resp.status, resp.headers
+        except urllib.error.HTTPError as err:
+            raw, status, resp_headers = err.read(), err.code, err.headers
+        except (urllib.error.URLError, OSError, TimeoutError):
+            net_fail += 1
+            if net_fail >= _NET_ATTEMPTS or attempt == _MAX_ATTEMPTS - 1:
+                raise
+            _retry_sleep(net_fail - 1)          # network blip: back off and retry (own small budget)
+            continue
+        ratelimit.PACER.done(key)               # the server stamps rejected calls too
+        parsed = _parse(raw, resp_headers)
+        limited = status in _RETRY_STATUSES or ratelimit.is_app_429(status, parsed) is not None
+        if limited and attempt < _MAX_ATTEMPTS - 1:
+            _retry_sleep(attempt, resp_headers.get("Retry-After"))  # rate-limited: wait, retry
+            continue
+        break
     set_cookies = resp_headers.get_all("Set-Cookie") if hasattr(resp_headers, "get_all") else None
     return status, parsed, (set_cookies or [])
 
@@ -313,7 +405,9 @@ def signup_platform(cc: str, udid: str, user_type: str = "LINE") -> dict | None:
     }
     req = urllib.request.Request("https://" + RANGERS_HOST + "/v12.3/signup/platform",
                                  headers=headers, method="GET")
+    global LAST_SIGNUP_HTTP
     st, res, cookies = _do(req)
+    LAST_SIGNUP_HTTP = st
     lf_ac = _cookie_value(cookies, "LF_AC")
     if not isinstance(res, dict) or "result" not in res:
         print("  signup    : FAILED HTTP %s %s" % (st, json.dumps(res, ensure_ascii=False)[:200]))
@@ -382,7 +476,27 @@ def write_account_xml(account, xml_dir):
     return path
 
 
-def _finish(account, session, write_xml_dir):
+def skip_tutorial(cookie):
+    """Confirm every server-side tutorial step so a fresh guest lands past the tutorial.
+
+    Uses GET /v12.3/tutorial/confirm/<STEP> (dynamic + idempotent) over the FULL 67-step set from
+    tools/tutorial.py. Runs on the CURRENT session cookie only - never re-logs-in, because a re-login
+    rotates the LF_AC and would strand the token we just saved. Returns (done, total, pending). Two
+    steps (SALLY, YELLOW_STONE) stay pending: they gate on the tutorial gacha/evolve mechanics, not a
+    flag, and are non-blocking - the guest already has 5 starter units and can enter stages at 65/67.
+    """
+    from tutorial import STEPS, confirm  # same dir; pulls in rangers_api.call
+    done, pending = 0, []
+    for step in STEPS:
+        ok, _status, _data = confirm(cookie, step)
+        if ok:
+            done += 1
+        else:
+            pending.append(step)
+    return done, len(STEPS), pending
+
+
+def _finish(account, session, write_xml_dir, skip_tut=True):
     """Fold a successful login into the account record and emit its XML."""
     account.update({
         "mid": session["mid"],
@@ -392,13 +506,23 @@ def _finish(account, session, write_xml_dir):
         "tutorialDone": _tutorial_done(session.get("tutorialStep")),
         "status": "ready",
     })
+    if skip_tut and account.get("lf_ac"):
+        try:
+            done, total, pending = skip_tutorial("LF_AC=" + account["lf_ac"])
+            account["tutorialDone"] = "%d/%d" % (done, total)
+            if pending:
+                account["tutorialPending"] = pending
+            print("  tutorial  : confirmed %d/%d%s"
+                  % (done, total, (" (pending: %s)" % ",".join(pending)) if pending else ""))
+        except Exception as err:  # a tutorial hiccup must never lose a freshly-minted account
+            print("  tutorial  : skip FAILED (%s) - account still saved" % err)
     _save_json(account)
     if write_xml_dir and account.get("lf_ac"):
         print("  account file -> %s" % write_account_xml(account, write_xml_dir))
     return account
 
 
-def make_account(write_xml_dir=None):
+def make_account(write_xml_dir=None, skip_tut=True):
     device_id = secrets.token_hex(16)   # trident SDK DeviceId
     udid = secrets.token_hex(16)        # the game's own device uuid (_DEVICE_UUID_KEY)
     print("deviceId=%s  udid=%s" % (device_id, udid))
@@ -424,10 +548,10 @@ def make_account(write_xml_dir=None):
         print("  PENDING   gameId=%s - credentials kept; run --resume to finish it"
               % account["gameId"])
         return account
-    return _finish(account, session, write_xml_dir)
+    return _finish(account, session, write_xml_dir, skip_tut)
 
 
-def resume_pending(write_xml_dir=None):
+def resume_pending(write_xml_dir=None, skip_tut=True):
     """Finish accounts that were minted but never got a session (e.g. server was down)."""
     files = sorted(glob.glob(os.path.join(OUT_DIR, "account-*.json")))
     pending = []
@@ -451,7 +575,7 @@ def resume_pending(write_xml_dir=None):
         authorize(acct["deviceId"], cc)
         session = signup_platform(cc, acct["udid"]) or game_login(cc, acct["udid"])
         if session:
-            done.append(_finish(acct, session, write_xml_dir))
+            done.append(_finish(acct, session, write_xml_dir, skip_tut))
     print("completed %d/%d" % (len(done), len(pending)))
     return done
 
@@ -470,13 +594,15 @@ def main():
     parser.add_argument("--xml-dir", help="write the shared_prefs .xml here (the UI bot's input/ queue)")
     parser.add_argument("--resume", action="store_true",
                         help="finish already-minted accounts that never got a session")
+    parser.add_argument("--no-skip-tutorial", dest="skip_tut", action="store_false",
+                        help="do NOT auto-confirm the tutorial (default: confirm all 67 steps -> past tutorial)")
     args = parser.parse_args()
     if args.resume:
-        resume_pending(args.xml_dir)
+        resume_pending(args.xml_dir, args.skip_tut)
         return
     for i in range(args.count):
         print("\n=== account %d/%d ===" % (i + 1, args.count))
-        make_account(args.xml_dir)
+        make_account(args.xml_dir, args.skip_tut)
 
 
 if __name__ == "__main__":

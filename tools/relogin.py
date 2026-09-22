@@ -33,6 +33,7 @@ from device_session import decrypt_lfac  # noqa: E402
 
 import new_account as na  # noqa: E402
 import rangers_api  # noqa: E402
+import ratelimit  # noqa: E402
 
 ENC_RE = re.compile(r'(<string name="_ENC_LF_AC_KEY">)(.*?)(</string>)', re.S)
 
@@ -41,7 +42,7 @@ APP_VERSION = "LGRGS/%s;android/12" % rangers_api.CLIENT_VERSION
 RANGERS_HOST = rangers_api.HOST
 LOGIN_PATH = rangers_api.API + "/login"
 PROVEN_WINDOW = 60.0  # วินาที: cc ที่เพิ่งสำเร็จภายในช่วงนี้ ถือว่า 401 = ไฟล์เสียเอง
-RETRY_WAITS = (2, 4, 8)  # backoff เมื่อเจอ network error / 429 / 5xx
+RETRY_WAITS = (2, 4, 8)  # backoff เมื่อเจอ 429 / app-429 / 5xx (network error: na._do retry ให้เองแล้ว)
 
 
 class BadFile(Exception):
@@ -85,9 +86,9 @@ class Transient(Exception):
 def login(cc, udid, guest_cookie, nation, language="en"):
     """ยิง GET /v12.3/login คืน (status, result_or_None, lf_ac_or_None).
 
-    retry เองเมื่อเจอ network error / 429 / 5xx (RETRY_WAITS). ถ้ายังไม่หายหลัง
-    retry ครบ -> raise Transient ให้ process_file นับเป็น error. 401 ไม่ retry
-    (เป็นคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว).
+    retry เองเมื่อเจอ 429 / app-429 (HTTP 400+errorCode 429) / 5xx (RETRY_WAITS). ถ้ายังไม่หายหลัง
+    retry ครบ -> raise Transient ให้ process_file นับเป็น error. network error -> raise Transient
+    ทันที (na._do retry ให้แล้ว). 401 ไม่ retry (เป็นคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว).
     """
     cookie = "cc=%s; udid=%s; guestCookie=%s;" % (cc, udid, guest_cookie)
     last = None
@@ -113,11 +114,13 @@ def login(cc, udid, guest_cookie, nation, language="en"):
                                      headers=headers, method="GET")
         try:
             status, res, cookies = na._do(req)
-        except urllib.error.URLError:
-            last = "network"
-            status = None
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            # na._do already retried the network error with backoff (_NET_ATTEMPTS); looping
+            # again here would multiply the wait (8 x 4 ~ 16 min per file when the net is down).
+            raise Transient("network: %s" % exc)
         else:
-            if status == 429 or (isinstance(status, int) and 500 <= status < 600):
+            if (status == 429 or ratelimit.is_app_429(status, res) is not None
+                    or (isinstance(status, int) and 500 <= status < 600)):
                 last = status
             else:
                 lf_ac = na._cookie_value(cookies, "LF_AC")

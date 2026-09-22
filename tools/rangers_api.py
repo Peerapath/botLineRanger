@@ -1,0 +1,198 @@
+r"""Shared helpers for driving the LINE Rangers API with a captured/decrypted LF_AC.
+
+Every game call is the same pinned endpoint replayed as a legit client: LF_AC cookie,
+the app's exact headers, and NO UID (the server derives the player from LF_AC). Tools
+get their session three ways, in priority order:
+  --cookie "LF_AC=..."     explicit token
+  --xml <account.xml>      decrypt it out of an account file (what new_account.py writes)
+  --from-device [--device] decrypt it off a rooted, logged-in device (guest accounts)
+  (captured jsonl)         newest login Set-Cookie from captures/ (proxy path)
+"""
+
+from __future__ import annotations
+
+import gzip
+import http.client
+import json
+import os
+import random
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import ratelimit
+
+HOST = "rangers-api.line-apps.com"
+
+# Keep this in step with the installed client. It is not cosmetic: the server routes each
+# version separately and older prefixes can be missing a handler. /v12.3/popup/reward/<seq>
+# returns 500 for a CLS_GACHA (Classic Gacha Ticket) reward while /v12.3 grants it fine -
+# same token, same body, only the prefix differs.
+API = "/v12.3"
+CLIENT_VERSION = "12.3.0"
+
+# --- 429/503 backoff-retry -------------------------------------------------------------
+# Running many workers hammers one shared server, so it answers some calls with 429 (Too Many
+# Requests) or 503 (overload/maintenance) - a non-JSON HTML body. Instead of failing the call
+# (which used to surface as a mystery "string indices" TypeError downstream), wait and retry.
+# Bounded + exponential + JITTERED so the retries themselves don't become a thundering herd
+# that amplifies the very overload we're backing off from; honor Retry-After when the server
+# sends it. Tune the ceiling with LGRGS_MAX_RETRY (total tries per call, incl. the first).
+# The per-account limit answers HTTP 400 + {"errorCode":429} instead - detected via
+# ratelimit.is_app_429 and retried the same way (see tools/ratelimit.py).
+RETRY_STATUSES = (429, 503)
+MAX_ATTEMPTS = max(1, int(os.environ.get("LGRGS_MAX_RETRY", "8")))
+_BACKOFF_BASE = 0.5   # seconds
+_BACKOFF_CAP = 8.0    # seconds (per-wait ceiling for the exponential term)
+
+
+def _retry_sleep(attempt, retry_after=None):
+    """Sleep before the next retry after a rate-limited/overloaded response.
+
+    Honors a numeric Retry-After header (capped so a bogus huge value can't hang a worker),
+    otherwise exponential backoff base*2**attempt capped at _BACKOFF_CAP, plus random jitter
+    in [0, base) so thousands of workers that all got 429 at once don't retry in lockstep.
+    """
+    delay = None
+    if retry_after:
+        try:
+            delay = min(float(retry_after), _BACKOFF_CAP * 2)
+        except (TypeError, ValueError):
+            delay = None
+    if delay is None:
+        delay = min(_BACKOFF_CAP, _BACKOFF_BASE * (2 ** attempt))
+    time.sleep(delay + random.uniform(0, _BACKOFF_BASE))
+
+
+# Persistent keep-alive connection per thread. Every call goes to the same HOST, so reusing
+# one TLS connection across calls saves a full handshake (~100-300ms) on every call after the
+# first - the single biggest speedup when a worker makes many API calls per account. Each
+# worker is its own process (own connection); the GUI's background threads each get their own.
+_conn_tls = threading.local()
+
+
+def _get_conn():
+    conn = getattr(_conn_tls, "conn", None)
+    if conn is None:
+        proxy = ratelimit.PROXY_PARTS
+        if proxy:
+            phost, pport, auth = proxy
+            conn = http.client.HTTPSConnection(phost, pport, timeout=25)
+            conn.set_tunnel(HOST, 443, headers={"Proxy-Authorization": auth} if auth else None)
+        else:
+            conn = http.client.HTTPSConnection(HOST, timeout=25)
+        _conn_tls.conn = conn
+    return conn
+
+
+def _drop_conn():
+    conn = getattr(_conn_tls, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _conn_tls.conn = None
+
+
+def _decode(raw: bytes, enc):
+    if enc == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw.decode("utf-8", "replace")
+
+
+def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None = None):
+    """Return (status, parsed). `cookie` is the full 'LF_AC=...' value.
+
+    `path` is relative to the API prefix (see API above). Pass `api` to pin one call to a
+    different version prefix without changing the default. Uses a reused keep-alive connection;
+    a stale/closed connection is transparently reconnected once.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        data = bytes(body)     # pre-serialized (e.g. /stage/save wants compact, key-sorted JSON)
+    else:
+        data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
+    url = (api or API) + path
+    bucket = ratelimit.bucket_for(HOST)
+    status, parsed = 0, ""
+    # http.client returns 4xx/5xx as a normal response (no exception), so no HTTPError branch is
+    # needed. Three retry reasons: a dropped keep-alive socket (reconnect immediately), a nginx
+    # 429/503 (per-IP overload), and the per-account HTTP 400 + errorCode 429 min-gap rejection.
+    # Before every attempt: keep the per-account gap, then take a per-IP token.
+    for attempt in range(MAX_ATTEMPTS):
+        # wait first, then stamp: a bucket wait can take seconds at 300 workers and the
+        # X-LINEGAME-TIMESTAMP / timeID headers must reflect the actual send time
+        ratelimit.PACER.wait(cookie)
+        bucket.acquire()
+        now = int(time.time() * 1000)
+        headers = {
+            "Host": HOST,
+            "Accept": "*/*",
+            "Content-Type": "application/json; charset=utf-8;",
+            "App-Version": "LGRGS/%s;android/12" % CLIENT_VERSION,
+            "User-Agent": "LGRGS/%s (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)" % CLIENT_VERSION,
+            "Accept-Language": "en",
+            "X-LINEGAME-MCC": "000",
+            "X-LINEGAME-MNC": "00",
+            "X-LINEGAME-TIMESTAMP": str(now),
+            "timeID": str(now),
+            "Cookie": cookie,
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
+        }
+        conn = _get_conn()
+        try:
+            conn.request(method, url, body=data, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()          # must read the full body to keep the connection reusable
+            status = resp.status
+            enc = resp.getheader("Content-Encoding")
+            retry_after = resp.getheader("Retry-After")
+        except (http.client.HTTPException, OSError):
+            _drop_conn()
+            if attempt == MAX_ATTEMPTS - 1:
+                raise
+            if attempt >= 1:
+                _retry_sleep(attempt - 1)   # repeated socket failures: back off, don't hammer
+            continue               # first drop = stale keep-alive socket: reconnect right away
+        ratelimit.PACER.done(cookie)   # the server stamps rejected calls too
+        parsed = _decode(raw, enc)
+        limited = status in RETRY_STATUSES or ratelimit.is_app_429(status, parsed) is not None
+        if limited and attempt < MAX_ATTEMPTS - 1:
+            _retry_sleep(attempt, retry_after)
+            continue               # rate-limited/overloaded: wait, then retry
+        break
+    return status, parsed
+
+
+def add_session_args(parser):
+    parser.add_argument("--cookie", help='explicit "LF_AC=..." cookie value')
+    parser.add_argument("--xml", help="account file (_LINE_COCOS_PREF_KEY.xml) to read the session from")
+    parser.add_argument("--from-device", action="store_true",
+                        help="read the live LF_AC off a rooted, logged-in device")
+    parser.add_argument("--device", help="adb serial for --from-device")
+
+
+def resolve_cookie(args) -> str:
+    if getattr(args, "cookie", None):
+        return args.cookie if args.cookie.startswith("LF_AC=") else "LF_AC=" + args.cookie
+    if getattr(args, "xml", None):
+        from account_file import read_pref_xml
+        return "LF_AC=" + read_pref_xml(args.xml)[1]
+    if getattr(args, "from_device", False):
+        from device_session import get_lfac_from_device
+        return "LF_AC=" + get_lfac_from_device(getattr(args, "device", None))
+    # fall back to the newest token in captures/
+    from pull_roster import newest_auth_from_captures
+    cookie, _uid, when = newest_auth_from_captures()
+    if not cookie:
+        raise SystemExit("No session. Use --cookie \"LF_AC=...\", or --from-device, or capture a login.")
+    print("Using session captured at %s" % when)
+    return cookie if cookie.startswith("LF_AC=") else "LF_AC=" + cookie

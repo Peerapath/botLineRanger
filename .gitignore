@@ -23,3 +23,6 @@ bot/encrypt_config.py
 bot/input/
 *_backup/
 *.relogin.csv
+
+# Shared rate-limit bucket/lock files written by workers at runtime (repo root / next to the exe).
+.ratelimit/
