@@ -142,3 +142,25 @@ def test_build_opener_from_proxy_url():
     handlers = [type(h).__name__ for h in op.handlers]
     assert "ProxyHandler" in handlers
     assert na._build_opener(None) is None
+
+
+def test_do_builds_a_fresh_request_for_every_attempt(monkeypatch, wired):
+    """urllib's ProxyHandler mutates the Request in place; a retry must not reuse it."""
+    seen = []
+
+    def fake_open(req):
+        seen.append(req)
+        if len(seen) == 1:
+            req.set_proxy("10.0.0.1:8080", "https")          # what ProxyHandler.proxy_open does
+            req.add_unredirected_header("Proxy-Authorization", "Basic x")
+            raise urllib.error.HTTPError(req.full_url, 400, "err", _headers(), io.BytesIO(APP429))
+        assert req is not seen[0]
+        assert req.host == "rangers-api.line-apps.com"
+        assert req.full_url == "https://rangers-api.line-apps.com/v12.3/login"
+        assert req.get_header("Cookie") == "c=1"
+        assert not req.has_header("Proxy-authorization") and not req.has_header("Proxy-Authorization")
+        assert req.get_header("Proxy-authorization") is None
+        return FakeResp(200, OK, _headers())
+    monkeypatch.setattr(na, "_open", fake_open)
+    st, _, _ = na._do(_req("c=1"))
+    assert st == 200 and len(seen) == 2

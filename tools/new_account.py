@@ -228,13 +228,22 @@ def _do(req):
     # bootstrap calls (auth/signup) key on the URL. The per-IP bucket is per destination host
     # because game-api.line.me and rangers-api.line-apps.com have separate limits.
     key = req.get_header("Cookie") or req.full_url
-    bucket = ratelimit.bucket_for(req.host)
+    host = req.host
+    bucket = ratelimit.bucket_for(host)
+    # Send a FRESH Request per attempt: urllib's ProxyHandler mutates the one it is given
+    # (set_proxy rewrites host/type/selector, add_unredirected_header adds Proxy-Authorization),
+    # so reusing it would send attempt 2 with an absolute-form URI and attempt 3+ through the
+    # plaintext HTTPHandler inside the CONNECT tunnel. req.headers holds only the caller's
+    # headers; the unredirected ones a handler added live elsewhere and must not be carried over.
+    template = (req.full_url, req.data, dict(req.headers), req.get_method())
     raw, status, resp_headers, parsed = b"", 0, None, {}
     for attempt in range(_MAX_ATTEMPTS):
         ratelimit.PACER.wait(key)
         bucket.acquire()
+        attempt_req = urllib.request.Request(template[0], data=template[1],
+                                             headers=template[2], method=template[3])
         try:
-            resp = _open(req)
+            resp = _open(attempt_req)
             raw, status, resp_headers = resp.read(), resp.status, resp.headers
         except urllib.error.HTTPError as err:
             raw, status, resp_headers = err.read(), err.code, err.headers
