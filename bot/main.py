@@ -65,6 +65,7 @@ except ImportError:
 # All available play modes (will be filtered based on subscription)
 ALL_PLAY_MODE_OPTIONS = {
     "🎮 Login": "ranger_api_Login",
+    "🎮 Login Lv3": "ranger_api_Level3",
     "🎯 GenID": "ranger_api_GenID",
     "🎯 Stage": "ranger_api_Stage",
     # "🛠 Auto Setup": "AutoSetup",
@@ -698,8 +699,10 @@ class EmulatorManager(ctk.CTk):
         # Mode specific
         if mode_key == "ranger_api_Login":
             ctk.CTkLabel(self.mode_specific_frame, text="🎮 ล๊อกอินไอดีเกม").pack(pady=3)
+        elif mode_key == "ranger_api_Level3":
+            ctk.CTkLabel(self.mode_specific_frame, text="🎮 ล๊อกอิน + ดันเลเวลถึง 3 (เล่น st01 ซ้ำ)").pack(pady=3)
         elif mode_key == "ranger_api_GenID":
-            ctk.CTkLabel(self.mode_specific_frame, text="🎯 สร้างไอดีใหม่เลเวล1").pack(pady=3)
+            ctk.CTkLabel(self.mode_specific_frame, text="🎯 สร้างไอดีใหม่เลเวล3").pack(pady=3)
         elif mode_key == "ranger_api_Stage":
             ctk.CTkLabel(self.mode_specific_frame, text="🎯 ดันด่านไอดีจาก input/").pack(pady=3)
         elif mode_key == "AutoSetup":
@@ -723,7 +726,7 @@ class EmulatorManager(ctk.CTk):
         ctk.CTkFrame(self.mode_specific_frame, height=1, fg_color="#333333").pack(fill="x", padx=5, pady=5)
 
         # Mode specific
-        if mode_key == "ranger_api_Login":
+        if mode_key in ("ranger_api_Login", "ranger_api_Level3"):   # Lv3 = Login + ดันเลเวล ตั้งค่าชุดเดียวกัน
             # gacha_ranger
             btn_gacharanger_frame = ctk.CTkFrame(self.mode_specific_frame)
             btn_gacharanger_frame.pack(fill="x", pady=3)
@@ -1532,7 +1535,7 @@ class EmulatorManager(ctk.CTk):
         return self.play_mode_options.get(self.play_mode_var.get())
 
     def _isLoginMode(self):
-        return self._currentModeKey() == "ranger_api_Login"
+        return self._currentModeKey() in ("ranger_api_Login", "ranger_api_Level3")
 
     def _isGenIDMode(self):
         return self._currentModeKey() == "ranger_api_GenID"
@@ -1547,7 +1550,8 @@ class EmulatorManager(ctk.CTk):
         Stage relogin จากไฟล์ input แล้วดันด่านผ่าน API จึงใช้แผงตั้งจำนวน thread +
         สปอว์น worker ชุดเดียวกัน (ต่างกันแค่ฟังก์ชันที่ worker เรียก)
         """
-        return self._currentModeKey() in ("ranger_api_Login", "ranger_api_GenID", "ranger_api_Stage")
+        return self._currentModeKey() in ("ranger_api_Login", "ranger_api_Level3", "ranger_api_GenID",
+                                          "ranger_api_Stage")
 
     def render_left_panel(self):
         """เลือกเนื้อหาแผงซ้ายตามโหมด: Login/GenID/Stage = ตั้งจำนวน thread (ไม่แตะ adb) อื่น ๆ = รายการ device"""
@@ -2292,6 +2296,8 @@ def run_bot(device, choice):
             startBotGenID_API_headless(device)   # headless แท้: mint บัญชีใหม่ผ่าน signup ไม่เปิดเกม/ไม่ต่อ adb
         elif choice == "ranger_api_Stage":
             startBotStage_API_headless(device)   # headless แท้: relogin จากไฟล์ แล้วดันด่านผ่าน API
+        elif choice == "ranger_api_Level3":
+            startBotLevel3_API_headless(device)  # headless แท้: Login + เล่น st01 ซ้ำจนเลเวล 3
         elif choice == "AutoSetup":
             startBotCheckGameInfo_API(device)
     except Exception:

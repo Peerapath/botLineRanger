@@ -338,3 +338,76 @@ def test_enter_plain_failure_falls_back_to_tutorial_route(monkeypatch):
     status, result, error = sf.enter("LF_AC=t", "st01")
     assert (status, error) == (200, None) and result["battleSn"] == 777
     assert calls == ["/stage/enter/st01", "/tutorial/stage/enter/st01?tutorialType=START"]
+
+
+def _level_up_env(monkeypatch, start_level, results):
+    """player_info -> start_level; clear_stage pops (ok, info) from `results`; no real sleeping."""
+    calls = []
+    monkeypatch.setattr(sf, "player_info", lambda cookie: {"level": start_level, "rsn": "r"})
+
+    def fake_clear(cookie, stc, rsn, pt):
+        calls.append(stc)
+        return results.pop(0)
+    monkeypatch.setattr(sf, "clear_stage", fake_clear)
+    slept = []
+    monkeypatch.setattr(sf.time, "sleep", lambda s: slept.append(s))
+    return calls, slept
+
+
+def test_level_up_already_at_target_plays_nothing(monkeypatch):
+    calls, _ = _level_up_env(monkeypatch, 3, [])
+    assert sf.level_up("LF_AC=t", "r", 3, progress=lambda m: None) == (3, 0, "done")
+    assert calls == []
+
+
+def test_level_up_replays_stage_until_target(monkeypatch):
+    results = [(True, {"step": "save", "level": 2, "exp": 600, "hearts": 9}),
+               (True, {"step": "save", "level": 3, "exp": 600, "hearts": 13})]
+    calls, slept = _level_up_env(monkeypatch, 1, results)
+    msgs = []
+    assert sf.level_up("LF_AC=t", "r", 3, delay=3.0, progress=msgs.append) == (3, 2, "done")
+    assert calls == ["st01", "st01"]
+    assert len(slept) == 1 and 3.0 <= slept[0] <= 4.0      # delay + jitter between plays only
+    assert any("level=3" in m for m in msgs)
+
+
+def test_level_up_stops_on_cheat_verdict(monkeypatch):
+    results = [(False, {"step": "save", "errorCode": sf.ERR_SUSPECTED_ABUSING, "http": 400})]
+    calls, _ = _level_up_env(monkeypatch, 1, results)
+    assert sf.level_up("LF_AC=t", "r", 3, progress=lambda m: None) == (1, 0, "flagged")
+    assert calls == ["st01"]
+
+
+def test_level_up_waits_for_hearts_then_continues(monkeypatch):
+    results = [(False, {"step": "hearts", "wait_s": 40}),
+               (True, {"step": "save", "level": 3, "exp": 600, "hearts": 5})]
+    calls, slept = _level_up_env(monkeypatch, 2, results)
+    assert sf.level_up("LF_AC=t", "r", 3, delay=0, progress=lambda m: None) == (3, 1, "done")
+    assert slept == [45]                                     # wait_s + 5
+    assert calls == ["st01", "st01"]
+
+
+def test_level_up_gives_up_when_hearts_too_far(monkeypatch):
+    results = [(False, {"step": "hearts", "wait_s": 5000})]
+    _level_up_env(monkeypatch, 1, results)
+    assert sf.level_up("LF_AC=t", "r", 3, max_heart_wait=600, progress=lambda m: None) == (1, 0, "hearts")
+
+
+def test_level_up_max_plays_cap(monkeypatch):
+    results = [(True, {"step": "save", "level": 1, "exp": 0, "hearts": 5})] * 3
+    calls, _ = _level_up_env(monkeypatch, 1, results)
+    assert sf.level_up("LF_AC=t", "r", 3, max_plays=3, delay=0, progress=lambda m: None) == (1, 3, "maxplays")
+    assert len(calls) == 3
+
+
+def test_level_up_two_losses_fail(monkeypatch):
+    loss = (False, {"step": "save", "errorCode": None, "http": 200})
+    results = [loss, loss]
+    _level_up_env(monkeypatch, 1, results)
+    assert sf.level_up("LF_AC=t", "r", 3, delay=0, progress=lambda m: None) == (1, 0, "failed")
+
+
+def test_level_up_auth_stops_immediately(monkeypatch):
+    results = [(False, {"step": "auth", "errorCode": None, "http": 401})]
+    _level_up_env(monkeypatch, 1, results)
+    assert sf.level_up("LF_AC=t", "r", 3, delay=0, progress=lambda m: None) == (1, 0, "auth")

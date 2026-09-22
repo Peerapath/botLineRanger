@@ -364,6 +364,69 @@ def clear_range(cookie: str, rsn: str, first: int, last: int, pt: int = 1, retri
     return cleared, "done"
 
 
+def level_up(cookie: str, rsn: str, target_level: int, stc: str = "st01", pt: int = 1,
+             max_plays: int = 10, retries: int = 2, max_heart_wait: float = 600,
+             delay: float = DEFAULT_DELAY, progress=print) -> tuple[int, int, str]:
+    """Replay ONE stage (default st01) until the player's level reaches `target_level`.
+
+    Returns (level, plays, reason); reason is "done" when the level was reached (plays may be 0
+    if the account already had it), else the same stop reasons as clear_range ("hearts", "auth",
+    "flagged", "locked", "failed") or "maxplays" when `max_plays` clears were not enough.
+
+    Measured 2026-09-23 on fresh guests: every st01 clear pays 600 exp (first and repeat alike),
+    level 1 -> 2 after one clear and -> 3 after two, and each level-up refills hearts, so a
+    new account reaches level 3 in two plays without any tutorial handling.
+    """
+    player = player_info(cookie)
+    level = int(player.get("level") or 0)
+    if level >= target_level:
+        return level, 0, "done"
+    plays = losses = attempt = heart_waits = 0
+    while plays < max_plays:
+        if plays and delay > 0:
+            time.sleep(delay + random.uniform(0, min(1.0, delay)))
+        try:
+            ok, info = clear_stage(cookie, stc, rsn, pt)
+        except NET_ERRORS as err:
+            ok, info = False, {"stage": stc, "step": "network", "error": repr(err)}
+        if ok:
+            plays += 1
+            level = int(info.get("level") or level)
+            progress("%s cleared (%d/%d plays) level=%s exp=+%s hearts=%s" % (
+                stc, plays, max_plays, level, info.get("exp"), info.get("hearts")))
+            if level >= target_level:
+                return level, plays, "done"
+            continue
+        error, step = info.get("errorCode"), info["step"]
+        if step == "hearts":
+            wait = info.get("wait_s") or 0
+            if wait > max_heart_wait or heart_waits >= 3:
+                progress("%s out of hearts - next heart in %.0fs, stopping" % (stc, wait))
+                return level, plays, "hearts"
+            heart_waits += 1
+            progress("%s out of hearts - waiting %.0fs for regen" % (stc, wait + 5))
+            time.sleep(wait + 5)
+            continue
+        attempt += 1
+        progress("%s FAILED (try %d/%d) %s" % (stc, attempt, retries + 1, json.dumps(info)))
+        if step == "auth":
+            return level, plays, "auth"
+        if error == ERR_SUSPECTED_ABUSING:
+            return level, plays, "flagged"
+        if error in LOCKED:
+            return level, plays, "locked"
+        if step == "save":
+            if info.get("http") != 200:
+                return level, plays, "failed"
+            losses += 1
+            if losses > 1:
+                return level, plays, "failed"
+        if attempt > retries:
+            return level, plays, "failed"
+        time.sleep(min(30, 2 * 2 ** attempt))
+    return level, plays, "maxplays"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_session_args(parser)

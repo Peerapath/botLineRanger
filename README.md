@@ -341,6 +341,15 @@ python tools\stage_forge.py --xml bot\input\40d2cf61.xml --to 80 --confirm
 (ไอดีที่โดนตีธง 102204 จะถูกย้ายไป `login failed/` แทน) โหมดจะโผล่ใน dropdown ก็ต่อเมื่อ
 license API คืน `ranger_api_Stage` มาใน `allowed_modes` (อีเมล whitelist = เห็นทุกโหมด)
 
+**🎮 Login Lv3** (`ranger_api_Level3`, เพิ่ม 2026-09-23) = Login ทุกอย่างเหมือนเดิม แต่หลัง relogin จะเช็คเลเวล:
+ถ้ายังไม่ถึง `settings.leveltarget` (ค่าเริ่มต้น 3) จะเล่น st01 ซ้ำผ่าน API (`stage_forge.level_up`) จนถึง
+แล้วค่อยรับของ/กาชา/ส่งออกตามปกติ (ถึงอยู่แล้ว = login เฉย ๆ) วัดจริง: st01 ให้ 600 exp ทุกรอบ
+เลเวล 1 -> 3 ใช้ 2 รอบ (~15 วิ) ไม่ต้องข้าม tutorial ไอดีที่ดันไม่ถึงหรือโดนตีธง 102204 จะไป `login failed/`
+ไม่ปนกับ output/ โหมดนี้ต้องมี `ranger_api_Level3` ใน `allowed_modes` ของ license API เช่นกัน
+
+**🎯 GenID** ตั้งแต่ 2026-09-23 ดันเลเวลบัญชีใหม่ให้ถึง `leveltarget` (3) ด้วยวิธีเดียวกันก่อนรับของ/กาชา
+บัญชีที่ดันไม่ถึงจะถูกย้ายไป `login failed/` แล้วสร้างใหม่แทน ผลลัพธ์ที่ออกจาก GenID จึงเป็นเลเวล 3 เสมอ
+
 ### Rate limit (tools/ratelimit.py)
 
 ทุก request ที่ผ่าน `rangers_api.call` และ `new_account._do` จะ (1) รอให้ห่างจากคำตอบก่อนหน้าของไอดีเดิม

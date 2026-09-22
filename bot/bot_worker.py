@@ -24,6 +24,7 @@ def run_worker(device, mode="ranger_api_Login"):
 
     mode == 'ranger_api_GenID' -> startBotGenID_API_headless (mint บัญชีใหม่ผ่าน /signup/platform)
     mode == 'ranger_api_Stage' -> startBotStage_API_headless (relogin จากไฟล์ แล้วดันด่านผ่าน API)
+    mode == 'ranger_api_Level3' -> startBotLevel3_API_headless (Login + เล่น st01 ซ้ำจนเลเวล 3)
     อื่น ๆ                     -> startBotLogin_API_headless (relogin จากไฟล์ใน input/)
     """
     try:
@@ -38,6 +39,8 @@ def run_worker(device, mode="ranger_api_Login"):
             botLineRanger.startBotGenID_API_headless(device)
         elif mode == "ranger_api_Stage":
             botLineRanger.startBotStage_API_headless(device)
+        elif mode == "ranger_api_Level3":
+            botLineRanger.startBotLevel3_API_headless(device)
         else:
             botLineRanger.startBotLogin_API_headless(device)
     except Exception:
