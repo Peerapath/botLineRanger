@@ -27,6 +27,17 @@ import atexit
 import importlib
 from bot_version import CURRENT_VERSION   # แทน 'import main as mai' เดิม (เลี่ยง customtkinter ใน worker)
 
+# Windows console/พื้นฐานเป็น cp1252: พอ print ข้อความไทย/emoji (เช่น log [SESSION], ชื่อ ranger,
+# ข้อความ error) ลง console จะโยน UnicodeEncodeError ('charmap' codec can't encode characters ...)
+# แล้ว worker พังทั้ง session (เห็นใน src/log/genid-sessions.csv เป็น FAIL). บังคับ UTF-8 ที่
+# stdout/stderr เหมือนที่ tools/*.py ทุกไฟล์ทำ. guard ไว้เผื่อ stream ถูก redirect เป็น devnull/
+# object ที่ไม่มี reconfigure(). ต้องทำก่อนมี print แรกของบอท
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 
 class _LazyModule:
     """โหลดโมดูลจริงตอนถูกใช้ครั้งแรก (attribute access) ไม่ใช่ตอน import
@@ -370,11 +381,14 @@ def _loadBotConfig():
 
     current_gacha_cycles = 0
 
-    configRanger = configparser.ConfigParser()
+    # strict=False: ทนต่อ key ซ้ำในไฟล์ (เอาค่าท้ายสุด) แทนที่จะ crash ทั้ง worker
+    # การเพิ่มเรนเจอร์/เกียร์ผ่าน GUI อาจได้ code ซ้ำ (เช่น u1206e-moon สองชื่อ) ถ้า strict
+    # จะโยน DuplicateOptionError ทำให้ setUpHeadless พังตั้งแต่ต้น worker เลยไม่รันสักตัว
+    configRanger = configparser.ConfigParser(strict=False)
     configRanger.read("src\configRangers.ini", encoding="utf-8")
     RANGERSCONFIG = dict(configRanger["rangers"])
 
-    configGear = configparser.ConfigParser()
+    configGear = configparser.ConfigParser(strict=False)
     configGear.read("src\configGears.ini", encoding="utf-8")
     GEARS = dict(configGear["gears"])
     
@@ -3137,6 +3151,19 @@ def exportFileFromExecuteToOutput(text:str="", newName:str=""):
     log(f"Export File: {dest_path}")
     shutil.move(path, dest_path)
     return dest_path
+
+
+def removeFileInExecute():
+    """ลบไฟล์ที่ import เข้ามาใน execute ทิ้งไปเลย (ไม่ย้ายไปไหน)"""
+    if not FILENAME:
+        raise FileNotFoundError("No imported file to remove (FILENAME is empty)")
+    path = os.path.join("execute", FILENAME)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"File not found: {path}")
+
+    log(f"Remove File: {path}")
+    os.remove(path)
+    return f"Remove File: {path}"
 
 
 def exportFileFromExecuteToLoginFailed():
@@ -7831,7 +7858,7 @@ def printGachaBanners(rows):
             print("    banner: %s" % r["banner"])
 
 
-GACHABANNERTYPES = ("ULTRA_RARE", "")
+GACHABANNERTYPES = ("ULTRA_RARE", "PICK_UP")
 
 
 def reloginFromInput(rel_path=""):
@@ -7915,10 +7942,10 @@ def getGachaBanner(summary=True, includeClosed=False, types=GACHABANNERTYPES, ev
     rows = []
     for group in groups:
         gg = group.get("gachaGroup") or {}
-        if types is not None and gg.get("gachaDisplayType") not in types:
-            continue
-        if eventOnly and "[EVENT-" not in (gg.get("gachaName") or ""):
-            continue
+        # if types is not None and gg.get("gachaDisplayType") not in types:
+        #     continue
+        # if eventOnly and "[EVENT-" not in (gg.get("gachaName") or ""):
+        #     continue
         start, end = gg.get("exposureStartDate"), gg.get("exposureEndDate")
         live = bool(start and end and start <= now <= end)
         if not includeClosed and not live:
@@ -8081,8 +8108,148 @@ def startBotLogin_API_headless(deviceSerial=""):
             _releaseAccountThisRun(accountId)
 
         # log ก่อนเช็คว่ามีไฟล์เหลือไหม เดิม break ก่อนถึงตรงนี้ session สุดท้ายของทุกเครื่องเลยหาย
-        # logSession(sessionStart, sessionStatus, GAMEID, currentLevelValue, rangerNames,
-        #            gachaStatus, usedAttempts, exportedFile, lastError)
+        logSession(sessionStart, sessionStatus, GAMEID, currentLevelValue, rangerNames,
+                   gachaStatus, usedAttempts, exportedFile, lastError)
+        print("========== End ==========", flush=True)
+
+
+def apiForceStage(targetStage=None, fromStage=None):
+    """ดันด่าน main stage ของบัญชีปัจจุบันผ่าน API ล้วน (ไม่เปิดเกม ไม่แตะ adb)
+
+    ใช้ tools/stage_forge.py: /stage/enter -> ประกอบ battle log ที่เซิร์ฟเวอร์ยอมรับ
+    (sn_e/win_e = RSA ของคีย์ที่ enter แจกมา, icu = AES ที่ผูกกับ rsn+battleSn) -> /stage/save
+    เริ่มจากด่านถัดจากด่านที่เคลียร์ล่าสุด (อ่าน /stage/last เพราะ lastStageCode ขยับตอน "เข้า"
+    ด่าน ไม่ใช่ตอนเคลียร์) ไปจนถึง targetStage (ดีฟอลต์ = STAGEEND จาก config)
+    stage_forge เว้นจังหวะระหว่างด่านให้เอง (DEFAULT_DELAY) กัน rate limit ของเซิร์ฟเวอร์
+
+    คืน dict {"cleared", "target", "stop", "levelAfter"} - stop คือเหตุที่หยุด
+    (done/locked/hearts/auth/flagged/failed)
+    """
+    if TOOLSDIR not in sys.path:
+        sys.path.insert(0, TOOLSDIR)
+    import stage_forge
+
+    cookie = getLFAC()
+    player = stage_forge.player_info(cookie)
+    rsn = player.get("rsn")
+    if not rsn:
+        raise Exception("force stage: อ่าน rsn ของบัญชีไม่ได้ (icu ผูกกับ rsn ถ้าผิดจะแพ้เงียบ ๆ)")
+
+    target = int(targetStage or STAGEEND or stage_forge.LAST_STAGE)
+    first = int(fromStage or stage_forge.start_stage(cookie, player))
+    if first > target:
+        log(f"force stage: ถึงด่าน {target} แล้ว (ด่านถัดไปคือ st{first:02d}) ข้าม")
+        return {"cleared": first - 1, "target": target, "stop": "done",
+                "levelAfter": player.get("level")}
+
+    log(f"force stage: st{first:02d} -> st{target:02d} (level {player.get('level')})")
+    cleared, reason = stage_forge.clear_range(cookie, rsn, first, target, progress=log)
+    level = player.get("level")
+    try:
+        level = stage_forge.player_info(cookie).get("level", level)
+    except Exception:
+        pass    # อ่านเลเวลใหม่ไม่ได้ ไม่ใช่เหตุให้ทั้ง session พัง
+    log(f"force stage: เคลียร์ถึง st{cleared:02d}/{target} (หยุดเพราะ {reason}) level -> {level}")
+    return {"cleared": cleared, "target": target, "stop": reason, "levelAfter": level}
+
+
+def startBotStage_API_headless(deviceSerial=""):
+    """โหมด Stage (headless แท้): หยิบไฟล์ ID จาก input/ -> relogin -> ดันด่าน -> export
+
+    โครงเดียวกับ startBotLogin_API_headless ต่างกันที่ขั้นกลาง: แทนกาชา/รับของ จะเรียก
+    apiForceStage() ดันด่าน main stage ถึงด่านที่ตั้งไว้ใน config (stageend) แล้วส่งไฟล์ออก
+    output/ พร้อมเลเวลใหม่ในชื่อไฟล์ ไม่เปิดเกม ไม่ต่อ adb
+
+    บัญชีที่เซิร์ฟเวอร์ตีธงโกง (stop=flagged) จะถูกย้ายไป 'login failed' แทนการส่งออก
+    จะได้ไม่ปนกับไอดีที่ใช้ได้
+    """
+    global GAMEID
+    MAXATTEMPTS = 3
+
+    setUpHeadless(deviceSerial)
+    log(f"Bot running headless (Stage -> st{STAGEEND}) on {deviceSerial}")
+
+    while True:
+        GAMEID = ""
+        sessionStart = time.time()
+        sessionStatus = "FAIL"
+        currentLevelValue = 0
+        stageStatus = "-"
+        exportedFile = ""
+        lastError = ""
+        usedAttempts = 0
+        sessionFile = ""
+        noMoreFiles = False
+        stageDone = False        # ดันด่านไปแล้ว: retry ขั้นหลังห้ามดันซ้ำ
+        flagged = False
+        rangerNames = ""
+
+        print("========= Start =========", flush=True)
+        print(">>> startBotStage (headless) <<<", flush=True)
+
+        for attempt in range(1, MAXATTEMPTS + 1):
+            usedAttempts = attempt
+            try:
+                force_stop_LINE_Rangers()   # headless: แค่ล้าง LFACCACHE บังคับ relogin ไฟล์นี้ใหม่
+                if not sessionFile:
+                    try:
+                        importFileFromInputToExecute()
+                    finally:
+                        sessionFile = FILENAME
+                    if not sessionFile:
+                        noMoreFiles = True
+                        break
+                else:
+                    reImportFileInExecute()
+
+                getLFAC(timeout=60)         # relogin จากไฟล์ ได้ LF_AC สด
+
+                if not stageDone:
+                    result = apiForceStage()
+                    stageDone = True
+                    flagged = result["stop"] == "flagged"
+                    stageStatus = "st%d/%s" % (result["cleared"], result["stop"])
+                else:
+                    log(f"Stage already pushed this session ({stageStatus}) - skip")
+
+                rangerNames, level, ruby, ticket, gameID = getAccoutInfo()
+                currentLevelValue = level
+                fileName = f"{rangerNames}_Rb{ruby}_Tk{ticket}_{gameID}_Lv{level}"
+
+                if flagged:
+                    # เซิร์ฟเวอร์ตีธง 102204 = บัญชีนี้ถูกจับได้ อย่าเอาไปปนกับไอดีที่ขายได้
+                    exportFileFromExecuteToLoginFailed()
+                    exportedFile = os.path.join("login failed", sessionFile)
+                else:
+                    exportedFile = exportFileFromExecuteToOutput(newName=fileName)
+                force_stop_LINE_Rangers()
+                sessionStatus = "OK" if not flagged else "FLAG"
+                break
+
+            except TimeoutError as e:
+                lastError = f"timeout: {e}"
+                log(f"Restart bot due to timeout (attempt {attempt}): {e}")
+                continue
+            except Exception as e:
+                lastError = str(e)
+                log(f"Unexpected error (attempt {attempt}): {e}")
+                traceback.print_exc()
+                continue
+
+        if noMoreFiles:
+            print("========== End ==========", flush=True)
+            log(f"Not Found File ID")
+            break
+
+        if sessionStatus == "FAIL" and sessionFile and os.path.isfile(os.path.join("execute", sessionFile)):
+            try:
+                exportFileFromExecuteToLoginFailed()
+                exportedFile = os.path.join("login failed", sessionFile)
+            except Exception as e:
+                log(f"move to login failed error: {e}")
+
+        logSession(sessionStart, sessionStatus, GAMEID, currentLevelValue, rangerNames,
+                   stageStatus, usedAttempts, exportedFile, lastError)
         print("========== End ==========", flush=True)
 
 
@@ -8112,7 +8279,9 @@ def _headlessCreateAccount():
     na.authorize(device_id, cc)
     session = na.signup_platform(cc, udid)  # สร้าง player ฝั่ง rangers -> LF_AC + starter ruby/coin
     if not session or not session.get("lf_ac"):
-        raise Exception("headless signup ล้มเหลว - ไม่ได้ LF_AC (บัญชีถูก mint แล้ว รันซ้ำ/--resume ได้)")
+        # แนบ HTTP status ของ signup ไว้ในข้อความ แยก 429 (rate-limit ชั่วคราว) จากเหตุจริงอื่น
+        raise Exception(f"headless signup ล้มเหลว (HTTP {na.LAST_SIGNUP_HTTP}) - ไม่ได้ LF_AC "
+                        f"(บัญชีถูก mint แล้ว รันซ้ำ/--resume ได้)")
 
     lf_ac = session["lf_ac"]
     gameId = session.get("mid") or guest.get("userKey")
@@ -8197,7 +8366,7 @@ def startBotGenID_API_headless(deviceSerial=""):
                 if gotTarget:
                     exportedFile = exportFileFromExecuteToBackup(newName=fileName)
                 else:
-                    exportedFile = exportFileFromExecuteToOutput(newName=fileName)
+                    exportedFile = removeFileInExecute()
                 sessionStatus = "OK"
                 break
 
@@ -8207,12 +8376,9 @@ def startBotGenID_API_headless(deviceSerial=""):
                 traceback.print_exc()
                 continue
 
-        # สรุป session ลง stdout อย่างเดียว (โหมด headless ไม่เขียนไฟล์ log เหมือน startBotLogin_API_headless)
-        print("[SESSION] %s  status=%s attempts=%d gameId=%s Lv%s ranger=%s gacha=%s file=%s"
-              % (datetime.now().strftime("%H:%M:%S"), sessionStatus, usedAttempts, GAMEID or "-",
-                 currentLevelValue, rangerNames or "-", gachaStatus or "-", exportedFile or "-"), flush=True)
-        if lastError:
-            print("[SESSION] error: %s" % " ".join(str(lastError).split())[:200], flush=True)
+        # เก็บสรุป session ลง src/log/genid-sessions.csv (logSession พิมพ์ [SESSION] + error ให้ในตัว)
+        logSession(sessionStart, sessionStatus, GAMEID, currentLevelValue, rangerNames,
+                   gachaStatus, usedAttempts, exportedFile, lastError)
         print("========== End ==========", flush=True)
 
 
@@ -8227,8 +8393,7 @@ if __name__ == "__main__":
         setUp("127.0.0.1:16416")
 
 
-    startBotLogin_API_headless
-    startBotGenID_API_headless
+
 
 
 

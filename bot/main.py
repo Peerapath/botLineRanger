@@ -66,6 +66,7 @@ except ImportError:
 ALL_PLAY_MODE_OPTIONS = {
     "🎮 Login": "ranger_api_Login",
     "🎯 GenID": "ranger_api_GenID",
+    "🎯 Stage": "ranger_api_Stage",
     # "🛠 Auto Setup": "AutoSetup",
 }
 
@@ -544,7 +545,10 @@ class EmulatorManager(ctk.CTk):
             self.config.setdefault("mode", {})
             self.config.setdefault("login", {})
             try:
-                self.config["settings"]["stageend"] = str(self.stage_end.get())
+                # โหมด Stage อ่านค่านี้เป็น int (botLineRanger._loadBotConfig ใช้ getint) ถ้าผู้ใช้
+                # พิมพ์ตัวอักษร/ว่าง ต้องไม่เขียนลงไฟล์ ไม่งั้น worker พังตั้งแต่โหลด config
+                stage_end = int(str(self.stage_end.get()).strip())
+                self.config["settings"]["stageend"] = str(max(1, min(stage_end, 500)))
             except Exception:
                 pass
             try:
@@ -696,6 +700,8 @@ class EmulatorManager(ctk.CTk):
             ctk.CTkLabel(self.mode_specific_frame, text="🎮 ล๊อกอินไอดีเกม").pack(pady=3)
         elif mode_key == "ranger_api_GenID":
             ctk.CTkLabel(self.mode_specific_frame, text="🎯 สร้างไอดีใหม่เลเวล1").pack(pady=3)
+        elif mode_key == "ranger_api_Stage":
+            ctk.CTkLabel(self.mode_specific_frame, text="🎯 ดันด่านไอดีจาก input/").pack(pady=3)
         elif mode_key == "AutoSetup":
             ctk.CTkLabel(self.mode_specific_frame, text="🛠 Auto Setup").pack(pady=3)
         else:
@@ -827,6 +833,23 @@ class EmulatorManager(ctk.CTk):
                 self.rgacha_cycles.insert(0, "1")
             self.rgacha_cycles.pack(side="left")
             self.rgacha_cycles.bind("<KeyRelease>", self.debounce_save)
+
+        elif mode_key == "ranger_api_Stage":
+            # ด่านเป้าหมาย: ดันจากด่านที่ไอดีนั้นค้างอยู่ ไปจนถึงเลขนี้ (เซฟลง settings.stageend)
+            btn_stageend_frame = ctk.CTkFrame(self.mode_specific_frame)
+            btn_stageend_frame.pack(fill="x", pady=3)
+            ctk.CTkLabel(btn_stageend_frame, text="เล่นถึงด่าน").pack(side="left", padx=(0, 5))
+            self.stage_end = ctk.CTkEntry(btn_stageend_frame, placeholder_text="150", width=50, height=20)
+            try:
+                self.stage_end.insert(0, self.config.get("settings", "stageend"))
+            except Exception:
+                self.stage_end.insert(0, "150")
+            self.stage_end.pack(side="left")
+            self.stage_end.bind("<KeyRelease>", self.debounce_save)
+            ctk.CTkLabel(self.mode_specific_frame,
+                         text="ดันด่านผ่าน API ล้วน (ไม่เปิดเกม) เริ่มจากด่านที่ไอดีนั้นค้างอยู่\n"
+                              "จบแล้วส่งไฟล์ออก output/ พร้อมเลเวลใหม่ในชื่อไฟล์",
+                         text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=5, pady=(2, 3))
 
         elif mode_key == "AutoSetup":
             ctk.CTkLabel(self.mode_specific_frame, text="🛠 Auto Setup").pack(pady=3)
@@ -1514,16 +1537,20 @@ class EmulatorManager(ctk.CTk):
     def _isGenIDMode(self):
         return self._currentModeKey() == "ranger_api_GenID"
 
-    def _isHeadlessThreadMode(self):
-        """โหมดที่รันแบบ headless หลาย thread (ไม่ผูก device): Login + GenID
+    def _isStageMode(self):
+        return self._currentModeKey() == "ranger_api_Stage"
 
-        ทั้งสองโหมดไม่แตะ adb/เกม: Login relogin จากไฟล์ input, GenID mint บัญชีใหม่เอง
-        จึงใช้แผงตั้งจำนวน thread + สปอว์น worker ชุดเดียวกัน (ต่างกันแค่ฟังก์ชันที่ worker เรียก)
+    def _isHeadlessThreadMode(self):
+        """โหมดที่รันแบบ headless หลาย thread (ไม่ผูก device): Login + GenID + Stage
+
+        ทุกโหมดนี้ไม่แตะ adb/เกม: Login relogin จากไฟล์ input, GenID mint บัญชีใหม่เอง,
+        Stage relogin จากไฟล์ input แล้วดันด่านผ่าน API จึงใช้แผงตั้งจำนวน thread +
+        สปอว์น worker ชุดเดียวกัน (ต่างกันแค่ฟังก์ชันที่ worker เรียก)
         """
-        return self._currentModeKey() in ("ranger_api_Login", "ranger_api_GenID")
+        return self._currentModeKey() in ("ranger_api_Login", "ranger_api_GenID", "ranger_api_Stage")
 
     def render_left_panel(self):
-        """เลือกเนื้อหาแผงซ้ายตามโหมด: Login/GenID = ตั้งจำนวน thread (ไม่แตะ adb) อื่น ๆ = รายการ device"""
+        """เลือกเนื้อหาแผงซ้ายตามโหมด: Login/GenID/Stage = ตั้งจำนวน thread (ไม่แตะ adb) อื่น ๆ = รายการ device"""
         if self._isHeadlessThreadMode():
             self._build_thread_panel()
         else:
@@ -1536,10 +1563,15 @@ class EmulatorManager(ctk.CTk):
             widget.destroy()
 
         isGen = self._isGenIDMode()
+        isStage = self._isStageMode()
         header = ctk.CTkFrame(self.left_frame, fg_color="#303030")
         header.pack(fill="x", padx=4, pady=(6, 3))
-        ctk.CTkLabel(header, text=("🎯 จำนวน Thread สร้างไอดี" if isGen else "⚙ จำนวน Thread (headless)"),
-                     anchor="w").pack(side="left", padx=6)
+        header_text = "⚙ จำนวน Thread (headless)"
+        if isGen:
+            header_text = "🎯 จำนวน Thread สร้างไอดี"
+        elif isStage:
+            header_text = "🎯 จำนวน Thread ดันด่าน"
+        ctk.CTkLabel(header, text=header_text, anchor="w").pack(side="left", padx=6)
 
         ctrl = ctk.CTkFrame(self.left_frame, fg_color="#303030")
         ctrl.pack(fill="x", padx=4, pady=3)
@@ -1556,8 +1588,11 @@ class EmulatorManager(ctk.CTk):
                       command=lambda: self._change_thread_count(1)).pack(side="left", padx=4)
         ctk.CTkLabel(ctrl, text="thread (สูงสุด 1024)", text_color="gray").pack(side="left", padx=4)
 
-        hint = ("แต่ละ thread สร้างบัญชีใหม่เอง (mint + signup) ส่งออกลง output/ ไม่กินไฟล์ input"
-                if isGen else "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันอัตโนมัติ")
+        hint = "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันอัตโนมัติ"
+        if isGen:
+            hint = "แต่ละ thread สร้างบัญชีใหม่เอง (mint + signup) ส่งออกลง output/ ไม่กินไฟล์ input"
+        elif isStage:
+            hint = "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วดันด่านผ่าน API (ไม่เปิดเกม)"
         ctk.CTkLabel(self.left_frame, text=hint,
                      text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=8, pady=(2, 6))
 
@@ -2243,7 +2278,9 @@ def run_bot(device, choice):
     จะรกและปนกัน (แบบ error OpenBLAS ที่เห็นก่อนหน้า) ไม่มี console ก็ยังพังตอน print
     """
     try:
-        devnull = open(os.devnull, "w")
+        # errors="replace": devnull ใช้ encoding พื้นฐาน (cp1252 บน Windows) พอ print ไทย/emoji
+        # จะโยน UnicodeEncodeError กลาง flow (แม้จะทิ้งลง devnull) แล้ว worker พังเงียบ ๆ
+        devnull = open(os.devnull, "w", encoding="utf-8", errors="replace")
         sys.stdout = devnull
         sys.stderr = devnull
     except Exception:
@@ -2253,6 +2290,8 @@ def run_bot(device, choice):
             startBotLogin_API_headless(device)   # headless แท้: mint LF_AC เองจากไฟล์ ไม่เปิดเกม/ไม่ต่อ adb
         elif choice == "ranger_api_GenID":
             startBotGenID_API_headless(device)   # headless แท้: mint บัญชีใหม่ผ่าน signup ไม่เปิดเกม/ไม่ต่อ adb
+        elif choice == "ranger_api_Stage":
+            startBotStage_API_headless(device)   # headless แท้: relogin จากไฟล์ แล้วดันด่านผ่าน API
         elif choice == "AutoSetup":
             startBotCheckGameInfo_API(device)
     except Exception:

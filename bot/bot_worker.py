@@ -23,6 +23,7 @@ def run_worker(device, mode="ranger_api_Login"):
     """รันลูป headless ของ 1 worker ตามโหมด (ไม่เขียน log: กลบ stdout/stderr ทิ้ง)
 
     mode == 'ranger_api_GenID' -> startBotGenID_API_headless (mint บัญชีใหม่ผ่าน /signup/platform)
+    mode == 'ranger_api_Stage' -> startBotStage_API_headless (relogin จากไฟล์ แล้วดันด่านผ่าน API)
     อื่น ๆ                     -> startBotLogin_API_headless (relogin จากไฟล์ใน input/)
     """
     try:
@@ -35,6 +36,8 @@ def run_worker(device, mode="ranger_api_Login"):
     try:
         if mode == "ranger_api_GenID":
             botLineRanger.startBotGenID_API_headless(device)
+        elif mode == "ranger_api_Stage":
+            botLineRanger.startBotStage_API_headless(device)
         else:
             botLineRanger.startBotLogin_API_headless(device)
     except Exception:
