@@ -33,6 +33,7 @@ from device_session import decrypt_lfac  # noqa: E402
 
 import new_account as na  # noqa: E402
 import rangers_api  # noqa: E402
+import ratelimit  # noqa: E402
 
 ENC_RE = re.compile(r'(<string name="_ENC_LF_AC_KEY">)(.*?)(</string>)', re.S)
 
@@ -85,7 +86,7 @@ class Transient(Exception):
 def login(cc, udid, guest_cookie, nation, language="en"):
     """ยิง GET /v12.3/login คืน (status, result_or_None, lf_ac_or_None).
 
-    retry เองเมื่อเจอ network error / 429 / 5xx (RETRY_WAITS). ถ้ายังไม่หายหลัง
+    retry เองเมื่อเจอ network error / 429 / app-429 (HTTP 400+errorCode 429) / 5xx (RETRY_WAITS). ถ้ายังไม่หายหลัง
     retry ครบ -> raise Transient ให้ process_file นับเป็น error. 401 ไม่ retry
     (เป็นคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว).
     """
@@ -117,7 +118,8 @@ def login(cc, udid, guest_cookie, nation, language="en"):
             last = "network"
             status = None
         else:
-            if status == 429 or (isinstance(status, int) and 500 <= status < 600):
+            if (status == 429 or ratelimit.is_app_429(status, res) is not None
+                    or (isinstance(status, int) and 500 <= status < 600)):
                 last = status
             else:
                 lf_ac = na._cookie_value(cookies, "LF_AC")

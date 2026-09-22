@@ -327,3 +327,12 @@ def test_process_file_error_when_renew_fails(tmp_path, monkeypatch):
 
     res = relogin.process_file(str(src), str(tmp_path / "acc"), Pool(), str(tmp_path / "bk"))
     assert res["status"] == "error"   # renew failure surfaced, not swallowed
+
+
+def test_login_app_429_after_retries_is_transient(monkeypatch):
+    monkeypatch.setattr(relogin.na, "_do",
+                        lambda req: (400, {"errorCode": 429, "extras": {"current": 2, "previous": 1}}, []))
+    monkeypatch.setattr(relogin.time, "sleep", lambda s: None)
+    import pytest
+    with pytest.raises(relogin.Transient):
+        relogin.login("CC", "U", "OLD", "TH")
