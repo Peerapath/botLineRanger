@@ -92,19 +92,25 @@ PACER = AccountPacer()
 
 # --- per-IP token bucket (cross-process, lock file) -----------------------------------------
 
+_LOCK_TIMEOUT_S = 10.0   # give up -> OSError -> IpBucket.acquire() disables the bucket instead of hanging
+
 if os.name == "nt":
     import msvcrt
 
     def _lock(fh):
-        # LK_LOCK gives up after 10 s with OSError; a busy box with hundreds of workers can hit
-        # that legitimately, so just keep waiting.
+        # LK_LOCK only retries once per second, which starves contending workers (measured: one
+        # of 8 processes got 58 tokens, others 1-2). Poll LK_NBLCK with a few-ms jittered sleep
+        # instead; a lock that never frees within _LOCK_TIMEOUT_S raises so acquire() can bail.
+        deadline = time.monotonic() + _LOCK_TIMEOUT_S
         while True:
             fh.seek(0)
             try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
                 return
             except OSError:
-                continue
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(random.uniform(0.001, 0.005))
 
     def _unlock(fh):
         fh.seek(0)

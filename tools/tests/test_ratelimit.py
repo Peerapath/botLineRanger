@@ -177,6 +177,16 @@ def test_bucket_is_shared_across_processes(tmp_path):
     assert 40 <= total <= 75, counts
 
 
+def test_bucket_is_fair_across_processes(tmp_path):
+    code = WORKER % (TOOLS, str(tmp_path))
+    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+             for _ in range(4)]
+    counts = [int(p.communicate(timeout=30)[0].strip()) for p in procs]
+    total = sum(counts)
+    assert 40 <= total <= 80, counts          # still one shared bucket, not four private ones
+    assert min(counts) >= 3, counts           # no worker starved out by the lock
+
+
 def test_bucket_for_caches_per_host(monkeypatch, tmp_path):
     monkeypatch.setenv("LGRGS_RL_DIR", str(tmp_path))
     ratelimit._BUCKETS.clear()
