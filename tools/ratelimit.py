@@ -92,7 +92,12 @@ PACER = AccountPacer()
 
 # --- per-IP token bucket (cross-process, lock file) -----------------------------------------
 
-_LOCK_TIMEOUT_S = 10.0   # give up -> OSError -> IpBucket.acquire() disables the bucket instead of hanging
+_LOCK_TIMEOUT_S = 10.0   # give up -> LockTimeout -> acquire() paces and retries instead of hanging
+
+
+class LockTimeout(OSError):
+    """The bucket file stayed locked for _LOCK_TIMEOUT_S; the caller waits one token period and retries."""
+
 
 if os.name == "nt":
     import msvcrt
@@ -109,7 +114,7 @@ if os.name == "nt":
                 return
             except OSError:
                 if time.monotonic() >= deadline:
-                    raise
+                    raise LockTimeout("bucket file stayed locked for %.1fs" % _LOCK_TIMEOUT_S)
                 time.sleep(random.uniform(0.001, 0.005))
 
     def _unlock(fh):
@@ -136,17 +141,25 @@ class IpBucket:
     def __init__(self, host, rate=None, burst=None, rl_dir=None, proxy=None,
                  clock=time.time, sleep=time.sleep):
         self.rate = RPS_BUDGET if rate is None else float(rate)
-        self.burst = BURST if burst is None else int(burst)
+        # burst < 1 can never reach the 1-token threshold -> acquire() would wait forever.
+        self.burst = max(1, BURST if burst is None else int(burst))
         self._clock = clock
         self._sleep = sleep
         proxy = PROXY if proxy is None else proxy
         self.path = os.path.join(rl_dir or rl_dir_(), "bucket-%s-%s.txt" % (_proxy_id(proxy), host))
         self._disabled = self.rate <= 0
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        except OSError:
+            pass            # os.open in _take() reports it, and acquire() disables the bucket
 
     def acquire(self) -> None:
         while not self._disabled:
             try:
                 wait = self._take()
+            except LockTimeout:
+                self._sleep(1.0 / self.rate)     # fail closed: pace at the budget, keep the cap armed
+                continue
             except OSError as exc:
                 print("ratelimit: bucket disabled (%s: %s)" % (self.path, exc), file=sys.stderr)
                 self._disabled = True
@@ -157,7 +170,6 @@ class IpBucket:
 
     def _take(self) -> float:
         """One locked read-modify-write. Returns 0 when a token was taken, else seconds to wait."""
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
         with os.fdopen(fd, "r+") as fh:
             _lock(fh)

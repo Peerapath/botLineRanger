@@ -154,6 +154,53 @@ def test_bucket_unwritable_dir_disables_without_raising(tmp_path, capsys):
     assert "bucket disabled" in capsys.readouterr().err
 
 
+def test_bucket_burst_below_one_is_clamped(tmp_path):
+    b, clk = _bucket(tmp_path, rate=10.0, burst=0)
+    b.acquire()                                  # burst 0 could never reach 1 token -> would hang
+    assert b.burst == 1
+
+
+def test_bucket_lock_timeout_paces_and_stays_armed(tmp_path, monkeypatch):
+    b, clk = _bucket(tmp_path, rate=10.0, burst=3)
+    real_lock, calls = ratelimit._lock, []
+
+    def flaky_lock(fh):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ratelimit.LockTimeout("held")
+        return real_lock(fh)                     # later calls lock for real, so _unlock matches
+
+    monkeypatch.setattr(ratelimit, "_lock", flaky_lock)
+    b.acquire()                                  # must retry, not disable the cap
+    assert clk.slept[0] == 0.1                   # one token period = 1.0 / rate, no jitter
+    assert b._disabled is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="msvcrt byte-range locking")
+def test_lock_raises_locktimeout_when_file_is_held(tmp_path, monkeypatch):
+    import io
+    import msvcrt
+    import time as _time
+
+    monkeypatch.setattr(ratelimit, "_LOCK_TIMEOUT_S", 0.2)
+    path = str(tmp_path / "bucket.txt")
+    open(path, "w").close()
+    holder = io.open(path, "r+b")
+    holder.seek(0)
+    msvcrt.locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
+    other = io.open(path, "r+b")
+    try:
+        t0 = _time.monotonic()
+        with pytest.raises(ratelimit.LockTimeout):
+            ratelimit._lock(other)
+        assert _time.monotonic() - t0 < 1.0      # bounded wait, not a 10 s stall or a spin
+    finally:
+        holder.seek(0)
+        msvcrt.locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
+        holder.close()
+        other.close()
+
+
 WORKER = r"""
 import os, sys, time
 sys.path.insert(0, %r)
@@ -167,29 +214,37 @@ print(n)
 """
 
 
-def test_bucket_is_shared_across_processes(tmp_path):
+def _worker_counts(tmp_path, nproc):
+    """Run nproc children against one shared bucket -> (per-process counts, their stderr)."""
     code = WORKER % (TOOLS, str(tmp_path))
-    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
-             for _ in range(2)]
-    counts = [int(p.communicate(timeout=30)[0].strip()) for p in procs]
+    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(nproc)]
+    try:
+        outs = [p.communicate(timeout=30) for p in procs]
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+    return [int(o.strip()) for o, _ in outs], "".join(e for _, e in outs)
+
+
+def test_bucket_is_shared_across_processes(tmp_path):
+    counts, err = _worker_counts(tmp_path, 2)
     total = sum(counts)
     # one shared bucket: burst 10 + 50/s over ~1 s (+ timing slack); two private ones would give ~120
-    assert 40 <= total <= 75, counts
+    assert 40 <= total <= 75, (counts, err)
 
 
 def test_bucket_is_fair_across_processes(tmp_path):
-    code = WORKER % (TOOLS, str(tmp_path))
-    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
-             for _ in range(4)]
-    counts = [int(p.communicate(timeout=30)[0].strip()) for p in procs]
+    counts, err = _worker_counts(tmp_path, 4)
     total = sum(counts)
-    assert 40 <= total <= 80, counts          # still one shared bucket, not four private ones
-    assert min(counts) >= 3, counts           # no worker starved out by the lock
+    assert 40 <= total <= 80, (counts, err)   # still one shared bucket, not four private ones
+    assert min(counts) >= 3, (counts, err)    # no worker starved out by the lock
 
 
 def test_bucket_for_caches_per_host(monkeypatch, tmp_path):
     monkeypatch.setenv("LGRGS_RL_DIR", str(tmp_path))
-    ratelimit._BUCKETS.clear()
+    monkeypatch.setattr(ratelimit, "_BUCKETS", {})
     a = ratelimit.bucket_for("rangers-api.line-apps.com")
     b = ratelimit.bucket_for("game-api.line.me")
     assert a is ratelimit.bucket_for("rangers-api.line-apps.com") and a is not b
