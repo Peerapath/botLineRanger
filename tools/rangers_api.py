@@ -65,35 +65,52 @@ def _retry_sleep(attempt, retry_after=None):
     time.sleep(delay + random.uniform(0, _BACKOFF_BASE))
 
 
-# Persistent keep-alive connection per thread. Every call goes to the same HOST, so reusing
-# one TLS connection across calls saves a full handshake (~100-300ms) on every call after the
-# first - the single biggest speedup when a worker makes many API calls per account. Each
-# worker is its own process (own connection); the GUI's background threads each get their own.
-_conn_tls = threading.local()
+# Connection และ lane ต้องเป็น thread-local คู่กัน: lane บอกว่า "ออก IP ไหนและใช้งบของใคร"
+# ส่วน connection คือ socket ที่เปิดไปบน IP นั้นแล้ว ถ้าเก็บ lane ไว้ระดับโมดูล (แบบที่
+# ratelimit.PROXY_PARTS เคยเป็น) เธรดจะได้ socket ของ IP หนึ่งแต่ไปหักงบของอีก IP
+# พอโปรเซสเดียววิ่งหลาย proxy พร้อมกัน
+_tls = threading.local()
+
+
+def use_lane(lane) -> None:
+    """ผูก lane เข้ากับเธรดนี้ ต้องเรียกก่อน call() ตัวแรกของเธรด
+
+    เปลี่ยน lane = ทิ้ง connection เดิม เพราะ socket เก่าเปิดไปบน proxy ตัวก่อน
+    การใช้ต่อคือการส่ง request ออก IP ที่ไม่ได้ตั้งใจโดยที่งบไปหักอีกที่หนึ่ง
+    """
+    if getattr(_tls, "lane", None) is not lane:
+        _drop_conn()
+    _tls.lane = lane
+
+
+def current_lane():
+    return getattr(_tls, "lane", None)
 
 
 def _get_conn():
-    conn = getattr(_conn_tls, "conn", None)
+    conn = getattr(_tls, "conn", None)
     if conn is None:
-        proxy = ratelimit.PROXY_PARTS
+        lane = current_lane()
+        # ไม่มี lane = ถูกเรียกจาก CLI ของ tools/ ตัวใดตัวหนึ่ง ใช้ค่าระดับโมดูลแบบเดิม
+        proxy = lane.parts if lane is not None else ratelimit.PROXY_PARTS
         if proxy:
             phost, pport, auth = proxy
             conn = http.client.HTTPSConnection(phost, pport, timeout=25)
             conn.set_tunnel(HOST, 443, headers={"Proxy-Authorization": auth} if auth else None)
         else:
             conn = http.client.HTTPSConnection(HOST, timeout=25)
-        _conn_tls.conn = conn
+        _tls.conn = conn
     return conn
 
 
 def _drop_conn():
-    conn = getattr(_conn_tls, "conn", None)
+    conn = getattr(_tls, "conn", None)
     if conn is not None:
         try:
             conn.close()
         except Exception:
             pass
-        _conn_tls.conn = None
+        _tls.conn = None
 
 
 def _decode(raw: bytes, enc):
@@ -120,7 +137,7 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
     else:
         data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
     url = (api or API) + path
-    bucket = ratelimit.bucket_for(HOST)
+    lane = current_lane()
     status, parsed = 0, ""
     # http.client returns 4xx/5xx as a normal response (no exception), so no HTTPError branch is
     # needed. Three retry reasons: a dropped keep-alive socket (reconnect immediately), a nginx
@@ -130,7 +147,10 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
         # wait first, then stamp: a bucket wait can take seconds at 300 workers and the
         # X-LINEGAME-TIMESTAMP / timeID headers must reflect the actual send time
         ratelimit.PACER.wait(cookie)
-        bucket.acquire()
+        if lane is not None:
+            lane.acquire()
+        else:
+            ratelimit.bucket_for(HOST).acquire()   # เส้นทาง CLI: ไม่มี lane ใช้ถังไฟล์แบบเดิม
         now = int(time.time() * 1000)
         headers = {
             "Host": HOST,
@@ -147,8 +167,11 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
             "Accept-Encoding": "gzip",
             "Connection": "keep-alive",
         }
-        conn = _get_conn()
         try:
+            # _get_conn() itself can raise (bad proxy tuple, tunnel setup) same as the socket
+            # ops below it - that must reach lane.note_fail() too, or a proxy that can never
+            # even connect goes on getting work forever. Keep it inside the try, not above it.
+            conn = _get_conn()
             conn.request(method, url, body=data, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()          # must read the full body to keep the connection reusable
@@ -156,6 +179,8 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
             enc = resp.getheader("Content-Encoding")
             retry_after = resp.getheader("Retry-After")
         except (http.client.HTTPException, OSError):
+            if lane is not None:
+                lane.note_fail()
             _drop_conn()
             if attempt == MAX_ATTEMPTS - 1:
                 raise
@@ -163,6 +188,8 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
                 _retry_sleep(attempt - 1)   # repeated socket failures: back off, don't hammer
             continue               # first drop = stale keep-alive socket: reconnect right away
         ratelimit.PACER.done(cookie)   # the server stamps rejected calls too
+        if lane is not None:
+            lane.note_ok()     # ตอบกลับมาได้ = proxy ยังดี ล้างสตรีคความพังทิ้ง
         parsed = _decode(raw, enc)
         limited = status in RETRY_STATUSES or ratelimit.is_app_429(status, parsed) is not None
         if limited and attempt < MAX_ATTEMPTS - 1:

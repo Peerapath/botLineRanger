@@ -17,6 +17,35 @@ OK = json.dumps({"result": {"ok": True}}).encode()
 NGINX = b"<html>429 Too Many Requests</html>"
 
 
+class _FakeResp:
+    def __init__(self, status, body):
+        self.status, self._body = status, body
+    def read(self): return self._body
+    def getheader(self, name): return None
+
+
+class _FakeConn:
+    """ตัวปลอมที่ *ไม่มี* keep-alive จริงและไม่มี bucket ในตัว - สิ่งที่กำลังพิสูจน์
+    คือ call() ไปเอา token จาก lane ไม่ใช่จากที่อื่น ตัวปลอมจึงต้องไม่แจก token เอง"""
+    def __init__(self, status=200, body=b'{"result":{}}'):
+        self.status, self.body = status, body
+    def request(self, *a, **k): pass
+    def getresponse(self): return _FakeResp(self.status, self.body)
+
+
+@pytest.fixture(autouse=True)
+def _lane_isolated():
+    """lane เป็น thread-local ที่ผูกกับเธรดของ pytest เอง (test ด้านล่างเรียก use_lane()
+    บนเธรดหลักตรง ๆ) ถ้าไม่รีเซ็ตก่อน/หลังทุกเทสต์ เทสต์ที่รันทีหลัง - ในไฟล์นี้หรือไฟล์อื่น
+    บนเธรดเดียวกัน - จะเห็น lane ที่เทสต์ก่อนหน้าผูกทิ้งไว้และพังแบบเดาสาเหตุไม่ออก
+    (ตัวอย่างจริง: มันทำให้ test_get_conn_tunnels_through_proxy เห็น lane เก่าที่ parts=None
+    แทนค่า ratelimit.PROXY_PARTS ที่เทสต์นั้นตั้งไว้เอง)
+    """
+    ra.use_lane(None)
+    yield
+    ra.use_lane(None)
+
+
 class FakeResp:
     def __init__(self, status, body, headers=None):
         self.status = status
@@ -205,3 +234,98 @@ def test_call_stamps_headers_after_waiting(monkeypatch, wired):
     ra.call("LF_AC=tok", "/home")
     headers = conn.requests[0][3]
     assert headers["X-LINEGAME-TIMESTAMP"] == "2000000" and headers["timeID"] == "2000000"
+
+
+def test_each_thread_keeps_its_own_lane():
+    """สองเธรดที่ผูกคนละ lane ต้องไม่เห็น lane ของกันและกัน"""
+    import threading
+    seen = {}
+
+    class Lane:
+        def __init__(self, name):
+            self.name, self.parts = name, None
+        def acquire(self): pass
+        def note_ok(self): pass
+        def note_fail(self): return False
+
+    def work(name):
+        ra.use_lane(Lane(name))
+        seen[name] = ra.current_lane().name
+
+    ts = [threading.Thread(target=work, args=("lane-%d" % i,)) for i in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        # timeout ป้องกันเทสต์ค้างตลอดกาลถ้า lane ไปรั่วข้ามเธรดจนเกิด deadlock แทนที่จะ
+        # ล้มแบบเห็นชัด - ต้องเห็น FAIL ไม่ใช่ CI แขวนไม่มีกำหนด
+        t.join(timeout=5)
+        assert not t.is_alive()
+    assert seen == {"lane-%d" % i: "lane-%d" % i for i in range(4)}
+
+
+def test_call_takes_a_token_from_the_lane_of_this_thread(monkeypatch):
+    taken = []
+
+    class Lane:
+        name, parts = "L", None
+        def acquire(self): taken.append(1)
+        def note_ok(self): pass
+        def note_fail(self): return False
+
+    ra.use_lane(Lane())
+    monkeypatch.setattr(ra, "_get_conn", lambda: _FakeConn(200, b'{"result":{}}'))
+    ra.call("LF_AC=x", "/home")
+    assert taken == [1]
+
+
+def test_a_socket_failure_is_reported_to_the_lane(monkeypatch):
+    """lane ต้องรู้ว่า proxy ของมันต่อไม่ติด ไม่งั้น proxy ตายแล้วยังถูกแจกงานต่อ"""
+    marks = []
+
+    class Lane:
+        name, parts = "L", None
+        def acquire(self): pass
+        def note_ok(self): marks.append("ok")
+        def note_fail(self): marks.append("fail"); return False
+
+    ra.use_lane(Lane())
+
+    def boom():
+        raise OSError("connect refused")
+
+    monkeypatch.setattr(ra, "_get_conn", boom)
+    monkeypatch.setattr(ra, "MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(ra, "_retry_sleep", lambda *a, **k: None)
+    # คุกกี้ใช้ "LF_AC=y" แยกจากเทสต์ก่อนหน้าโดยตั้งใจ - ratelimit.PACER ตัวจริงเป็น
+    # module-level singleton ที่ไม่ได้ mock ในเทสต์นี้ ถ้าใช้คีย์เดิม "LF_AC=x" ซ้ำ .wait()
+    # จะไปเจอ timestamp ที่เทสต์ก่อนหน้าเพิ่ง .done() ไว้ แล้ว sleep จริงเกือบ MIN_GAP_MS ทุกครั้ง
+    with pytest.raises(OSError):
+        ra.call("LF_AC=y", "/home")
+    assert "fail" in marks
+
+
+def test_use_lane_drops_the_connection_only_when_the_lane_actually_changes(monkeypatch):
+    """socket เก่าเปิดไปบน proxy ของ lane ก่อนหน้า ใช้ต่อกับ lane ใหม่ไม่ได้ - แต่ผูก lane
+    เดิมซ้ำ (เช่น worker วนไปเรียก use_lane() ทุกรอบงาน) ต้องไม่ทิ้ง connection โดยไม่จำเป็น
+    เพราะนั่นแปลว่าทุก request เปิด TLS handshake ใหม่ทั้งที่ proxy ไม่ได้เปลี่ยน"""
+    dropped = []
+    monkeypatch.setattr(ra, "_drop_conn", lambda: dropped.append(1))
+
+    class Lane:
+        def __init__(self, name):
+            self.name, self.parts = name, None
+        def acquire(self): pass
+        def note_ok(self): pass
+        def note_fail(self): return False
+
+    lane_a = Lane("A")
+    lane_b = Lane("B")
+
+    ra.use_lane(lane_a)               # first bind on this thread: drops whatever (if anything)
+    dropped.clear()                    # was there before - not the behavior under test, reset
+
+    ra.use_lane(lane_a)                # same lane object again: no reason to reconnect
+    assert dropped == []
+
+    ra.use_lane(lane_b)                # different lane: old socket is on the wrong proxy now
+    assert dropped == [1]
