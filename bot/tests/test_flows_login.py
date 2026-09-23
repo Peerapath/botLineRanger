@@ -1,0 +1,372 @@
+"""flow Login: state ทุกตัวอยู่ใน session ไม่ใช่ใน global
+
+บั๊กที่ชุดนี้กันไว้: บอทเดิมเก็บ LFACCACHE/GAMEID/FILENAME ไว้ระดับโมดูล สองบัญชีใน
+โปรเซสเดียวกันจึงเขียนทับกัน - เป็นเหตุผลเดียวที่บอทต้องใช้ 128 โปรเซสและ 5.5 GB
+"""
+import os
+import sys
+import threading
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "tools"))
+from engine import flows                       # noqa: E402
+from engine.session import AccountSession      # noqa: E402
+
+
+class Lane:
+    name, parts = "L", None
+    def acquire(self): pass
+    def note_ok(self): pass
+    def note_fail(self): return False
+
+
+CFG = {"gacharanger": False, "rewardpasses": 3, "gachacycles": 1}
+
+
+def make(tmp_path, name="a.xml"):
+    (tmp_path / "execute").mkdir(exist_ok=True)
+    path = tmp_path / "execute" / name
+    path.write_text("<map/>", encoding="utf-8")
+    return AccountSession(src=str(path), lane=Lane())
+
+
+def stub(monkeypatch, calls, rsn="ID1", level=3):
+    """ตัวปลอมที่ *ไม่* เก็บ token ให้เอง - สิ่งที่พิสูจน์คือ session เป็นคนถือ"""
+    monkeypatch.setattr(flows, "_relogin", lambda s: (
+        calls.append("relogin"), setattr(s, "cookie", "LF_AC=t-" + os.path.basename(s.src)),
+        setattr(s, "rsn", rsn))[0])
+    monkeypatch.setattr(flows, "_fetch_home", lambda s: (
+        calls.append("home"),
+        setattr(s, "home", {"player": {"rsn": rsn, "level": level},
+                            "rubyBalance": {"total": 10}}))[0])
+    monkeypatch.setattr(flows, "_claim_rewards", lambda s, cfg: calls.append("claim"))
+    monkeypatch.setattr(flows, "_gacha", lambda s, cfg: calls.append("gacha"))
+    monkeypatch.setattr(flows, "_account_info", lambda s: calls.append("info"))
+
+
+def test_the_token_lives_on_the_session_not_on_the_module(tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)
+    a, b = make(tmp_path, "a.xml"), make(tmp_path, "b.xml")
+    flows.run("ranger_api_Login", a, CFG)
+    flows.run("ranger_api_Login", b, CFG)
+    assert a.cookie == "LF_AC=t-a.xml"
+    assert b.cookie == "LF_AC=t-b.xml"
+    assert a.cookie != b.cookie
+
+
+def test_two_threads_running_two_accounts_do_not_cross_tokens(tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)
+    sessions = [make(tmp_path, "%03d.xml" % i) for i in range(32)]
+    ts = [threading.Thread(target=flows.run, args=("ranger_api_Login", s, CFG))
+          for s in sessions]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len({s.cookie for s in sessions}) == 32
+    for s in sessions:
+        assert s.cookie == "LF_AC=t-" + os.path.basename(s.src)
+
+
+def test_home_is_fetched_once_per_account(tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)
+    flows.run("ranger_api_Login", make(tmp_path), CFG)
+    assert calls.count("home") == 1
+
+
+def test_a_successful_run_sends_the_file_to_output(tmp_path, monkeypatch):
+    stub(monkeypatch, [])
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+    assert out.dest == "output"
+    assert out.status == "OK"
+
+
+def test_a_relogin_failure_sends_the_file_to_login_failed(tmp_path, monkeypatch):
+    stub(monkeypatch, [])
+
+    def boom(s):
+        raise RuntimeError("HTTP 401")
+
+    monkeypatch.setattr(flows, "_relogin", boom)
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+    assert out.dest == "login failed"
+    assert "401" in out.error
+
+
+def test_gacha_is_skipped_when_the_config_says_so(tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)
+    flows.run("ranger_api_Login", make(tmp_path), dict(CFG, gacharanger=False))
+    assert "gacha" not in calls
+
+
+def test_the_exported_name_carries_the_account_facts(tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)
+    s = make(tmp_path)
+
+    def info(sess):
+        sess.rangers, sess.ruby, sess.ticket, sess.level = "brown", "10", "2", 3
+
+    monkeypatch.setattr(flows, "_account_info", info)
+    out = flows.run("ranger_api_Login", s, CFG)
+    assert out.name == "brown_Rb10_Tk2_ID1_Lv3"
+
+
+def test_an_unknown_mode_is_refused_loudly(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        flows.run("ranger_api_Nope", make(tmp_path), CFG)
+
+
+# --- extra coverage beyond the brief's own 8 tests, added while implementing this task ---
+#
+# Every test above replaces _relogin/_fetch_home/_claim_rewards/_gacha/_account_info with
+# stubs, per the brief. That proves run_login's wiring but nothing about the real bodies of
+# those functions, and nothing that would fail if AccountSession's fields were reverted to
+# botLineRanger's old module globals (a stub writes onto whatever `s` it is handed, global
+# or not - see the task's own warning about this). The tests below exercise the REAL
+# _relogin (faked only at relogin.py's network boundary) and the real _account_info, and
+# pin three behaviours the brief's sketch got wrong that the 8 tests above cannot see
+# because they stub those exact functions away: a shared CcPool built fresh per call, a
+# missing gachaDone-equivalent guard, and _account_info's own NameError on `cfg`.
+
+
+def test_real_relogin_does_not_share_a_cached_token_across_threads(tmp_path, monkeypatch):
+    """Exercises the real flows._relogin (not the stub every test above uses), faked only
+    at relogin.py's network boundary. This is the exact bug class Task 7 exists to kill:
+    getLFACHeadless's `global LFACCACHE; if LFACCACHE: return LFACCACHE` early-return,
+    ported naively, would make the first thread through cache a token that every other
+    thread's _relogin then hands back unchanged - no matter which account it was actually
+    asked to log in. Every one of 32 concurrent, real _relogin calls must come back with
+    ITS OWN account's rsn/cookie, derived from ITS OWN fake udid, not a shared one.
+    """
+    import relogin as relogin_mod
+
+    def fake_read_account(path):
+        ident = os.path.basename(path).split(".")[0]
+        return {"udid": "udid-%s" % ident, "enc": "enc-%s" % ident,
+                "nation": "TH", "language": "en", "text": "<map/>"}
+
+    def fake_login(cc, udid, guest_cookie, nation, language):
+        # the real server identifies the account from guest_cookie/udid, never from
+        # which thread or cache asked - so the fake keys its answer the same way
+        return 200, {"rsn": "rsn-" + udid, "level": 5}, "lfac-" + udid
+
+    class FakePool:
+        def __init__(self, **kw): pass
+        def get(self): return "cc"
+        def renew(self, cc): return "cc"
+        def mark_proven(self): pass
+
+    monkeypatch.setattr(relogin_mod, "read_account", fake_read_account)
+    monkeypatch.setattr(flows, "decrypt_lfac", lambda udid, enc: "guest-" + udid)
+    monkeypatch.setattr(relogin_mod, "login", fake_login)
+    monkeypatch.setattr(relogin_mod, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(relogin_mod, "replace_enc", lambda *a, **k: "")
+    monkeypatch.setattr(relogin_mod, "CcPool", FakePool)
+
+    n = 32
+    sessions = [make(tmp_path, "%03d.xml" % i) for i in range(n)]
+    ts = [threading.Thread(target=flows._relogin, args=(s,)) for s in sessions]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    for i, s in enumerate(sessions):
+        ident = "%03d" % i
+        assert s.rsn == "rsn-udid-" + ident
+        assert s.cookie == "LF_AC=lfac-udid-" + ident
+    assert len({s.cookie for s in sessions}) == n
+
+
+def test_relogin_reuses_a_pool_attached_to_the_lane_instead_of_building_its_own(
+        tmp_path, monkeypatch):
+    """The fix for the brief's `pool = relogin.CcPool(share_file=...)` built fresh inside
+    _relogin on every call (see task-7-report.md): with hundreds of accounts and no
+    LGRGS_CC_FILE, that line mints a real, unlocked guest cc on every single call against
+    a 2-per-IP-per-minute quota. A pool the caller already attached to s.lane must be
+    reused instead - this proves _relogin prefers it and never constructs its own when
+    one is present.
+    """
+    import relogin as relogin_mod
+
+    used = []
+
+    class FakeSharedPool:
+        def get(self):
+            used.append("get")
+            return "shared-cc"
+        def renew(self, cc):
+            return "shared-cc"
+        def mark_proven(self):
+            used.append("proven")
+
+    class LaneWithPool(Lane):
+        def __init__(self):
+            self.cc_pool = FakeSharedPool()
+
+    def exploding_ccpool(*a, **kw):
+        raise AssertionError("must not build its own CcPool when lane.cc_pool exists")
+
+    monkeypatch.setattr(relogin_mod, "read_account", lambda path: {
+        "udid": "u", "enc": "e", "nation": "TH", "language": "en", "text": "<map/>"})
+    monkeypatch.setattr(flows, "decrypt_lfac", lambda udid, enc: "guest")
+    monkeypatch.setattr(relogin_mod, "login", lambda cc, *a, **kw: (
+        200, {"rsn": "R", "level": 1}, "lfac-" + cc))
+    monkeypatch.setattr(relogin_mod, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(relogin_mod, "replace_enc", lambda *a, **k: "")
+    monkeypatch.setattr(relogin_mod, "CcPool", exploding_ccpool)
+
+    s = make(tmp_path)
+    s.lane = LaneWithPool()
+    flows._relogin(s)
+
+    assert used == ["get", "proven"]
+    assert s.cookie == "LF_AC=lfac-shared-cc"
+
+
+def test_relogin_falls_back_to_its_own_pool_when_the_lane_has_none(tmp_path, monkeypatch):
+    """The brief's original per-call construction stays as a fallback (e.g. for calling
+    _relogin standalone, before a caller wires lane.cc_pool up) - this pins that the
+    fallback still runs and still works, not just that the lane-attached path does.
+    """
+    import relogin as relogin_mod
+
+    built = []
+
+    class FakePool:
+        def __init__(self, **kw):
+            built.append(kw)
+        def get(self): return "own-cc"
+        def renew(self, cc): return "own-cc"
+        def mark_proven(self): pass
+
+    monkeypatch.setattr(relogin_mod, "read_account", lambda path: {
+        "udid": "u", "enc": "e", "nation": "TH", "language": "en", "text": "<map/>"})
+    monkeypatch.setattr(flows, "decrypt_lfac", lambda udid, enc: "guest")
+    monkeypatch.setattr(relogin_mod, "login", lambda cc, *a, **kw: (
+        200, {"rsn": "R", "level": 1}, "lfac-" + cc))
+    monkeypatch.setattr(relogin_mod, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(relogin_mod, "replace_enc", lambda *a, **k: "")
+    monkeypatch.setattr(relogin_mod, "CcPool", FakePool)
+
+    s = make(tmp_path)          # plain Lane() - no cc_pool attribute
+    flows._relogin(s)
+
+    assert len(built) == 1
+    assert s.cookie == "LF_AC=lfac-own-cc"
+
+
+def test_gacha_is_not_redrawn_on_a_retry_after_it_already_succeeded(tmp_path, monkeypatch):
+    """Original (startBotLogin_API_headless) guarded gacha with a gachaDone flag that
+    spanned every retry attempt, at this exact comment: "กาชาหักตั๋วจริง ถ้าสุ่มไปแล้วแต่
+    ขั้นหลังพัง (เช่น pull ไฟล์ไม่ได้) retry ห้ามสุ่มซ้ำ" (gacha really spends tickets; if
+    it already drew but a later step broke, a retry must not draw again). The brief's
+    sketch dropped that flag - without it, attempt 2 would redraw (and re-spend real
+    tickets) whenever attempt 1 got past gacha but failed on a later, unrelated step.
+    """
+    calls = []
+    stub(monkeypatch, calls)
+
+    def gacha_once(s, cfg):
+        calls.append("gacha")
+        s.gacha_units, s.gacha_status = ["u1630e-sally"], "u1630e-sally"
+
+    monkeypatch.setattr(flows, "_gacha", gacha_once)
+
+    attempts_seen = []
+
+    def flaky_info(s):
+        attempts_seen.append(s.attempts)
+        if s.attempts == 1:
+            raise RuntimeError("transient: units endpoint timed out")
+
+    monkeypatch.setattr(flows, "_account_info", flaky_info)
+    out = flows.run("ranger_api_Login", make(tmp_path), dict(CFG, gacharanger=True))
+
+    assert calls.count("gacha") == 1
+    assert attempts_seen == [1, 2]
+    assert out.status == "OK"
+
+
+def test_a_session_that_draws_a_target_ranger_is_routed_to_backup(tmp_path, monkeypatch):
+    """Original: gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in gachaUnits)
+    sent the file to backup/ instead of output/. Outcome.dest documents "backup" as a
+    valid destination, but nothing produces it without this check - confirmed against
+    task-8-brief.md and task-9-brief.md, neither of which ever returns dest="backup" either
+    (only "output" and "login failed"), so Login is the only flow that can ever reach it.
+    """
+    calls = []
+    stub(monkeypatch, calls)
+
+    def gacha_found_target(s, cfg):
+        calls.append("gacha")
+        s.gacha_units = ["u1630e-sally", "u9999e-other"]
+        s.gacha_status = "u1630e-sally,u9999e-other"
+
+    monkeypatch.setattr(flows, "_gacha", gacha_found_target)
+    cfg = dict(CFG, gacharanger=True, _rangers_config={"u1630e-sally": "Sally"})
+    out = flows.run("ranger_api_Login", make(tmp_path), cfg)
+
+    assert out.dest == "backup"
+    assert out.status == "OK"
+
+
+def test_a_session_with_no_matching_gacha_target_still_goes_to_output(tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)
+
+    def gacha_no_target(s, cfg):
+        calls.append("gacha")
+        s.gacha_units, s.gacha_status = ["u9999e-other"], "u9999e-other"
+
+    monkeypatch.setattr(flows, "_gacha", gacha_no_target)
+    cfg = dict(CFG, gacharanger=True, _rangers_config={"u1630e-sally": "Sally"})
+    out = flows.run("ranger_api_Login", make(tmp_path), cfg)
+
+    assert out.dest == "output"
+
+
+def test_account_info_reads_the_ranger_target_config_without_crashing(tmp_path, monkeypatch):
+    """_account_info is the one step every test above replaces outright via stub(); a bug
+    in its real body (the brief's own sketch read an undefined name `cfg` - see
+    _account_info's docstring in flows.py) would never surface anywhere else in this file,
+    since _account_info is never called for real elsewhere. This runs the real function
+    against fakes at its own network boundary and checks it both survives and reproduces
+    the original getAccoutInfo's target-ranger-name lookup.
+    """
+    import gacha as gacha_mod
+    import rangers_api as rangers_api_mod
+
+    calls = []
+
+    def fake_relogin(s):
+        calls.append("relogin")
+        s.cookie, s.rsn = "LF_AC=t", "ID1"
+
+    def fake_fetch_home(s):
+        # mirrors what the real _fetch_home derives from /home - level included, since
+        # the real _account_info never touches s.level itself (only ruby/ticket/rangers)
+        calls.append("home")
+        s.home = {"player": {"rsn": "ID1", "level": 3}, "rubyBalance": {"total": 10}}
+        s.level = 3
+
+    monkeypatch.setattr(flows, "_relogin", fake_relogin)
+    monkeypatch.setattr(flows, "_fetch_home", fake_fetch_home)
+    monkeypatch.setattr(flows, "_claim_rewards", lambda s, cfg: calls.append("claim"))
+    monkeypatch.setattr(flows, "_gacha", lambda s, cfg: calls.append("gacha"))
+    monkeypatch.setattr(gacha_mod, "ticket_counts", lambda cookie, uid=None: (7, 0))
+    monkeypatch.setattr(rangers_api_mod, "call", lambda cookie, path, **kw: (
+        200, {"result": {"playerUnits": [{"unitCode": "u1630e-sally"}]}}))
+
+    cfg = dict(CFG, _rangers_config={"u1630e-sally": "Sally"})
+    out = flows.run("ranger_api_Login", make(tmp_path), cfg)
+
+    assert out.status == "OK", out.error   # the brief's NameError would surface here as FAIL
+    assert out.name == "Sally_Rb10_Tk7_ID1_Lv3"
