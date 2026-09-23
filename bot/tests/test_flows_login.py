@@ -539,3 +539,148 @@ def test_a_token_write_back_note_reaches_the_outcome_on_success(tmp_path, monkey
 
     assert out.status == "OK"
     assert "token write failed" in out.error
+
+
+# --- Review findings, round 1 (Finding 2): duplicate-account guard ---
+#
+# bot/input/ has 24,279 files and two of them can be the same underlying game account
+# (observed: a0bfb087, two files, gacha'd twice - see _claimAccountThisRun's own docstring,
+# botLineRanger.py:3255). Without a guard, both files claim rewards and draw gacha on the
+# same account, spending a second real ticket for nothing. The original
+# (startBotLogin_API_headless:8042, startBotLevel3_API_headless:8344) skips the reward/
+# gacha steps for the second file and marks it dup-account, while still exporting it. None
+# of the four flows had this - the reviewer found it missing from run_login too, even
+# though run_login was already approved. AccountClaimRegistry below is the thread-pool
+# replacement for the original's os.O_CREAT|O_EXCL marker file under src/split-ID/.
+
+
+def test_account_claim_registry_lets_only_one_thread_through_for_the_same_id():
+    """Must be safe for many threads - a thread pool has no separate processes/filesystem
+    races to coordinate, just one Lock over one in-memory set. Many threads racing to claim
+    the SAME id must let exactly one through.
+    """
+    registry = flows.AccountClaimRegistry()
+    results = []
+    lock = threading.Lock()
+
+    def go():
+        ok = registry.claim("SAME-ID")
+        with lock:
+            results.append(ok)
+
+    ts = [threading.Thread(target=go) for _ in range(32)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == 31
+
+
+def test_account_claim_registry_falsy_id_never_blocks():
+    """Original (_claimAccountThisRun): "ระบุบัญชีไม่ได้ ก็ทำตามปกติ ดีกว่าข้ามไปเฉยๆ" -
+    an account this run can't identify must never be blocked by this guard.
+    """
+    registry = flows.AccountClaimRegistry()
+    assert registry.claim("") is True
+    assert registry.claim("") is True     # still True the second time - never "claimed"
+    registry.release("")                  # must not raise
+
+
+def test_account_claim_registry_release_lets_the_id_be_claimed_again():
+    registry = flows.AccountClaimRegistry()
+    assert registry.claim("ID1") is True
+    assert registry.claim("ID1") is False
+    registry.release("ID1")
+    assert registry.claim("ID1") is True
+
+
+def test_login_gachas_normally_when_account_claims_is_absent_from_cfg(tmp_path, monkeypatch):
+    """The guard must be a pure no-op when cfg has no _account_claims key - CLI use today,
+    and every test above this one in this file, never set it. Their behaviour must stay
+    exactly what it was before this fix: no dedup, _gacha always runs when configured.
+    """
+    calls = []
+    stub(monkeypatch, calls)
+
+    def gacha_once(s, cfg):
+        calls.append("gacha")
+        s.gacha_units, s.gacha_status = ["u9999e-other"], "u9999e-other"
+
+    monkeypatch.setattr(flows, "_gacha", gacha_once)
+    out = flows.run("ranger_api_Login", make(tmp_path), dict(CFG, gacharanger=True))
+    assert "gacha" in calls
+    assert out.status == "OK"
+
+
+def test_login_two_threads_with_the_same_game_id_only_gacha_once(tmp_path, monkeypatch):
+    """Two DIFFERENT files (different src, like two different input/ entries) that both
+    turn out to be the SAME underlying account must gacha exactly once between them - by
+    identity (which session actually drew), not just by count, since a bare count could
+    pass by coincidence even if the wrong one drew.
+    """
+    barrier = threading.Barrier(2)
+
+    def fake_relogin(s):
+        barrier.wait(timeout=5)     # both threads reach the claim race together
+        s.cookie = "LF_AC=t-" + os.path.basename(s.src)
+        s.rsn = "SAME-ID"           # both files resolve to the same underlying account
+
+    def fake_fetch_home(s):
+        s.home = {"player": {"rsn": "SAME-ID", "level": 3}, "rubyBalance": {"total": 10}}
+        s.level = 3
+
+    drew = []
+    drew_lock = threading.Lock()
+
+    def fake_gacha(s, cfg):
+        with drew_lock:
+            drew.append(s)
+        s.gacha_units, s.gacha_status = ["u9999e-other"], "u9999e-other"
+
+    monkeypatch.setattr(flows, "_relogin", fake_relogin)
+    monkeypatch.setattr(flows, "_fetch_home", fake_fetch_home)
+    monkeypatch.setattr(flows, "_claim_rewards", lambda s, cfg: None)
+    monkeypatch.setattr(flows, "_gacha", fake_gacha)
+    monkeypatch.setattr(flows, "_account_info", lambda s: None)
+
+    registry = flows.AccountClaimRegistry()
+    cfg = dict(CFG, gacharanger=True, _account_claims=registry)
+    a, b = make(tmp_path, "a.xml"), make(tmp_path, "b.xml")
+    outcomes = {}
+
+    def run_one(name, s):
+        outcomes[name] = flows.run("ranger_api_Login", s, cfg)
+
+    ts = [threading.Thread(target=run_one, args=("a", a)),
+          threading.Thread(target=run_one, args=("b", b))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    assert len(drew) == 1                     # exactly one of the two sessions drew
+    assert outcomes["a"].status == "OK"        # both still exported...
+    assert outcomes["b"].status == "OK"
+    assert {outcomes["a"].dest, outcomes["b"].dest} <= {"output", "backup"}
+    # ...and the loser is marked so nothing downstream mistakes it for "not yet handled"
+    assert {a.gacha_status, b.gacha_status} == {"u9999e-other", "dup-account"}
+
+
+def test_login_releases_the_claim_when_it_never_reaches_gacha(tmp_path, monkeypatch):
+    """Original: "จองบัญชีไว้แต่สุ่มไม่สำเร็จ ปล่อยให้ไฟล์ซ้ำของบัญชีนี้ (ถ้ามี) ได้สุ่มแทน" - a
+    session that claims an id but never gets past _claim_rewards (every attempt fails
+    first) must give the claim back for a genuine duplicate file to use instead.
+    """
+    stub(monkeypatch, [])
+
+    def always_fails(s, cfg):
+        raise RuntimeError("units endpoint down")
+
+    monkeypatch.setattr(flows, "_claim_rewards", always_fails)
+    registry = flows.AccountClaimRegistry()
+    out = flows.run("ranger_api_Login", make(tmp_path), dict(CFG, _account_claims=registry))
+
+    assert out.dest == "login failed"
+    assert registry.claim("ID1") is True    # released -> claimable again

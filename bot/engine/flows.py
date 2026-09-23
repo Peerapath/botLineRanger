@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -38,6 +39,66 @@ class PermanentFailure(Exception):
     spend a second and third attempt getting the same answer against a shared, measured
     2-per-IP-per-minute auth quota.
     """
+
+
+class LevelGateFailure(Exception):
+    """GenID's freshly-minted account never reached leveltarget - retryable exactly like
+    any other transient failure (global constraint 10: this is "รอคิว", not "พัง" - hearts
+    ran out, a stage locked, a play failed, for reasons that have nothing to do with
+    whether this identity could ever work). The original (startBotGenID_API_headless)
+    raises here too and lets its own attempt loop catch it, minting an entirely fresh
+    account on the next try instead of ending the session on attempt 1 ("attempt ใหม่ =
+    สร้างบัญชีใหม่สด (มินต์ก่อนหน้าถ้าพังหลัง signup ก็ปล่อยทิ้ง)" - _create_account's own
+    docstring). Carries `status` so the LAST attempt's Outcome can still say LOWLV instead
+    of the generic FAIL every other exception produces in this loop.
+    """
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class AccountClaimRegistry:
+    """Guards one game account (by rsn) from being processed by two different account
+    *files* in the same run - bot/input/ has 24,279 files and two of them can point at the
+    same underlying game account (observed: a0bfb087, two files, gacha'd twice). Without
+    this, both files claim rewards and draw gacha on that one account, spending a second
+    real ticket for nothing.
+
+    Thread-pool replacement for the original's os.O_CREAT|O_EXCL marker file under
+    src/split-ID/ (_claimAccountThisRun/_releaseAccountThisRun, botLineRanger.py:3255) - a
+    thread pool has no separate processes or filesystem races to coordinate, just one Lock
+    over one in-memory set.
+    """
+
+    def __init__(self) -> None:
+        self._claimed: set[str] = set()
+        self._lock = threading.Lock()
+
+    def claim(self, account_id: str) -> bool:
+        """True if this caller is the first this run to claim account_id.
+
+        Original (_claimAccountThisRun, botLineRanger.py:3262-3263): "ระบุบัญชีไม่ได้ ก็ทำ
+        ตามปกติ ดีกว่าข้ามไปเฉยๆ" - an account this run can't identify (falsy id) always
+        proceeds normally rather than being blocked by a guard that cannot tell accounts
+        apart.
+        """
+        if not account_id:
+            return True
+        with self._lock:
+            if account_id in self._claimed:
+                return False
+            self._claimed.add(account_id)
+            return True
+
+    def release(self, account_id: str) -> None:
+        """Give back a claim that was never actually spent (rewards/gacha never ran under
+        it), so a duplicate file for the same account can run instead of being blocked by
+        a claim nobody is using any more."""
+        if not account_id:
+            return
+        with self._lock:
+            self._claimed.discard(account_id)
 
 
 # --- ขั้นตอนย่อย (เทสต์ replace ตัวพวกนี้ทีละตัว) ---
@@ -265,6 +326,25 @@ def _force_stage(s: AccountSession, cfg: dict) -> str:
 
 def run_login(s: AccountSession, cfg: dict) -> Outcome:
     last = ""
+    # Finding 2 (review round 1): see AccountClaimRegistry's own docstring for the guard
+    # this restores (original: _claimAccountThisRun/_releaseAccountThisRun,
+    # botLineRanger.py:3255, used in startBotLogin_API_headless:8042). Absent from cfg
+    # (CLI use today, every test that predates this fix) claims stays None and every branch
+    # below behaves exactly as it did before - a pure no-op.
+    claims = cfg.get("_account_claims")
+    account_id = ""      # claimed once per session, across every retry of the same file
+    duplicate = False
+    did_process = False
+
+    def _release_unclaimed_account() -> None:
+        # Original (startBotLogin_API_headless, botLineRanger.py:8109): "จองบัญชีไว้แต่สุ่ม
+        # ไม่สำเร็จ ปล่อยให้ไฟล์ซ้ำของบัญชีนี้ (ถ้ามี) ได้สุ่มแทน" - only the session that
+        # actually holds the claim (not a duplicate) and never got past rewards/gacha
+        # under it may give it back. Safe to call from every exit point below: a no-op
+        # whenever there is nothing to release.
+        if claims is not None and account_id and not duplicate and not did_process:
+            claims.release(account_id)
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         s.attempts = attempt
         try:
@@ -275,17 +355,30 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
             s.cache["_rangers_config"] = cfg.get("_rangers_config")
             _relogin(s)
             _fetch_home(s)
-            _claim_rewards(s, cfg)
-            # Original (startBotLogin_API_headless) guarded gacha with a gachaDone flag
-            # that lived outside the retry loop, at this exact comment: "กาชาหักตั๋วจริง
-            # ถ้าสุ่มไปแล้วแต่ขั้นหลังพัง (เช่น pull ไฟล์ไม่ได้) retry ห้ามสุ่มซ้ำ" (gacha
-            # really spends tickets; if it already drew but a later step broke, a retry
-            # must not draw again). The brief's sketch dropped that flag - restored here
-            # as s.gacha_status == "-", the dataclass default that reset_token() leaves
-            # untouched and that only _gacha() itself ever changes. Without this, attempt
-            # 2 re-spends real tickets whenever attempt 1 got past gacha but failed after.
-            if cfg.get("gacharanger") and s.gacha_status == "-":
-                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
+            if claims is not None and not account_id and s.rsn:
+                # Original (_claimAccountThisRun, called from startBotLogin_API_headless
+                # :8039-8042): "บัญชีนี้มีไฟล์อื่นในรอบเดียวกันทำไปแล้ว ไม่ต้องสุ่มซ้ำ (retry
+                # ของ session ตัวเองไม่นับ)" - claim once, the first time s.rsn is known,
+                # before rewards/gacha - not on every retry attempt of this same file.
+                account_id = s.rsn
+                if not claims.claim(account_id):
+                    duplicate = True
+                    # Original: gachaStatus = "dup-account" - a second, independent guard
+                    # against a redraw, on top of `if not duplicate:` below.
+                    s.gacha_status = "dup-account"
+            if not duplicate:
+                _claim_rewards(s, cfg)
+                # Original (startBotLogin_API_headless) guarded gacha with a gachaDone flag
+                # that lived outside the retry loop, at this exact comment: "กาชาหักตั๋วจริง
+                # ถ้าสุ่มไปแล้วแต่ขั้นหลังพัง (เช่น pull ไฟล์ไม่ได้) retry ห้ามสุ่มซ้ำ" (gacha
+                # really spends tickets; if it already drew but a later step broke, a retry
+                # must not draw again). The brief's sketch dropped that flag - restored here
+                # as s.gacha_status == "-", the dataclass default that reset_token() leaves
+                # untouched and that only _gacha() itself ever changes. Without this, attempt
+                # 2 re-spends real tickets whenever attempt 1 got past gacha but failed after.
+                if cfg.get("gacharanger") and s.gacha_status == "-":
+                    _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
+                did_process = True
             _account_info(s)
             # Original routed a session that drew a target ranger to backup/ instead of
             # output/: gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in
@@ -301,23 +394,44 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
             # left by an attempt that otherwise ran to completion; nothing else in this
             # dataclass carries it back to the caller, so a successful Outcome still
             # needs to say so instead of dropping it silently.
+            _release_unclaimed_account()
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
         except PermanentFailure as err:
             # The server already gave its real answer about this account (see
             # PermanentFailure above) - a second and third attempt would only spend more
             # of the shared auth quota to hear it again. Global constraint 10:
             # แยก "รอคิว" ออกจาก "พัง" - this is "พัง", not a queue to wait out.
+            _release_unclaimed_account()
             return Outcome(dest="login failed", status="FAIL", error=str(err))
         except Exception as err:   # everything else is "รอคิว" - wait, then retry
             last = str(err)
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+    _release_unclaimed_account()
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 
 def run_level3(s: AccountSession, cfg: dict) -> Outcome:
     target = int(cfg.get("leveltarget") or 3)
     last = ""
+    # Finding 2 (review round 1): same guard as run_login (see AccountClaimRegistry's own
+    # docstring) - the original applied it here too (startBotLevel3_API_headless:8344).
+    # Absent from cfg this is a pure no-op, exactly like run_login.
+    claims = cfg.get("_account_claims")
+    account_id = ""      # claimed once per session, across every retry of the same file
+    duplicate = False
+    did_process = False
+
+    def _release_unclaimed_account() -> None:
+        # Same release check as startBotLevel3_API_headless:8417 (accountId and not
+        # duplicateAccount and not gachaDone) - that line carries no comment of its own,
+        # but startBotLogin_API_headless's identical check at :8108 does: "จองบัญชีไว้แต่
+        # สุ่มไม่สำเร็จ ปล่อยให้ไฟล์ซ้ำของบัญชีนี้ (ถ้ามี) ได้สุ่มแทน" - only the session that
+        # actually holds the claim (not a duplicate) and never got past rewards/gacha
+        # under it may give it back.
+        if claims is not None and account_id and not duplicate and not did_process:
+            claims.release(account_id)
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         s.attempts = attempt
         try:
@@ -327,6 +441,15 @@ def run_level3(s: AccountSession, cfg: dict) -> Outcome:
             s.cache["_rangers_config"] = cfg.get("_rangers_config")
             _relogin(s)
             _fetch_home(s)
+            if claims is not None and not account_id and s.rsn:
+                # Original (_claimAccountThisRun, botLineRanger.py:8344) claims here, before
+                # the level gate below - the original levels up every file the same way
+                # regardless of the claim (not a resource this guard protects); only
+                # rewards/gacha are skipped for a file that lost the claim race.
+                account_id = s.rsn
+                if not claims.claim(account_id):
+                    duplicate = True
+                    s.gacha_status = "dup-account"   # second guard, same as run_login
             level_reason = "done"
             if s.level < target:
                 level_reason = _level_up(s, cfg) or "done"
@@ -336,28 +459,34 @@ def run_level3(s: AccountSession, cfg: dict) -> Outcome:
                 # "FLAG" ออกจาก "LOWLV" ตาม stop reason จริง (result["stop"] == "flagged") - ไม่ใช่
                 # เดาว่า LOWLV เสมอ (level_up คืน "flagged" ได้เฉพาะตอน level ยังไม่ถึง target
                 # เท่านั้น ดู _level_up's docstring จึงไม่มีทางชนกับกรณีถึงเป้าแล้ว)
+                _release_unclaimed_account()
                 return Outcome(dest="login failed",
                                status="FLAG" if level_reason == "flagged" else "LOWLV",
                                error="level %s < target %s (stop=%s)" % (s.level, target, level_reason))
-            _claim_rewards(s, cfg)
-            # เหมือน run_login: กาชาหักตั๋วจริง ถ้าสุ่มไปแล้วแต่ขั้นหลังพัง retry ห้ามสุ่มซ้ำ
-            if cfg.get("gacharanger") and s.gacha_status == "-":
-                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
+            if not duplicate:
+                _claim_rewards(s, cfg)
+                # เหมือน run_login: กาชาหักตั๋วจริง ถ้าสุ่มไปแล้วแต่ขั้นหลังพัง retry ห้ามสุ่มซ้ำ
+                if cfg.get("gacharanger") and s.gacha_status == "-":
+                    _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
+                did_process = True
             _account_info(s)
             # เหมือน run_login: ต้นฉบับส่งบัญชีที่สุ่มได้เรนเจอร์เป้าหมายไป backup/ แทน output/ -
             # gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in gachaUnits)
             targets = cfg.get("_rangers_config") or {}
             dest = "backup" if any(targets.get(code.lower()) for code in s.gacha_units) else "output"
+            _release_unclaimed_account()
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
         except PermanentFailure as err:
             # เหมือน run_login: เซิร์ฟเวอร์ตอบจริงแล้วว่าบัญชีนี้ตาย (401 ยืนยันสองรอบใน _relogin) -
             # retry ซ้ำมีแต่จะเปลืองโควตา auth ร่วมเพื่อฟังคำตอบเดิม (constraint 10: แยก "รอคิว"
             # ออกจาก "พัง")
+            _release_unclaimed_account()
             return Outcome(dest="login failed", status="FAIL", error=str(err))
         except Exception as err:   # อย่างอื่นทั้งหมดคือ "รอคิว" - รอแล้วลองใหม่
             last = str(err)
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+    _release_unclaimed_account()
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 
@@ -376,8 +505,17 @@ def run_genid(s: AccountSession, cfg: dict) -> Outcome:
                 if s.level < target:
                     _level_up(s, cfg)
                 if s.level < target:
-                    return Outcome(dest="login failed", status="LOWLV",
-                                   error="level %s < target %s" % (s.level, target))
+                    # Finding 1 (review round 1): a bare `return` here used to end the
+                    # whole flow after attempt 1 - spending only 1 of the original's
+                    # budget of MAX_ATTEMPTS mints on what is a transient, "รอคิว" failure
+                    # (hearts ran out, a stage locked, a play failed), not a permanent
+                    # answer about this identity (constraint 10). Raising instead sends
+                    # this through the exact same except/retry machinery as any other
+                    # failure below, so attempt 2 and 3 mint an entirely fresh account
+                    # each via _create_account at the top of this loop - see
+                    # LevelGateFailure's own docstring for the original this mirrors.
+                    raise LevelGateFailure(
+                        "LOWLV", "level %s < target %s" % (s.level, target))
             _claim_rewards(s, cfg)
             # เหมือน run_level3 - แต่ที่ทำให้ guard นี้ยังถูกต้องสำหรับ GenID คือ _create_account
             # ล้าง gacha_status/gacha_units ทุก attempt (บัญชีใหม่ทุกครั้ง) ถ้าไม่ล้าง guard นี้จะ
@@ -398,6 +536,14 @@ def run_genid(s: AccountSession, cfg: dict) -> Outcome:
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
         except PermanentFailure as err:
             return Outcome(dest="login failed", status="FAIL", error=str(err))
+        except LevelGateFailure as err:
+            last = str(err)
+            if attempt >= MAX_ATTEMPTS:
+                # Mint budget spent, still short of target - answer LOWLV, kept distinct
+                # from the generic FAIL below exactly as before this fix (only the number
+                # of attempts tried before answering has changed - see LevelGateFailure).
+                return Outcome(dest="login failed", status=err.status, error=last)
+            time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
         except Exception as err:
             last = str(err)
             if attempt < MAX_ATTEMPTS:

@@ -475,3 +475,100 @@ def test_force_stage_refreshes_the_level_after_clearing_stages(tmp_path, monkeyp
     assert reason == "done"
     assert s.level == 12
     assert calls == ["player_info", "player_info"]
+
+
+# --- Review findings, round 1 ---
+#
+# Finding 1: run_genid's level-gate branch did a bare `return` on attempt 1, ending the
+# whole flow - the original (startBotGenID_API_headless) raises instead, so its own
+# attempt loop mints an entirely fresh account on the next try ("attempt ใหม่ = สร้างบัญชี
+# ใหม่สด (มินต์ก่อนหน้าถ้าพังหลัง signup ก็ปล่อยทิ้ง)" - _create_account's own docstring),
+# spending its full budget of MAX_ATTEMPTS mints before giving up on a level-gate failure.
+# test_genid_sends_an_account_that_never_reached_target_level_to_login_failed (above)
+# asserts only dest/status, which stay identical either way - that's why 1-of-3 went
+# unnoticed. The test below counts _create_account calls directly.
+
+
+def test_genid_mints_a_fresh_account_on_every_retry_after_a_level_gate_failure(
+        tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls, level=1)
+    mint_attempts = []
+    monkeypatch.setattr(flows, "_create_account",
+                         lambda s, cfg: mint_attempts.append(s.attempts))
+    monkeypatch.setattr(flows, "_level_up", lambda s, cfg: None)
+    s = AccountSession(src="", lane=Lane())
+    out = flows.run("ranger_api_GenID", s, dict(CFG, genidlevel3=True, leveltarget=3))
+
+    assert mint_attempts == [1, 2, 3]       # one fresh mint per attempt, not just attempt 1
+    assert out.dest == "login failed"
+    assert out.status == "LOWLV"            # final outcome unchanged - only the count was
+
+
+# Finding 2: bot/input/ has 24,279 files and two of them can be the same underlying game
+# account (observed: a0bfb087, two files, gacha'd twice). The original
+# (startBotLevel3_API_headless:8344, like startBotLogin_API_headless:8042) claims the
+# account id once per session and skips rewards/gacha for a file that lost the race, while
+# still exporting it. See test_flows_login.py for AccountClaimRegistry's own unit tests and
+# the threaded proof against run_login - these two only prove run_level3 wires it the same
+# way, and that run_genid deliberately does NOT (a fresh mint's identity can't collide with
+# another input/ file's, since it never came from input/ at all).
+
+
+def test_level3_a_duplicate_account_skips_rewards_and_gacha_but_still_exports(
+        tmp_path, monkeypatch):
+    calls = []
+    stub(monkeypatch, calls)             # stub()'s default rsn is "ID1"
+    registry = flows.AccountClaimRegistry()
+    assert registry.claim("ID1")         # another input/ file already claimed this account
+    cfg = dict(CFG, gacharanger=True, leveltarget=3, _account_claims=registry)
+    out = flows.run("ranger_api_Level3", make(tmp_path), cfg)
+
+    assert "claim" not in calls          # _claim_rewards
+    assert "gacha" not in calls
+    assert out.status == "OK"
+    assert out.dest in ("output", "backup")
+
+
+def test_level3_releases_the_claim_when_the_level_gate_rejects_the_account(
+        tmp_path, monkeypatch):
+    """Original: "จองบัญชีไว้แต่สุ่มไม่สำเร็จ ปล่อยให้ไฟล์ซ้ำของบัญชีนี้ (ถ้ามี) ได้สุ่มแทน" - a
+    session that claims an id but is rejected by the level gate before ever reaching
+    rewards/gacha must give the claim back.
+    """
+    stub(monkeypatch, [], level=1)
+    monkeypatch.setattr(flows, "_level_up", lambda s, cfg: None)
+    registry = flows.AccountClaimRegistry()
+    out = flows.run("ranger_api_Level3", make(tmp_path),
+                     dict(CFG, leveltarget=3, _account_claims=registry))
+
+    assert out.dest == "login failed"
+    assert out.status == "LOWLV"
+    assert registry.claim("ID1") is True   # never actually spent - released, claimable again
+
+
+def test_genid_ignores_account_claims_even_when_present(tmp_path, monkeypatch):
+    """GenID mints a brand-new game account every attempt - there is no input/ file whose
+    identity could collide with another file's, which is the only scenario
+    AccountClaimRegistry defends against (see its own docstring). A claim already held
+    under the rsn GenID is about to mint must not suppress this account's own, first-ever
+    draw - proving GenID stays correct even if cfg carries _account_claims for every mode.
+    """
+    calls = []
+    stub(monkeypatch, calls)
+    monkeypatch.setattr(flows, "_create_account", lambda s, cfg: (
+        calls.append("create"), setattr(s, "rsn", "ID1"), setattr(s, "level", 3))[0])
+
+    def gacha_spy(s, cfg):
+        calls.append("gacha")
+        s.gacha_units, s.gacha_status = ["u9999e-other"], "u9999e-other"
+
+    monkeypatch.setattr(flows, "_gacha", gacha_spy)
+    registry = flows.AccountClaimRegistry()
+    assert registry.claim("ID1")         # an unrelated prior claim on the same rsn
+    s = AccountSession(src="", lane=Lane())
+    cfg = dict(CFG, gacharanger=True, _account_claims=registry)
+    out = flows.run("ranger_api_GenID", s, cfg)
+
+    assert "gacha" in calls
+    assert out.status == "OK"
