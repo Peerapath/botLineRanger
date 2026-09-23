@@ -455,7 +455,11 @@ def test_token_bucket_never_waits_when_time_has_already_passed():
 
 def test_token_bucket_disabled_when_rate_zero():
     clock, waits = _FakeClock(), []
-    b = ratelimit.TokenBucket(rate=0, burst=1, clock=clock, sleep=waits.append)
+    # sleep advances the clock like every other fake-clock test here: a stub that only
+    # records leaves acquire()'s `while True` spinning against a frozen clock, so a
+    # regression would hang the run instead of failing it
+    b = ratelimit.TokenBucket(rate=0, burst=1, clock=clock,
+                              sleep=lambda s: (waits.append(s), clock.advance(s)))
     for _ in range(50):
         b.acquire()
     assert waits == []
