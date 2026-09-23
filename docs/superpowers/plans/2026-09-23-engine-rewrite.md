@@ -1849,14 +1849,21 @@ def _claim_rewards(s: AccountSession, cfg: dict) -> None:
 
 
 def _gacha(s: AccountSession, cfg: dict) -> None:
+    """สุ่มกาชาด้วยตั๋วของบัญชีนี้
+
+    draw_with_ticket คืน (granted_codes, status) - ต้องแกะเป็นสองค่า ไม่ใช่เก็บทั้ง tuple
+    ลง gacha_units ซึ่งเป็น list ไม่งั้น len(s.gacha_units) จะได้ 2 เสมอไม่ว่าสุ่มได้กี่ตัว
+    """
     import gacha as gacha_mod
-    s.gacha_units = gacha_mod.draw_with_ticket(
+    s.gacha_units, s.gacha_status = gacha_mod.draw_with_ticket(
         s.cookie, s.rsn,
         group=cfg.get("gacharangergroup"),
         cycles=int(cfg.get("gachacycles") or 1),
         stop_when_found=bool(cfg.get("stopwhenfound", True)),
         targets=cfg.get("_rangers_config"),
-        cache=s.cache)
+        cache=s.cache,
+        gacha_mode=cfg.get("gachamode") or "NumberOfCycles",
+        use_ruby=bool(cfg.get("useruby", False)))
 
 
 def _account_info(s: AccountSession) -> None:
@@ -1895,8 +1902,7 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
             _fetch_home(s)
             _claim_rewards(s, cfg)
             if cfg.get("gacharanger"):
-                _gacha(s, cfg)
-                s.gacha_status = "done"
+                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
             _account_info(s)
             return Outcome(dest="output", name=_export_name(s), status="OK")
         except Exception as err:        # ทุกความพลาดคือ "ลองใหม่ได้" จนกว่าจะครบ MAX_ATTEMPTS
@@ -2087,8 +2093,7 @@ def run_level3(s: AccountSession, cfg: dict) -> Outcome:
                                error="level %s < target %s" % (s.level, target))
             _claim_rewards(s, cfg)
             if cfg.get("gacharanger"):
-                _gacha(s, cfg)
-                s.gacha_status = "done"
+                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
             _account_info(s)
             return Outcome(dest="output", name=_export_name(s), status="OK")
         except Exception as err:
@@ -2112,8 +2117,7 @@ def run_genid(s: AccountSession, cfg: dict) -> Outcome:
                                    error="level %s < target %s" % (s.level, target))
             _claim_rewards(s, cfg)
             if cfg.get("gacharanger"):
-                _gacha(s, cfg)
-                s.gacha_status = "done"
+                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
             _account_info(s)
             return Outcome(dest="output", name=_export_name(s), status="OK")
         except Exception as err:
