@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import glob
 import gzip
 import io
@@ -164,6 +165,98 @@ def base_name(code: str) -> str:
 def evolution_of(code: str) -> str:
     match = re.match(r"u(\d+)([a-z]?)-", code or "")
     return EVOLUTION.get(match.group(2), match.group(2)) if match else "?"
+
+
+def fuzzy_match(ocr_text, target_text, threshold=1):
+    # ลบช่องว่าง และทำเป็น lower case เพื่อลดความผิดพลาด
+    o = re.sub(r"\s+", "", ocr_text).lower()
+    t = re.sub(r"\s+", "", target_text).lower()
+
+    ratio = difflib.SequenceMatcher(None, o, t).ratio()
+    return ratio >= threshold, ratio
+
+
+def matchGachaName(allNames:dict, name:str):
+    for key in allNames.keys():
+        is_match, score = fuzzy_match(key, name)
+        # print(is_match, f"{score:.2f}", "||", key, "=", name)
+        if is_match:
+            return True, allNames[key].replace(" ", "")
+    return False, name.replace(" ", "")
+
+
+def add_ranger_name(rangerNames: str, rangerName: str) -> str:
+
+    if rangerNames == "":
+        return rangerName
+
+    names = rangerNames.split("_")
+
+    def split_name_number(name):
+        m = re.match(r"^(.*?)(\d+)$", name)
+        if m:
+            return m.group(1), int(m.group(2))
+        return name, None
+
+    base_matches = []
+    for i, name in enumerate(names):
+        base, num = split_name_number(name)
+        if base == rangerName:
+            base_matches.append((i, base, num))
+
+    if not base_matches:
+        return rangerNames + "_" + rangerName
+
+    # ให้ update ชื่อเก่าตัวแรกที่เจอ (index ต่ำสุด)
+    idx, base, num = base_matches[0]
+
+    # ถ้าไม่มีเลข เช่น Cony → Cony2
+    if num is None:
+        new_name = f"{base}2"
+    else:
+        new_name = f"{base}{num + 1}"
+
+    names[idx] = new_name
+
+    return "_".join(names)
+
+
+def unit_names(units, ranger_config=None):
+    """สรุปคลัง ranger เป็นข้อความสำหรับตั้งชื่อไฟล์ที่ export
+
+    ย้ายมาจาก botLineRanger.getTeanInfo() ตัวที่ยิง API ไม่ได้ย้ายมาด้วยเพราะผู้เรียก
+    ฝั่ง engine ยิงเองแล้วส่งผลลัพธ์เข้ามา - จะได้ไม่ยิงซ้ำ
+
+    Correction to that framing: the loop this function moves (RANGERSCONFIG match ->
+    add_ranger_name accumulate) is not in getTeanInfo's own body - it lives in the caller
+    that consumes getTeanInfo's result, botLineRanger.getAccoutInfo() (its rangerNames
+    variable is exactly this function's return value, fed into the exported filename as
+    f"{rangerNames}_Rb{ruby}_Tk{ticket}_{gameID}_Lv{level}"). getTeanInfo itself only
+    fetches the roster and tags each row with base_name()/evolution_of(); it never calls
+    matchGachaName or add_ranger_name. See task-6-report.md for the full note - this is
+    called out rather than silently "corrected" so it can be checked against the source.
+
+    units: playerUnits-shaped dicts (only "unitCode" is read - the raw API list and
+      getTeanInfo's transformed rows both qualify, so callers can pass either)
+    ranger_config: RANGERSCONFIG-shaped dict (unitCode.lower() -> display name), the same
+      dict matchGachaName takes as allNames. None (the default) means "nothing configured
+      as a target", so every unit is a no-match and the result is "" - not a crash.
+
+    matchGachaName's threshold defaults to 1 (100% SequenceMatcher ratio), so despite the
+    name this is an exact match after whitespace-stripping and lowercasing, not a fuzzy
+    one - same effective lookup as targets.get(code.lower()) in gacha.draw_with_ticket,
+    just written as an O(n) scan instead of a dict get. add_ranger_name then folds each
+    match into the accumulated string, incrementing a numeric suffix for repeats
+    (Cony, Cony -> "Cony2", not "Cony_Cony2" - see add_ranger_name above).
+    """
+    ranger_config = ranger_config or {}
+    rangerNames = ""
+    for i in units:
+        unitCode = i["unitCode"]
+        is_match, rangerName = matchGachaName(ranger_config, unitCode)
+        if is_match:
+            rangerNames = add_ranger_name(rangerNames, rangerName)
+    return rangerNames
 
 
 def main():

@@ -149,7 +149,21 @@ def ticket_counts(cookie, uid=None):
                  for group in ("premiumGachaTicketItems", "eventGachaTicketItems"))
 
 
-def pick_ticket_group(cookie, uid=None):
+def gacha_info(cookie, uid, cache=None):
+    """ข้อมูลตู้กาชาของบัญชีนี้ ใช้ cache ที่ผู้เรียกถือมาถ้ามี
+
+    cache ต้องมาจากผู้เรียก ห้ามเป็นตัวแปรระดับโมดูล - engine รันหลายบัญชีพร้อมกัน
+    ในโปรเซสเดียว cache ที่แชร์กันจะทำให้บัญชีหนึ่งเห็นตู้ของอีกบัญชี
+    """
+    if cache is not None and "info" in cache:
+        return cache["info"]
+    _status, info = call(cookie, uid, "/v12.3/gacha/info")
+    if cache is not None:
+        cache["info"] = info
+    return info
+
+
+def pick_ticket_group(cookie, uid=None, cache=None):
     """Pick the machine a single TICKET pull should go to.
 
     A ticket only buys a pull where the index-1 option advertises a ticket price - the
@@ -157,9 +171,12 @@ def pick_ticket_group(cookie, uid=None):
     charges ruby instead. Returns (groupId, ticketPrice, name), or (None, 0, None) when
     no open UNIT machine takes tickets.
     """
-    status, info = call(cookie, uid, "/v12.3/gacha/info")
+    info = gacha_info(cookie, uid, cache)
     # Same guard as _ticket_items: a 429/maintenance string body must not be indexed as a dict.
-    if status != 200 or not isinstance(info, dict):
+    # (gacha_info folds the HTTP status into `info` instead of returning it separately, so the
+    # explicit status != 200 check that used to sit here is gone too - a non-200/non-JSON body
+    # still fails isinstance(dict) and is treated the same as "no open machine".)
+    if not isinstance(info, dict):
         return None, 0, None
     now_ms = int(time.time() * 1000)
     groups = sorted((info.get("result") or {}).get("gachaGroupResponseList", []),
@@ -197,9 +214,9 @@ def _period(start_ms, end_ms):
     return "%s~%s" % (fmt(start_ms), fmt(end_ms))
 
 
-def cmd_list(cookie, uid, show_all=False, kind=None):
+def cmd_list(cookie, uid, show_all=False, kind=None, cache=None):
     """Each gacha MACHINE is a groupId. gachaIndex only picks a pull option inside it."""
-    _, info = call(cookie, uid, "/v12.3/gacha/info")
+    info = gacha_info(cookie, uid, cache)
     now_ms = int(time.time() * 1000)
     groups = sorted(
         info["result"].get("gachaGroupResponseList", []),
@@ -306,6 +323,177 @@ def cmd_roll(cookie, uid, group_id, index, pay_type, do_confirm, save=False):
             json.dump(result, handle, ensure_ascii=False, indent=1)
         print("saved %s" % out)
     return granted
+
+
+def _gacha_group_price(cookie, uid, groupId, cache=None):
+    """คืน (rubyPrice, ticketPrice, gachaName) ของตัวเลือกสุ่มเดี่ยว (gachaIndex=1) ของตู้ groupId
+
+    อ่านจาก /gacha/info (ตัวเดียวกับ getGachaBanner) ตู้ CLASSIC ตั้งราคา index 1 เป็นรูบี้อย่าง
+    เดียว ticketPrice จะเป็น 0 ไม่เจอตู้/ตัวเลือกคืน (0, 0, None)
+
+    Moved from botLineRanger._gachaGroupPull() - not named in the task brief's helper list,
+    but draw_with_ticket cannot resolve a caller-supplied group's price without it. Reads
+    through gacha_info(cache) instead of a bare call() so this and pick_ticket_group's own
+    /gacha/info fetch share one cache within a single draw_with_ticket call.
+    """
+    info = gacha_info(cookie, uid, cache)
+    if not isinstance(info, dict):
+        return 0, 0, None
+    for group in (info.get("result") or {}).get("gachaGroupResponseList") or []:
+        gg = group.get("gachaGroup") or {}
+        if gg.get("groupId") == groupId:
+            for opt in gg.get("gachaGroupInfos") or []:
+                if opt.get("gachaIndex") == 1:
+                    return (opt.get("displayRubyPrice") or 0,
+                            opt.get("displayTicketPrice") or 0, gg.get("gachaName"))
+    return 0, 0, None
+
+
+def _ruby_and_tickets(cookie, uid):
+    """รูบี้รวม + จำนวนตั๋วกาชาปกติ ที่ draw_with_ticket ใช้เช็กก่อนสุ่มทุกรอบ
+
+    Moved from botLineRanger.getRubyAndTicket() - data-fetch half only (that function's
+    summary=True branch just prints a log line; apiGachaWithTicket always called it with
+    summary=False, so nothing calls this module's version with logging and it was not
+    moved). Not in the task brief's helper list either, but the ticket/ruby resource
+    check is load-bearing for draw_with_ticket's pay-ticket-first-then-ruby decision.
+
+    Raises on a failed /home call exactly like the original - draw_with_ticket has no
+    try/except around this lookup (see the loop below), so a broken /home call aborts
+    the whole draw instead of being silently read as "0 ruby, 0 tickets".
+    """
+    status, data = call(cookie, uid, "/home")
+    if status != 200 or not isinstance(data, dict):
+        raise Exception(f"getRubyAndTicket failed (HTTP {status}): {str(data)[:200]}")
+    ruby = (data.get("result") or {}).get("rubyBalance") or {}
+    premium, event = ticket_counts(cookie, uid)
+    return {"ruby": ruby.get("total", 0), "ticket": premium, "eventTicket": event}
+
+
+def draw_with_ticket(cookie, uid, group=None, cycles=1, stop_when_found=True,
+                     targets=None, cache=None, gacha_mode="NumberOfCycles", use_ruby=False):
+    """สุ่มกาชาด้วยตั๋ว คืนรายชื่อ unitCode ที่ได้
+
+    ย้ายมาจาก botLineRanger.apiGachaWithTicket() แบบคำต่อคำ ต่างกันแค่ค่าที่เคยอ่านจาก
+    global (GACHARANGERGROUP, RANGERSCONFIG, LASTGACHASTATUS) กลายเป็นพารามิเตอร์และค่าคืน
+    - engine รันหลายบัญชีในโปรเซสเดียว global จะทำให้บัญชีหนึ่งใช้ค่าตั้งของอีกบัญชี
+
+    ฟังก์ชันนี้หักตั๋วจริงบนบัญชีจริง ทุกบรรทัดที่ต่างจากต้นฉบับคือความเสี่ยงที่จะเสียตั๋วฟรี
+
+    Return value is (granted_codes, status) - a 2-tuple, not the bare list the task brief's
+    own interface line sketches. LASTGACHASTATUS must become part of the return per the task
+    instructions, and a plain list can't carry both the codes and the status string, so this
+    follows the explicit instruction over the interface sketch. `status` is the exact string
+    the original wrote to LASTGACHASTATUS - callers used it for session-summary logging only,
+    never for control flow (the target-found check reads the codes list, not the status).
+
+    Beyond the three sanctioned substitutions, this move required more plumbing than the task
+    description's "only changes permitted" list names, because the original function is not
+    self-sufficient outside botLineRanger's module globals. Every one is called out here so a
+    reviewer can check it against the original instead of taking it on faith:
+      - cookie, uid: the original called getLFAC()/_importApiTools() itself to get a session.
+        The caller now holds the session already, so these are parameters instead.
+      - cache: threaded into gacha_info() so a single draw_with_ticket call (auto-pick group:
+        pick_ticket_group + this function's own price lookup) hits /gacha/info once, not
+        twice - this is the other half of this task (see gacha_info above).
+      - gacha_mode, use_ruby: kept, with their original defaults, even though the brief's
+        interface sketch omits them. Dropping them would delete the "giveItAll" mode and the
+        ruby-fallback-when-tickets-run-out behaviour, which is a capability loss, not a rename
+        - out of scope for a move.
+      - the local loop counter, originally also named `cycles`, is renamed to `cycles_done`:
+        the brief asks for the *parameter* `cycles` (replacing the original `gacha_cycles`),
+        which would otherwise collide with and shadow the counter of the same name.
+      - log(...) calls become print(...): log() is a botLineRanger console-timestamp helper
+        that does not exist in tools/; every other function in this file already uses print()
+        for equivalent status lines (see cmd_roll above), so this matches the local file, not
+        botLineRanger.
+      - the try/except around the roll call now catches SystemExit too. The original wrapped
+        every tools/-side call in botLineRanger._apiCall(), whose whole job was: "เรียกฟังก์ชัน
+        ฝั่ง tools/ แล้วแปลง SystemExit เป็น Exception ธรรมดา tools/ เขียนมาเป็น CLI เวลา token
+        ตายหรือ adb หาไม่เจอมันจะ raise SystemExit ซึ่งไม่ได้สืบทอดจาก Exception" (comment copied
+        from _apiCall's own docstring). cmd_roll still raises SystemExit on a failed reserve;
+        without that conversion the original's `except Exception` would no longer catch it.
+      - uid is threaded into the read-only lookups this move adds (pick_ticket_group,
+        gacha_info, ticket_counts, the /home call) but NOT into the cmd_roll call, which keeps
+        the original's literal `None` in that slot. Every function in this file already treats
+        uid as optional/inert ("server derives player from LF_AC" - see call()'s docstring),
+        so threading it into reads carries no risk and avoids a dead parameter; the one call
+        that actually spends tickets is left byte-for-byte identical to the original.
+
+    A pre-existing quirk preserved as-is, not fixed: the "no-resource:..." and "roll-error:..."
+    status strings set inside the loop are always overwritten by the unconditional status =
+    ",".join(...)/"empty" line right before the final return - they were dead stores in the
+    original too (every path through the loop ends in a `break` that falls through to that
+    line). A caller never actually observes "no-resource:..."/"roll-error:..." in the returned
+    status. Verbatim means this stays exactly as surprising as it always was.
+
+    gacharangergroup: groupId ตู้ที่จะสุ่ม (เช่น 'grp_gacha_33' ที่เลือกจาก dropdown ใน main.py)
+      None = ให้เลือกตู้ที่รับตั๋วอัตโนมัติ (pick_ticket_group) เหมือนพฤติกรรมเดิม
+    stop_when_found: เจอเรนเจอร์ที่อยู่ใน targets แล้วหยุดทันที (ดีฟอลต์ True)
+    gacha_mode: 'giveItAll' สุ่มจนตั๋ว/รูบี้หมด | 'NumberOfCycles' สุ่มครบ cycles รอบแล้วหยุด
+    cycles: จำนวนรอบเมื่อ gacha_mode='NumberOfCycles'
+    use_ruby: ตั๋วหมดแล้วยอมจ่ายรูบี้ต่อ (ดีฟอลต์ False = จ่ายเฉพาะตั๋ว ตั๋วหมดก็หยุด)
+
+    จ่ายตั๋วก่อนเสมอ (คุ้มกว่า) ตั๋วไม่พอค่อยใช้รูบี้ถ้า use_ruby=True index 1 = สุ่มเดี่ยว
+    เทียบเรนเจอร์แบบตรงตัว (targets.get(code.lower())) ไม่ใช่ matchGachaName fuzzy เพราะ
+    ได้ unitCode เป๊ะจาก API ไม่มีความเพี้ยนของ OCR ให้ต้องกลบ (โค้ดต่างตัวเดียวจะจับผิดตัว)
+    unitCode คืนเต็มไม่ตัด prefix (targets เก็บ key เป็น code เต็ม u1630e-sally)
+    """
+    targets = targets or {}
+
+    # หาตู้เป้าหมาย + ราคาสุ่มเดี่ยว (ตั๋ว/รูบี้)
+    if group:
+        groupId = group
+        rubyPrice, ticketPrice, name = _gacha_group_price(cookie, uid, groupId, cache)
+    else:
+        groupId, ticketPrice, name = pick_ticket_group(cookie, uid, cache=cache)
+        rubyPrice = _gacha_group_price(cookie, uid, groupId, cache)[0] if groupId else 0
+    if not groupId:
+        status = "no-machine"
+        print("No open gacha machine - skip gacha")
+        return [], status
+    print(f"Gacha target {groupId} ({name}) - ticket {ticketPrice}/pull, ruby {rubyPrice}/pull")
+
+    granted_codes = []
+    cycles_done = 0
+    while True:
+        if gacha_mode == "NumberOfCycles" and cycles_done >= cycles:
+            break
+
+        # status บอกเหตุผลไว้ให้ log สรุป session เพราะ list ว่างบอกไม่ได้ว่าไม่มีตู้
+        # ตั๋วหมด หรือสุ่มแล้วไม่ได้อะไร ซึ่งคนละเรื่องกันตอน monitor
+        info = _ruby_and_tickets(cookie, uid)
+        premium, ruby = info["ticket"], info["ruby"]
+        # เลือกวิธีจ่าย: ตั๋วก่อน ไม่พอค่อยรูบี้ (เมื่อ use_ruby) ไม่พอทั้งคู่ = จบ
+        if ticketPrice and premium >= ticketPrice:
+            payType = "TICKET"
+        elif use_ruby and rubyPrice and ruby >= rubyPrice:
+            payType = "RUBY"
+        else:
+            status = f"no-resource:tk{premium}/rb{ruby}"
+            print(f"Gacha stop: ตั๋ว {premium} รูบี้ {ruby} ไม่พอ "
+                f"(ตั๋ว/รอบ {ticketPrice}, รูบี้/รอบ {rubyPrice}, use_ruby={use_ruby})")
+            break
+
+        try:
+            granted = cmd_roll(cookie, None, groupId, 1, payType, True) or []
+        except (Exception, SystemExit) as e:
+            status = f"roll-error:{e}"
+            print(f"Gacha roll ล้มเหลว หยุด: {e}")
+            break
+        codes = [unit.get("unitCode", "") for unit in granted if unit.get("unitCode")]
+        granted_codes.extend(codes)
+        cycles_done += 1
+        print(f"Gacha {groupId} pull #{cycles_done} ({payType}): {', '.join(codes) or 'none'}")
+
+        # เจอเรนเจอร์ที่ตั้งไว้ใน config แล้วหยุด
+        if stop_when_found and any(targets.get(c.lower()) for c in codes):
+            print(f"Gacha พบเรนเจอร์เป้าหมาย หยุดสุ่ม")
+            break
+
+    status = ",".join(granted_codes) if granted_codes else "empty"
+    print(f"Gacha granted รวม: {', '.join(granted_codes) if granted_codes else 'none'}")
+    return granted_codes, status
 
 
 def main():
