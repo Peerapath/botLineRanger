@@ -2569,6 +2569,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "tools"))
 
+from engine import flows                 # noqa: E402
 from engine.pool import EnginePool       # noqa: E402
 from engine.queue import WorkQueue       # noqa: E402
 from engine.report import Reporter       # noqa: E402
@@ -2623,6 +2624,12 @@ def main(argv):
     root = os.getcwd()
     cfg = load_config(os.path.join(root, "src", "config.ini"),
                       os.path.join(root, "src", "configRangers.ini"))
+
+    # สามค่าที่ flows อ่านจาก cfg แต่ cfg เองสร้างเองไม่ได้ - ถ้าไม่ใส่ตรงนี้
+    # flows จะทำงานต่อได้เงียบ ๆ โดยปิดความสามารถไปทีละอย่าง โดยเทสต์ยังเขียวหมด
+    cfg["_account_claims"] = flows.AccountClaimRegistry()   # กันไฟล์สองใบของบัญชีเดียวสุ่มซ้ำ
+    cfg["_execute_dir"] = os.path.join(root, "execute")     # GenID เขียนไฟล์ใหม่ลงที่เดียวกับ WorkQueue
+
     reporter = Reporter()
 
     queue = WorkQueue(root, os.path.join(root, "src", "log", "run.jsonl"))
