@@ -35,6 +35,10 @@ class AccountSession:
         self.cookie = ""
         self.home = None
         self.cache.clear()
+        # A write-back note from a failed attempt must not survive into the next one -
+        # nothing else clears it, and the next attempt may never hit the branch that
+        # would otherwise overwrite it.
+        self.error = ""
 
 
 @dataclass

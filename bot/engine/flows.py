@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "tools"))
@@ -19,6 +20,24 @@ from device_session import decrypt_lfac   # noqa: E402
 from .session import AccountSession, Outcome   # noqa: E402
 
 MAX_ATTEMPTS = 3
+
+# Gap (seconds) before each retry of a transient failure - one entry per gap between
+# MAX_ATTEMPTS attempts, so len() == MAX_ATTEMPTS - 1. relogin.login() already backs off
+# 2/4/8s internally for 429 / app-429 / 5xx before it raises (tools/relogin.py
+# RETRY_WAITS), so this is not stacked on top of a wait that already happened - it is the
+# wait for everything else that can fail in this loop: network hiccups in _fetch_home /
+# _claim_rewards / _gacha / _account_info, or _relogin failing before it even reaches
+# relogin.login (e.g. a bad account file).
+RETRY_BACKOFF_SECONDS = (5.0, 15.0)
+
+
+class PermanentFailure(Exception):
+    """The server's real answer about this account, not a transient condition - e.g. a
+    401 from relogin.login(), confirmed after a cc renew-and-retry. tools/relogin.py:91:
+    "401 ไม่ retry (เป็นคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว)". run_login must not
+    spend a second and third attempt getting the same answer against a shared, measured
+    2-per-IP-per-minute auth quota.
+    """
 
 
 # --- ขั้นตอนย่อย (เทสต์ replace ตัวพวกนี้ทีละตัว) ---
@@ -59,6 +78,12 @@ def _relogin(s: AccountSession) -> None:
         status, result, lf_ac = relogin.login(
             cc, acct["udid"], guest_cookie, acct["nation"], acct["language"])
     if not result or not lf_ac:
+        if status == 401:
+            # Confirmed twice above (the original cc, then a renewed one) - the same bar
+            # process_file() in tools/relogin.py uses for its "rejected" bucket, the only
+            # outcome that script treats as a real answer about this account rather than
+            # an error worth a bare retry.
+            raise PermanentFailure("relogin rejected (HTTP 401)")
         raise RuntimeError("relogin failed (HTTP %s)" % status)
     pool.mark_proven()
     try:
@@ -180,9 +205,21 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
             # (engine_main.load_config, task 9).
             targets = cfg.get("_rangers_config") or {}
             dest = "backup" if any(targets.get(code.lower()) for code in s.gacha_units) else "output"
-            return Outcome(dest=dest, name=_export_name(s), status="OK")
-        except Exception as err:        # ทุกความพลาดคือ "ลองใหม่ได้" จนกว่าจะครบ MAX_ATTEMPTS
+            # s.error is a non-fatal note (e.g. token write-back failed - see _relogin)
+            # left by an attempt that otherwise ran to completion; nothing else in this
+            # dataclass carries it back to the caller, so a successful Outcome still
+            # needs to say so instead of dropping it silently.
+            return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
+        except PermanentFailure as err:
+            # The server already gave its real answer about this account (see
+            # PermanentFailure above) - a second and third attempt would only spend more
+            # of the shared auth quota to hear it again. Global constraint 10:
+            # แยก "รอคิว" ออกจาก "พัง" - this is "พัง", not a queue to wait out.
+            return Outcome(dest="login failed", status="FAIL", error=str(err))
+        except Exception as err:   # everything else is "รอคิว" - wait, then retry
             last = str(err)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 

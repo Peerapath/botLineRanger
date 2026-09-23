@@ -7,6 +7,8 @@ import os
 import sys
 import threading
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "tools"))
@@ -22,6 +24,16 @@ class Lane:
 
 
 CFG = {"gacharanger": False, "rewardpasses": 3, "gachacycles": 1}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_backoff(monkeypatch):
+    """run_login now sleeps between retries of a transient failure (Finding 1). Every
+    test in this file that drives a retry would otherwise pay that real wall-clock delay
+    - a test that wants to prove the wait happens replaces flows.time.sleep again inside
+    itself, which overrides this for the rest of that one test.
+    """
+    monkeypatch.setattr(flows.time, "sleep", lambda seconds: None)
 
 
 def make(tmp_path, name="a.xml"):
@@ -370,3 +382,160 @@ def test_account_info_reads_the_ranger_target_config_without_crashing(tmp_path, 
 
     assert out.status == "OK", out.error   # the brief's NameError would surface here as FAIL
     assert out.name == "Sally_Rb10_Tk7_ID1_Lv3"
+
+
+# --- Fix round 1: retry loop tells "the server said no" apart from "it hiccuped" ---
+#
+# Before this round, run_login's single `except Exception` retried EVERY failure up to
+# MAX_ATTEMPTS times with no wait at all - including a 401, which tools/relogin.py:91
+# already documents as the server's real (non-transient) answer about an account. The
+# tests below pin the two halves of that fix: a PermanentFailure (raised by the real
+# _relogin on a confirmed 401 - see its own test further down) ends the account in one
+# attempt, while an ordinary exception still retries but now waits in between.
+
+
+def test_a_permanent_failure_is_attempted_exactly_once(tmp_path, monkeypatch):
+    """Constraint 10: แยก "รอคิว" ออกจาก "พัง" - a 401 is "พัง" (see PermanentFailure's
+    docstring), so a second and third attempt must never happen. Asserting the attempt
+    count (not just dest) is the point: dest=="login failed" alone would stay green even
+    if this quietly retried twice more first, which is exactly Finding 1's complaint.
+    """
+    stub(monkeypatch, [])
+    attempts_seen = []
+
+    def boom(s):
+        attempts_seen.append(s.attempts)
+        raise flows.PermanentFailure("relogin rejected (HTTP 401)")
+
+    monkeypatch.setattr(flows, "_relogin", boom)
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+
+    assert attempts_seen == [1]
+    assert out.dest == "login failed"
+    assert out.status == "FAIL"
+
+
+def test_a_transient_failure_retries_with_backoff_between_attempts(tmp_path, monkeypatch):
+    """An ordinary exception (network hiccup, server-side-busy - anything that is not a
+    PermanentFailure) still gets the full MAX_ATTEMPTS, but Finding 1 also requires a wait
+    in between so a batch of these doesn't hammer /login back to back. This replaces the
+    file's own autouse no-op sleep with a spy so the wait can be observed without the test
+    actually pausing.
+    """
+    sleeps = []
+    monkeypatch.setattr(flows.time, "sleep", lambda seconds: sleeps.append(seconds))
+    stub(monkeypatch, [])
+    attempts_seen = []
+
+    def boom(s):
+        attempts_seen.append(s.attempts)
+        raise RuntimeError("network hiccup")
+
+    monkeypatch.setattr(flows, "_relogin", boom)
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+
+    assert attempts_seen == [1, 2, 3]
+    assert out.dest == "login failed"
+    # one gap after each attempt but the last - never a trailing wait before giving up
+    assert sleeps == list(flows.RETRY_BACKOFF_SECONDS)
+
+
+def test_a_transient_failure_that_recovers_on_retry_still_succeeds(tmp_path, monkeypatch):
+    """The other half of Finding 1's fix: retrying a transient failure must still be able
+    to reach a normal successful Outcome, not just eventually land in "login failed".
+    """
+    calls = []
+    stub(monkeypatch, calls)
+    attempts_seen = []
+
+    def flaky(s):
+        attempts_seen.append(s.attempts)
+        if s.attempts == 1:
+            raise RuntimeError("network hiccup")
+        calls.append("relogin")
+        s.cookie, s.rsn = "LF_AC=t-" + os.path.basename(s.src), "ID1"
+
+    monkeypatch.setattr(flows, "_relogin", flaky)
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+
+    assert attempts_seen == [1, 2]
+    assert out.status == "OK"
+    assert out.dest == "output"
+
+
+def test_real_relogin_raises_permanent_failure_on_a_confirmed_401(tmp_path, monkeypatch):
+    """Exercises the real flows._relogin (not a stub) end to end against a fake
+    relogin.login that always answers 401 with no result - the same shape process_file()
+    in tools/relogin.py treats as "rejected" after its own renew-and-retry. Proves the
+    classification lives in _relogin itself, not just in a test double standing in for it.
+    """
+    import relogin as relogin_mod
+
+    renewed = []
+
+    class FakePool:
+        def get(self): return "cc"
+        def renew(self, cc):
+            renewed.append(cc)
+            return "cc-renewed"
+        def mark_proven(self):
+            raise AssertionError("a rejected account must never be marked proven")
+
+    monkeypatch.setattr(relogin_mod, "read_account", lambda path: {
+        "udid": "u", "enc": "e", "nation": "TH", "language": "en", "text": "<map/>"})
+    monkeypatch.setattr(flows, "decrypt_lfac", lambda udid, enc: "guest")
+    monkeypatch.setattr(relogin_mod, "login", lambda cc, *a, **kw: (401, None, None))
+
+    s = make(tmp_path)
+    s.lane.cc_pool = FakePool()
+    with pytest.raises(flows.PermanentFailure):
+        flows._relogin(s)
+
+    assert renewed == ["cc"]   # did renew-and-retry once, per tools/relogin.py's own bar
+
+
+def test_reset_token_clears_a_stale_error_before_the_next_attempt(tmp_path, monkeypatch):
+    """Finding 2: s.error is set by _relogin on a non-fatal write-back OSError, but
+    nothing used to clear it. reset_token() runs first in every attempt (including the
+    first), so a note left by a failed attempt must be gone by the time a LATER attempt
+    - which never touched that code path at all - reports its own Outcome.
+    """
+    calls = []
+    stub(monkeypatch, calls)
+    attempts_seen = []
+
+    def flaky_relogin(s):
+        attempts_seen.append(s.attempts)
+        if s.attempts == 1:
+            s.error = "token write failed: stale from attempt 1"
+            raise RuntimeError("network hiccup")
+        calls.append("relogin")
+        s.cookie, s.rsn = "LF_AC=t-" + os.path.basename(s.src), "ID1"
+
+    monkeypatch.setattr(flows, "_relogin", flaky_relogin)
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+
+    assert attempts_seen == [1, 2]
+    assert out.status == "OK"
+    assert out.error == ""     # attempt 2 never set s.error; attempt 1's note is gone
+
+
+def test_a_token_write_back_note_reaches_the_outcome_on_success(tmp_path, monkeypatch):
+    """Finding 2, the option this round picked: s.error was write-only before this fix -
+    _relogin set it on a failed token write-back but run_login tracked its own local
+    `last` and never read it, so the note vanished even though the run still reports OK.
+    Wiring it onto the successful Outcome (see run_login) is what makes it reachable.
+    """
+    calls = []
+    stub(monkeypatch, calls)
+
+    def relogin_with_write_back_note(s):
+        calls.append("relogin")
+        s.error = "token write failed: [Errno 13] Permission denied"
+        s.cookie, s.rsn = "LF_AC=t-" + os.path.basename(s.src), "ID1"
+
+    monkeypatch.setattr(flows, "_relogin", relogin_with_write_back_note)
+    out = flows.run("ranger_api_Login", make(tmp_path), CFG)
+
+    assert out.status == "OK"
+    assert "token write failed" in out.error
