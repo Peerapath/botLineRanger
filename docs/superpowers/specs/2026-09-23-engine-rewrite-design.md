@@ -15,8 +15,14 @@
 2. ยัง **build เป็น .exe** ได้ด้วย `bot/build.bat` และ updater เดิมยังอัปเดตได้
 3. license/hwid/protection ยังทำงานเหมือนเดิม
 4. คีย์ใน `config.ini` ที่มีอยู่แล้วห้ามเปลี่ยนชื่อ (ผู้ใช้มีไฟล์ config ของตัวเองอยู่)
-5. play mode ทั้ง 5 ตัวยังอยู่ครบ: `ranger_api_GenID` `ranger_api_Login` `ranger_api_Level3`
-   `ranger_api_Stage` `ranger_api_Quest`
+5. play mode ทั้ง 4 ตัวยังอยู่ครบ: `ranger_api_GenID` `ranger_api_Login` `ranger_api_Level3`
+   `ranger_api_Stage`
+
+   `ranger_api_Quest` (พร้อม `apiNewbieQuest` และ `apiSkipTutorial`) ถูกพักไว้ที่ branch
+   `wip/quest-mode` คอมมิต `77688b2` เพราะยังไม่เสร็จและอยู่ในไฟล์เดียวกับที่งานรื้อจะรื้อทั้งก้อน
+   **`engine/flows.py` ต้องออกแบบให้เพิ่มโหมดที่ห้าได้โดยไม่แก้ `pool.py` หรือ `queue.py`**
+   แล้วค่อย port งานนั้นกลับเข้ามาเป็นงานแยกรอบหลัง — `git cherry-pick wip/quest-mode` จะชนแน่นอน
+   เพราะโครงไฟล์เปลี่ยน ให้ใช้เป็น *ข้อมูลอ้างอิง* ว่าโหมดนั้นเรียกอะไรบ้าง ไม่ใช่เอาแพตช์มาแปะ
 
 ## 2. หลักฐานที่ดีไซน์นี้ตั้งอยู่บน
 
@@ -245,11 +251,14 @@ image matching (เหลือเฉพาะ icon ที่ GUI ใช้)
 ```
 setUpHeadless · getLFAC · getLFACHeadless · getLFACFromFile · getAccoutInfo · apiGetPlayer
 apiAcceptAllRewards · apiGachaWithTicket · apiEnterStage · apiForceStage · apiLevelUpByStage1
-apiSkipTutorial · apiNewbieQuest · apiReadTeamGroup · apiReadTeam · apiSaveTeamGroup
-apiSaveTeam · apiUnitSpecs · apiUpgradeStatus · apiUpgradeMachine · apiUpgradeEnergy
+apiReadTeamGroup · apiReadTeam · apiSaveTeamGroup · apiSaveTeam · apiUnitSpecs
+apiUpgradeStatus · apiUpgradeMachine · apiUpgradeEnergy
 _headlessCreateAccount · logSession · importFileFromInputToExecute · exportFileFromExecuteTo*
-startBot{Login,Level3,GenID,Stage,Quest}_API_headless
+startBot{Login,Level3,GenID,Stage}_API_headless
 ```
+
+(`apiSkipTutorial` และ `apiNewbieQuest` ไม่อยู่ในลิสต์เพราะถูกพักไปกับ `wip/quest-mode` แล้ว
+ลอจิกของมันยังอยู่ครบใน `tools/tutorial.py` และ `tools/newbie_quest.py` ซึ่งคอมมิตแล้ว)
 
 ที่เหลือ (ราว 170 จาก 202 ฟังก์ชัน) เป็น ADB/vision/OCR — ลบ **แต่ต้องตรวจทีละตัวว่าไม่มี
 ผู้เรียกที่ยังมีชีวิต** ไม่ใช่ลบตามชื่อ (บทเรียน eFootball ข้อ 2.5: ของที่ตายแล้วยังมีปุ่ม 15 ปุ่ม
@@ -339,36 +348,23 @@ startBot{Login,Level3,GenID,Stage,Quest}_API_headless
 - ยังไม่ทำ autoscale อัตโนมัติในรอบนี้ — เพิ่มทีหลังได้เมื่อมีตัวเลขจากรอบจริงพอจะปรับเทียบ
   (eFootball เสียเวลากับ planner ที่ปรับเทียบตอนคอขวดอยู่คนละที่)
 
-## 16. เงื่อนไขที่ต้องเคลียร์ก่อนเริ่มงาน (บล็อกอยู่)
+## 16. จุดเริ่มต้นของงาน (เคลียร์แล้ว 2026-09-23)
 
-ตรวจ `git status` วันที่เขียน spec แล้วพบสองเรื่องที่ต้องจัดการก่อน ไม่งั้นงานรื้อจะทับของที่กู้ไม่ได้
+ก่อนเริ่มมีสองอย่างที่บล็อกอยู่ ทั้งคู่จัดการเรียบร้อยแล้ว:
 
-**16.1 มีงานค้าง 301 บรรทัดยังไม่คอมมิต ในไฟล์ที่การรื้อจะแตะทั้งหมด**
+| | ปัญหา | ทำอะไรไป |
+|---|---|---|
+| 16.1 | งานค้าง 301 บรรทัดยังไม่คอมมิต ในไฟล์ที่การรื้อจะแตะทั้งหมด (`ranger_api_Quest`) | พักไว้ที่ branch `wip/quest-mode` คอมมิต `77688b2` |
+| 16.2 | ไฟล์ 16 ไฟล์ไม่ถูก track โดย git เลย รวม `tools/rewards.py` `tools/gacha.py` (สองไฟล์ที่ข้อ 5 จะแก้โดยตรง) และ `bot/hwid.py` `bot/protection.py` (ที่ `build.bat` เรียกตอน pyarmor) | คอมมิต `b569399` พร้อมขยาย `.gitignore` คลุม build output / runtime state / binary ที่ bundle มา |
 
-```
-M README.md                        41 บรรทัด
-M bot/botLineRanger.py            194 บรรทัด   (apiNewbieQuest, startBotQuest_API_headless)
-M bot/default_config/config.ini     2 บรรทัด   (newbiequest, genidlevel3)
-M bot/main.py                     103 บรรทัด   (โหมด Login Quest)
-```
+**จุดเริ่มต้น:** branch `feat/engine-rewrite` แตกจาก `master` ที่ `b569399` working tree สะอาด
 
-นี่คืองาน `ranger_api_Quest` ที่ทำค้างไว้จากอีกเซสชัน **ต้องคอมมิตหรือ stash ให้เรียบร้อยก่อน**
-เพราะงานรื้อจะลบ/ย้ายโค้ดในไฟล์เดียวกันเป็นพัน ๆ บรรทัด ถ้าชนแล้วไม่มีทางแยกออก
+**กฎระหว่างทำงาน**
 
-**16.2 ไฟล์สำคัญ 14 ไฟล์ยังไม่ถูก track โดย git เลย**
-
-```
-tools/rewards.py  tools/gacha.py  tools/newbie_quest.py  tools/tutorial.py
-tools/device_session.py  tools/device_snapshot.py  tools/export_account.py
-tools/extract_battles.py  tools/gifts.py  tools/pull_roster.py  tools/sevendays.py
-tools/summarize.py  bot/hwid.py  bot/protection.py  bot/nemu_capture.py
-```
-
-`tools/rewards.py` และ `tools/gacha.py` คือสองไฟล์ที่ข้อ 5 ของ spec นี้จะไปแก้โดยตรง
-และทั้งคู่**ไม่มีประวัติใน git เลย** แก้พลาดแล้วไม่มีทาง revert
-
-`bot/hwid.py` และ `bot/protection.py` ถูก `build.bat` เรียกใช้ตอน pyarmor — ถ้าหายไปตอนไหน
-build ตายทันทีโดยไม่มีสำเนา
-
-> **ต้องคอมมิตทั้ง 16.1 และ 16.2 ก่อน task แรกของแผนเสมอ** และงานรื้อทำบน branch แยก
-> (`feat/engine-rewrite`) ไม่ใช่บน `master`
+- `git add` เฉพาะไฟล์ที่ task ระบุ **ห้าม `git add -A`** — `bot/output/` มี 19,769 ไฟล์
+  และ `bot/input/` มี 24,279 ไฟล์ที่ถือ LF_AC จริง
+- **คอมมิตก่อนรันอะไรที่อาจต้อง revert** โดยเฉพาะ task ที่ลบโค้ดเป็นพันบรรทัด
+- ห้ามฆ่าโปรเซสด้วยชื่อ image (`taskkill /IM python.exe`) ฆ่าได้เฉพาะ pid ที่ตัวเองสร้าง
+- **ห้ามแตะ `bot/input/` `bot/output/` `bot/backup/` ในเทสต์** ใช้ `tmp_path` เสมอ
+  และเทสต์ต้อง monkeypatch ทุก path ระดับโมดูลที่เอื้อมถึง (eFootball เคยเขียนทับไฟล์
+  เครดิทเชียล 2,430 ไฟล์เพราะเทสต์โหลดโมดูลจริงผ่านตัวแปร path ที่ลืม patch)
