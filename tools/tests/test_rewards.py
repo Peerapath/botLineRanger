@@ -52,6 +52,10 @@ class FakeApi:
                        for sn in sorted(self.gift_state)]
             return 200, {"result": {"giftBox": {"gift": {"playerGifts": pending}}}}
         if path.startswith("/giftbox/gift/receive/all"):
+            # "all" in fail_sns rejects the bulk call and sweeps nothing, so a test can
+            # set up the case where the box is drained entirely by the per-gift loop
+            if "all" in self.fail_sns:
+                return 400, {"result": {}}
             # only NORMAL gifts get swept in bulk - MINI_GACHA ones are left for the
             # per-gift endpoint below, same as the real API (see claim_giftbox)
             self.gift_state = {sn: kind for sn, kind in self.gift_state.items()
@@ -152,10 +156,17 @@ def test_the_gifts_are_still_all_claimed(monkeypatch):
     assert api.claimed_individually == [0, 1]
 
 
-def test_claim_giftbox_reports_failure_when_a_leftover_post_fails(monkeypatch):
-    """done used to be an OR chain, so one rejected leftover could still read as ok."""
+def test_claim_giftbox_still_reports_success_when_only_the_bulk_call_failed(monkeypatch):
+    """A drained box must not read as a failure, or claim_all stops sweeping.
+
+    An AND-chain was tried here and reverted: a failed receive/all whose leftovers all
+    succeed leaves the box genuinely empty, but returned False. The gift box is the only
+    job a refresh pass can produce, so claim_all saw zero claims and broke out of the
+    remaining passes - losing the very pass that exists in case a gift deposits a gift.
+    """
     rewards = load("rewards")
-    api = FakeApi(gifts=2, mini_gacha_sns={0, 1}, fail_sns={1})
+    api = FakeApi(gifts=2, mini_gacha_sns={0, 1}, fail_sns={"all"})
     monkeypatch.setattr(rewards, "call", api)
     pending = [{"giftSn": 0}, {"giftSn": 1}]
-    assert rewards.claim_giftbox("c", pending) is False
+    assert rewards.claim_giftbox("c", pending) is True
+    assert api.claimed_individually == [0, 1]

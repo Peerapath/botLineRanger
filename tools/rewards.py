@@ -98,17 +98,25 @@ def claim_giftbox(cookie, pending=None):
     listed the box twice more per call - once to find the leftovers and once to
     confirm - on top of the listing the survey had just done.
 
-    Success requires the bulk call to have worked AND every leftover this call
-    attempted to be accepted - a single failed leftover must not hide behind an
-    earlier success, because a pass that is not followed by another survey has no
-    other way to notice a box that is still not empty.
+    The return value says "something was claimed", not "the box is now empty".
+    Nothing here can say the latter: the loop re-posts every entry the survey listed,
+    including ones receive/all already swept, and a redundant claim's status is not
+    something this codebase has ever observed. Only a fresh listing settles it, and
+    removing that listing is the point of this function's new shape.
+
+    So it stays optimistic on purpose. An AND-chain was tried and reverted: with it, a
+    failed receive/all followed by leftovers that all succeed - a genuinely drained box -
+    returned False, and since the gift box is the only job a refresh pass can produce,
+    claim_all counted zero claims and broke out of its remaining passes. That turned a
+    wrong log line into a skipped sweep. Being too optimistic costs an inaccurate "ok";
+    being too pessimistic costs the pass that exists to catch a gift depositing a gift.
     """
     status, _data = call(cookie, "/giftbox/gift/receive/all", "POST")
     done = status == 200
     leftovers = _pending_gifts(cookie) if pending is None else pending
     for gift_entry in leftovers:
         sub, _ = call(cookie, "/giftbox/gift/receive/%s" % gift_entry.get("giftSn"), "POST")
-        done = done and sub == 200
+        done = done or sub == 200
     return done
 
 
