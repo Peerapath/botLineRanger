@@ -13,10 +13,41 @@ from __future__ import annotations
 import collections
 import json
 import os
+import sys
 import threading
 import time
 
 DESTS = ("output", "backup", "login failed")
+
+# Windows can hold a rename target open for a moment - AV scan, indexer, another
+# thread mid-read (global constraint #13). Retrying turns that transient block into
+# an ordinary success instead of a file silently dropped from a moved/claimed count
+# (global constraint #10: "resource busy" must retry, not be treated as "impossible").
+# This is a millisecond-scale rename, so the whole retry budget is kept small.
+_REPLACE_MAX_ATTEMPTS = 5
+_REPLACE_RETRY_DELAY_S = 0.05
+
+
+def _replace_with_retry(src: str, dst: str) -> bool:
+    """os.replace(src, dst), retrying a transient OSError up to _REPLACE_MAX_ATTEMPTS times.
+
+    Returns True on success. Returns False only for FileNotFoundError: the source is
+    genuinely gone (something else already removed it) - a different case from
+    "blocked", and callers skip it quietly. Any other OSError that survives every
+    retry is re-raised, so the caller can record and report it instead of the file
+    quietly vanishing from a moved/claimed count.
+    """
+    for attempt in range(1, _REPLACE_MAX_ATTEMPTS + 1):
+        try:
+            os.replace(src, dst)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            if attempt == _REPLACE_MAX_ATTEMPTS:
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY_S)
+    return False  # unreachable: the loop above always returns or raises
 
 
 class WorkQueue:
@@ -26,6 +57,13 @@ class WorkQueue:
         self._lock = threading.Lock()
         self._pending: collections.deque[str] = collections.deque()
         self._scanned = False
+        # Set True the first time claim() hands out a file; guards recover()'s
+        # precondition (a queue that has already issued work cannot be recovered).
+        self._claim_issued = False
+        # Permanently-failed renames from the most recent recover() call, so a
+        # caller can find out even though recover()'s return value stays the
+        # "moved" count for backward compatibility.
+        self.recover_failures = 0
         os.makedirs(os.path.dirname(journal_path) or ".", exist_ok=True)
         for sub in ("input", "execute") + DESTS:
             os.makedirs(os.path.join(root, sub), exist_ok=True)
@@ -70,22 +108,48 @@ class WorkQueue:
 
         กู้ทุกไฟล์ที่อยู่ใน execute/ ไม่ใช่เฉพาะที่มีบรรทัดค้างใน journal เพราะไฟล์ที่
         ตกค้างจากบอทรุ่นก่อน (ยุค split-ID) ไม่มีบรรทัดใน journal เลย แต่ก็ต้องกลับมาเหมือนกัน
+
+        Must run exactly once, at startup, before any worker thread calls claim().
+        It moves every .xml file sitting in execute/ back to input/ unconditionally;
+        if a claim were already active when it ran, that claimed file would be
+        pulled back and then handed to a second thread by a later claim(), so two
+        threads would process the same account. To make that precondition
+        structural rather than just documented, recover() refuses to run once this
+        instance has issued a claim.
+
+        Raises:
+            RuntimeError: if claim() has already handed a file to a caller on this
+                WorkQueue instance.
         """
-        execute = os.path.join(self.root, "execute")
-        stale = self._open_claims()
-        moved = 0
-        for name in sorted(os.listdir(execute)):
-            if not name.endswith(".xml"):
-                continue
-            src = os.path.join(execute, name)
-            dst = os.path.join(self.root, "input", name)
-            try:
-                os.replace(src, dst)
-            except OSError:
-                continue
-            self._write(t="recover", f=name, known=name in stale)
-            moved += 1
-        return moved
+        with self._lock:
+            if self._claim_issued:
+                raise RuntimeError(
+                    "recover() must run once at startup, before any claim(): this "
+                    "WorkQueue has already issued a claim, so recovering now could "
+                    "steal a file an active worker still holds")
+            execute = os.path.join(self.root, "execute")
+            stale = self._open_claims()
+            moved = 0
+            self.recover_failures = 0
+            for name in sorted(os.listdir(execute)):
+                if not name.endswith(".xml"):
+                    continue
+                src = os.path.join(execute, name)
+                dst = os.path.join(self.root, "input", name)
+                try:
+                    moved_ok = _replace_with_retry(src, dst)
+                except OSError as exc:
+                    # Otherwise this file drops out of `moved` with no trace and
+                    # stays stuck in execute/ for the rest of the run - the exact
+                    # bug this class exists to prevent.
+                    self._write(t="recover_failed", f=name, why=str(exc)[:200])
+                    self.recover_failures += 1
+                    continue
+                if not moved_ok:
+                    continue  # genuinely gone (FileNotFoundError) - nothing to recover
+                self._write(t="recover", f=name, known=name in stale)
+                moved += 1
+            return moved
 
     def _scan(self) -> None:
         folder = os.path.join(self.root, "input")
@@ -102,10 +166,16 @@ class WorkQueue:
                 src = os.path.join(self.root, "input", name)
                 dst = os.path.join(self.root, "execute", name)
                 try:
-                    os.replace(src, dst)
-                except OSError:
+                    moved_ok = _replace_with_retry(src, dst)
+                except OSError as exc:
+                    # Survived every retry - move on to the next file, but log it
+                    # instead of dropping it from the queue with no trace.
+                    self._write(t="claim_failed", f=name, why=str(exc)[:200])
+                    continue
+                if not moved_ok:
                     continue      # ไฟล์หายไประหว่างทาง (คนลบเอง) - ข้ามไปตัวถัดไป
                 self._write(t="claim", f=name)
+                self._claim_issued = True
                 return dst
             return None
 
@@ -135,5 +205,7 @@ class WorkQueue:
     def close(self) -> None:
         try:
             self._journal.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Teardown must not raise, but a swallowed close/flush error (e.g. a
+            # full disk) needs somewhere to land instead of vanishing (constraint #9).
+            print(f"WorkQueue.close: journal close failed: {exc!r}", file=sys.stderr)

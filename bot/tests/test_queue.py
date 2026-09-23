@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 import pytest
 
@@ -49,13 +50,39 @@ def test_each_file_is_handed_out_exactly_once_under_concurrency(tmp_path):
             with lock:
                 got.append(os.path.basename(path))
 
-    threads = [threading.Thread(target=worker) for _ in range(16)]
+    # daemon=True: a deadlocked worker (see below) must not also keep the whole
+    # pytest process alive after the test itself has already reported failure.
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(16)]
     for t in threads:
         t.start()
+    # A deadlocking claim() (e.g. a peek instead of a pop) must fail this test fast,
+    # not hang the whole run forever - bound the total wait instead of joining with
+    # no timeout.
+    deadline = time.monotonic() + 10
     for t in threads:
-        t.join()
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    assert not any(t.is_alive() for t in threads), "a claim() regression deadlocked a worker thread"
     assert len(got) == 200
     assert len(set(got)) == 200
+
+
+def test_claim_retries_a_transient_replace_failure_and_still_succeeds(tmp_path, monkeypatch):
+    """os.replace ได้ PermissionError ชั่วคราว (มี handle ค้าง) ต้อง retry แล้วสำเร็จ ไม่ใช่ข้ามไฟล์ทิ้ง"""
+    q = build(tmp_path, ["a.xml"])
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError("[WinError 32] the process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    got = q.claim()
+    assert got == str(tmp_path / "execute" / "a.xml")
+    assert os.path.isfile(got)
+    assert calls["n"] == 3
 
 
 def test_finish_renames_into_the_destination_folder(tmp_path):
@@ -128,8 +155,88 @@ def test_recover_survives_a_journal_whose_last_line_was_cut_off(tmp_path):
     assert q2.recover() == 1
 
 
+def test_recover_raises_after_a_claim_has_been_issued(tmp_path):
+    """recover() ที่รันหลัง claim() จะดึงไฟล์ที่เธรดอื่นถือ claim อยู่กลับ input/ แล้วแจกซ้ำ - ต้องเด้งแทน"""
+    q = build(tmp_path, ["a.xml", "b.xml"])
+    claimed = q.claim()
+    with pytest.raises(RuntimeError):
+        q.recover()
+    # the claim must survive the refused recover() untouched
+    assert os.path.isfile(claimed)
+    assert sorted(os.listdir(tmp_path / "execute")) == ["a.xml"]
+    assert os.listdir(tmp_path / "input") == ["b.xml"]
+
+
+def test_recover_retries_a_transient_replace_failure_and_still_succeeds(tmp_path, monkeypatch):
+    """เหมือน claim() - PermissionError ชั่วคราวตอนกู้ไฟล์ต้อง retry แล้วสำเร็จ ไม่ใช่ทิ้งไฟล์ไว้ใน execute/"""
+    q = build(tmp_path, ["a.xml"])
+    q.claim()
+    q.close()
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError("[WinError 32] the process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    q2 = WorkQueue(str(tmp_path), str(tmp_path / "log" / "run.jsonl"))
+    assert q2.recover() == 1
+    assert sorted(os.listdir(tmp_path / "input")) == ["a.xml"]
+    assert os.listdir(tmp_path / "execute") == []
+    assert calls["n"] == 3
+    assert q2.recover_failures == 0
+
+
+def test_recover_reports_a_permanently_failing_replace_instead_of_dropping_it(tmp_path, monkeypatch):
+    """os.replace ที่พังตลอด (ไม่ใช่ชั่วคราว) ต้องถูกบันทึกใน journal และนับ ไม่ใช่หายไปเงียบ ๆ"""
+    q = build(tmp_path, ["a.xml", "b.xml"])
+    q.claim()
+    q.claim()
+    q.close()
+
+    real_replace = os.replace
+
+    def flaky(src, dst):
+        if os.path.basename(src) == "a.xml":
+            raise PermissionError("[WinError 32] the process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    q2 = WorkQueue(str(tmp_path), str(tmp_path / "log" / "run.jsonl"))
+    assert q2.recover() == 1                      # only b.xml made it back
+    assert os.path.isfile(tmp_path / "execute" / "a.xml")   # a.xml stayed put, not lost
+    assert q2.recover_failures == 1
+
+    lines = [json.loads(x) for x in (tmp_path / "log" / "run.jsonl").read_text(encoding="utf-8").splitlines()]
+    failed = [x for x in lines if x.get("t") == "recover_failed"]
+    assert len(failed) == 1
+    assert failed[0]["f"] == "a.xml"
+
+
 def test_remaining_counts_down_as_files_are_claimed(tmp_path):
     q = build(tmp_path, ["a.xml", "b.xml", "c.xml"])
     assert q.remaining() == 3
     q.claim()
     assert q.remaining() == 2
+
+
+class _BrokenJournal:
+    """Stand-in for a file whose close() always fails, and nothing more - unlike a
+    real TextIOWrapper it has no __del__ finalizer, so swapping it in doesn't leave
+    a broken close() for the garbage collector to call again later."""
+
+    def close(self):
+        raise OSError("disk full")
+
+
+def test_close_reports_a_failure_to_stderr_instead_of_swallowing_it_silently(tmp_path, capsys):
+    """ปิด journal ไม่สำเร็จ (เช่นดิสก์เต็ม) ต้องไม่ raise แต่ต้องมีร่องรอยใน stderr ไม่ใช่หายเงียบ"""
+    q = build(tmp_path, [])
+    q._journal.close()        # release the real file handle before swapping it out
+    q._journal = _BrokenJournal()
+    q.close()                 # must not raise even though the underlying close() failed
+    assert "disk full" in capsys.readouterr().err
