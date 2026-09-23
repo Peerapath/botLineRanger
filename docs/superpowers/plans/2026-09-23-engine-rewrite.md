@@ -2598,8 +2598,12 @@ def load_config(path, rangers_path=None):
     if rangers_path and os.path.isfile(rangers_path):
         rparser = configparser.ConfigParser()
         rparser.read(rangers_path, encoding="utf-8")
+        # ค่าเป็น "ชื่อที่แสดง" ไม่ใช่ธงเปิด/ปิด - configRangers.ini เก็บ
+        # unitCode -> ชื่อภาษาไทย และ pull_roster.unit_names เอาชื่อนั้นไปตั้งชื่อไฟล์ที่ export
+        # ส่วนกาชาใช้มันเป็น truthiness ถ้าแปลงเป็น bool ทุกตัวจะกลายเป็น False
+        # = ไม่มีเรนเจอร์เป้าหมายสักตัว และชื่อไฟล์จะว่างเปล่า
         cfg["_rangers_config"] = {
-            k.lower(): str(v).strip().lower() in ("true", "1", "yes")
+            k.lower(): str(v).strip()
             for section in rparser.sections()
             for k, v in rparser[section].items()}
     else:
