@@ -2988,6 +2988,28 @@ grep -rn "botLineRanger\." bot/engine/ bot/main.py
 
 ทุกอย่างที่ไม่โผล่ในผลลัพธ์นั้นและไม่มีผู้เรียกอื่น = ลบได้
 
+- [ ] **Step 4b: ลบโค้ดกาชาและ roster ที่ Task 6 ย้ายไป `tools/` แล้ว**
+
+Task 6 ย้าย `apiGachaWithTicket` และลูปสรุปชื่อ ranger ของ `getAccoutInfo` ไปเป็น
+`tools/gacha.draw_with_ticket` กับ `tools/pull_roster.unit_names` แต่**ไม่ได้ลบต้นฉบับ** เพราะตอนนั้น
+ยังมีผู้เรียกอยู่ ตอนนี้ engine ใช้ตัวใน `tools/` แล้ว ต้นฉบับจึงเป็นโค้ดซ้ำที่ไม่มีใครเรียก
+
+ตัวที่ต้องตรวจแล้วลบ (ไม่ได้อยู่ในรายการ ADB/vision จึงตกสำรวจถ้าไม่เขียนไว้ตรงนี้):
+
+```
+apiGachaWithTicket · _gachaGroupPull · matchGachaName · add_ranger_name
+getTeanInfo · getRubyAndTicket · getAccoutInfo · currentLevel · apiGetPlayer
+```
+
+ใช้วิธีเดียวกับ Step 4: `grep -rn "X" bot/ tools/ --include=*.py` ก่อนลบทุกตัว เจอแค่บรรทัด
+`def` ของตัวเอง = ลบได้ **ห้ามลบตามรายการนี้โดยไม่ตรวจ** — ถ้าตัวไหนยังมีผู้เรียกที่มีชีวิต
+ให้เก็บไว้แล้วรายงานว่าตัวไหนและใครเรียก
+
+> เหตุผลที่ต้องเขียนขั้นนี้ไว้ชัด ๆ: reviewer ของ Task 6 ไล่อ่าน brief ครบทั้ง 12 ใบแล้วพบว่า
+> **ไม่มี task ไหนเลยที่ปลดระวางต้นฉบับพวกนี้** Step 4 ของ task นี้ระบุขอบเขตเป็น "ฟังก์ชันที่แตะ
+> device/vision/OCR" ซึ่งกาชากับ roster ไม่เข้าข่าย โค้ดซ้ำ ~180 บรรทัดจึงจะค้างอยู่ตลอดไป
+
+
 - [ ] **Step 5: ตัดส่วน ADB ออกจาก `main.py`**
 
 ลบ: การเลือก device/emulator ทั้งชุด · การเรียก `setup_emulators` · ตัวเลือก
