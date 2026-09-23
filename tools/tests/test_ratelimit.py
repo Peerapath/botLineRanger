@@ -8,6 +8,18 @@ sys.path.insert(0, TOOLS)
 import ratelimit
 
 
+class _FakeClock:
+    """นาฬิกาที่เดินเฉพาะตอนถูกสั่ง - เทสต์เรื่องเวลาที่ใช้ time.sleep จริงจะช้าและแกว่ง"""
+    def __init__(self, start=0.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 # --- is_app_429 ---------------------------------------------------------------------------
 
 APP429 = {"errorCode": 429,
@@ -404,3 +416,65 @@ def test_locked_file_creates_and_round_trips(tmp_path):
     with ratelimit.locked_file(path) as fh:
         fh.seek(0)
         assert fh.read() == "abc 123"
+
+
+# --- TokenBucket (in-process) ----------------------------------------------------------------
+
+def test_token_bucket_hands_out_the_burst_without_waiting():
+    clock, waits = _FakeClock(), []
+    b = ratelimit.TokenBucket(rate=10, burst=5, clock=clock, sleep=waits.append)
+    for _ in range(5):
+        b.acquire()
+    assert waits == []
+
+
+def test_token_bucket_paces_at_the_configured_rate_once_the_burst_is_spent():
+    """เกินเบิร์สต์แล้วต้องรอ 1/rate ต่อ token ไม่ใช่ปล่อยผ่าน"""
+    clock, waits = _FakeClock(), []
+    b = ratelimit.TokenBucket(rate=10, burst=1, clock=clock, sleep=lambda s: (waits.append(s), clock.advance(s)))
+    b.acquire()
+    b.acquire()
+    assert waits and abs(sum(waits) - 0.1) < 0.01
+
+
+def test_token_bucket_never_waits_when_time_has_already_passed():
+    clock, waits = _FakeClock(), []
+    b = ratelimit.TokenBucket(rate=10, burst=1, clock=clock, sleep=waits.append)
+    b.acquire()
+    clock.advance(5.0)
+    b.acquire()
+    assert waits == []
+
+
+def test_token_bucket_hands_each_token_to_exactly_one_thread():
+    """เบิร์สต์ 50 ใบกับ 20 เธรดที่ขอคนละ 5 ใบ: ต้องไม่มีใครได้ token ผีเพิ่ม"""
+    import threading
+    import time
+    b = ratelimit.TokenBucket(rate=1000, burst=50)
+    got = []
+    lock = threading.Lock()
+
+    def worker():
+        for _ in range(5):
+            b.acquire()
+            with lock:
+                got.append(1)
+
+    ts = [threading.Thread(target=worker) for _ in range(20)]
+    for t in ts:
+        t.start()
+    # Bound the wait: a deadlock/livelock regression in acquire() must fail this test, not hang
+    # the whole suite forever. One shared deadline (not a per-thread timeout) caps the worst case
+    # at ~5s total even if every thread is stuck, instead of 20 * timeout.
+    deadline = time.monotonic() + 5.0
+    for t in ts:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    for t in ts:
+        assert not t.is_alive()
+    assert len(got) == 100
+
+
+def test_the_old_file_backed_bucket_is_still_available_under_its_new_name():
+    """ของเดิมต้องไม่หาย มันคือทางเดียวที่กันข้ามโปรเซสได้ถ้าวันหนึ่งต้องกลับไปหลาย engine"""
+    assert hasattr(ratelimit, "FileTokenBucket")
+    assert hasattr(ratelimit.FileTokenBucket, "acquire")

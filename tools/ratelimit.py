@@ -135,7 +135,45 @@ def _proxy_id(proxy: str) -> str:
     return "direct" if not proxy else hashlib.sha1(proxy.encode()).hexdigest()[:8]
 
 
-class IpBucket:
+class TokenBucket:
+    """ถังโทเคนในแรม คุมอัตรา request ของ IP หนึ่งเส้น
+
+    ใช้แทน IpBucket (ที่ตอนนี้ชื่อ FileTokenBucket) ตั้งแต่บอทเหลือ engine โปรเซสเดียว
+    ของเดิมต้องเปิด/ล็อก/เขียน/ปิดไฟล์ทุกครั้งที่ขอหนึ่งโทเคน เพราะเป็นทางเดียวที่ 128
+    โปรเซสจะแชร์งบกันได้ พอทุกเธรดอยู่ในโปรเซสเดียวกัน Lock ตัวเดียวก็พอ และเส้นทาง
+    LockTimeout / ปิดถังถาวรหลังพลาด 3 ครั้ง หายไปทั้งหมด
+    """
+
+    def __init__(self, rate: float, burst: int | None = None,
+                 clock=time.monotonic, sleep=time.sleep) -> None:
+        self.rate = max(0.001, float(rate))
+        self.burst = max(1, int(burst if burst is not None else BURST))
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._tokens = float(self.burst)
+        self._stamp = clock()
+
+    def acquire(self) -> None:
+        """รอจนถึงคิวของตัวเองแล้วหักหนึ่งโทเคน
+
+        คำนวณเวลาที่ต้องรอ *ในล็อก* แล้วหักโทเคนทันที ส่วนการ sleep ทำนอกล็อก
+        ไม่งั้นเธรดที่กำลังรอจะกันเธรดอื่นไม่ให้แม้แต่จองคิว แล้วอัตราจริงจะตกต่ำกว่า
+        ที่ตั้งไว้มากเมื่อเธรดเยอะ
+        """
+        while True:
+            with self._lock:
+                now = self._clock()
+                self._tokens = min(self.burst, self._tokens + (now - self._stamp) * self.rate)
+                self._stamp = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rate
+            self._sleep(wait)
+
+
+class FileTokenBucket:
     """Token bucket shared by every process on this box that talks to `host` through the same
     proxy (= the same egress IP). State lives in one small lock file: "<tokens> <unix_ts>"."""
 
@@ -217,6 +255,11 @@ class IpBucket:
             finally:
                 _unlock(fh)
         return wait
+
+
+# ชื่อเดิมของ FileTokenBucket สมัยที่บอทยังเป็น 128 โปรเซส เก็บไว้ให้โค้ดเก่าที่ยัง
+# อ้างถึงมันระหว่างการรื้อยังทำงานได้ ลบได้เมื่อ Task 11 ลบผู้เรียกกลุ่มสุดท้ายแล้ว
+IpBucket = FileTokenBucket
 
 
 # rl_dir() is defined above; IpBucket reads it lazily so tests can set LGRGS_RL_DIR after import.
