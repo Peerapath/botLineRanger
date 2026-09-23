@@ -422,7 +422,11 @@ def test_locked_file_creates_and_round_trips(tmp_path):
 
 def test_token_bucket_hands_out_the_burst_without_waiting():
     clock, waits = _FakeClock(), []
-    b = ratelimit.TokenBucket(rate=10, burst=5, clock=clock, sleep=waits.append)
+    # sleep also advances the clock: under a burst-not-preloaded regression, acquire()'s
+    # while True: loop must eventually see tokens accrue and return, not spin forever against
+    # a clock that never moves.
+    b = ratelimit.TokenBucket(rate=10, burst=5, clock=clock,
+                               sleep=lambda s: (waits.append(s), clock.advance(s)))
     for _ in range(5):
         b.acquire()
     assert waits == []
@@ -439,10 +443,21 @@ def test_token_bucket_paces_at_the_configured_rate_once_the_burst_is_spent():
 
 def test_token_bucket_never_waits_when_time_has_already_passed():
     clock, waits = _FakeClock(), []
-    b = ratelimit.TokenBucket(rate=10, burst=1, clock=clock, sleep=waits.append)
+    # sleep also advances the clock: guards the same regression as the burst test above - a
+    # wrong comparison here must fail fast, not hang retrying against a clock stuck at 0.
+    b = ratelimit.TokenBucket(rate=10, burst=1, clock=clock,
+                               sleep=lambda s: (waits.append(s), clock.advance(s)))
     b.acquire()
     clock.advance(5.0)
     b.acquire()
+    assert waits == []
+
+
+def test_token_bucket_disabled_when_rate_zero():
+    clock, waits = _FakeClock(), []
+    b = ratelimit.TokenBucket(rate=0, burst=1, clock=clock, sleep=waits.append)
+    for _ in range(50):
+        b.acquire()
     assert waits == []
 
 
@@ -461,6 +476,7 @@ def test_token_bucket_hands_each_token_to_exactly_one_thread():
                 got.append(1)
 
     ts = [threading.Thread(target=worker) for _ in range(20)]
+    t0 = time.monotonic()
     for t in ts:
         t.start()
     # Bound the wait: a deadlock/livelock regression in acquire() must fail this test, not hang
@@ -469,9 +485,17 @@ def test_token_bucket_hands_each_token_to_exactly_one_thread():
     deadline = time.monotonic() + 5.0
     for t in ts:
         t.join(timeout=max(0.0, deadline - time.monotonic()))
+    elapsed = time.monotonic() - t0
     for t in ts:
         assert not t.is_alive()
     assert len(got) == 100
+    # 100 tokens from a burst of 50 at rate 1000/s cannot finish in under (100-50)/1000 = 0.05s;
+    # a no-op or double-granting acquire() hands out all 100 in well under 1ms (measured ~3ms for
+    # thread start/join overhead alone with a no-op acquire()). Threshold is 40% of the
+    # theoretical minimum: generous slack for scheduling jitter on a loaded machine, while
+    # staying far above what broken code actually measures.
+    min_wait = (100 - 50) / 1000
+    assert elapsed >= min_wait * 0.4, elapsed
 
 
 def test_the_old_file_backed_bucket_is_still_available_under_its_new_name():

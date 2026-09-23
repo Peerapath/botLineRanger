@@ -91,7 +91,8 @@ class AccountPacer:
 PACER = AccountPacer()
 
 
-# --- per-IP token bucket (cross-process, lock file) -----------------------------------------
+# --- per-IP token buckets: in-memory (TokenBucket) and file-backed (FileTokenBucket) ----------
+# One process on this egress IP -> TokenBucket (a Lock); several processes sharing it -> FileTokenBucket (a lock file).
 
 _LOCK_TIMEOUT_S = 10.0   # give up -> LockTimeout -> acquire() paces and retries instead of hanging
 
@@ -146,11 +147,14 @@ class TokenBucket:
 
     def __init__(self, rate: float, burst: int | None = None,
                  clock=time.monotonic, sleep=time.sleep) -> None:
-        self.rate = max(0.001, float(rate))
+        self.rate = float(rate)
         self.burst = max(1, int(burst if burst is not None else BURST))
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()
+        # Same LGRGS_RPS_BUDGET=0 contract as FileTokenBucket (module docstring): disabled means
+        # no pacing at all, not the ~1000s wait max(0.001, rate) would give for rate=0.
+        self._disabled = self.rate <= 0
         self._tokens = float(self.burst)
         self._stamp = clock()
 
@@ -161,10 +165,12 @@ class TokenBucket:
         ไม่งั้นเธรดที่กำลังรอจะกันเธรดอื่นไม่ให้แม้แต่จองคิว แล้วอัตราจริงจะตกต่ำกว่า
         ที่ตั้งไว้มากเมื่อเธรดเยอะ
         """
+        if self._disabled:
+            return
         while True:
             with self._lock:
                 now = self._clock()
-                self._tokens = min(self.burst, self._tokens + (now - self._stamp) * self.rate)
+                self._tokens = min(float(self.burst), self._tokens + (now - self._stamp) * self.rate)
                 self._stamp = now
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
