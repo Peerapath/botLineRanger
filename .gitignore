@@ -26,3 +26,32 @@ bot/input/
 
 # Shared rate-limit bucket/lock files written by workers at runtime (repo root / next to the exe).
 .ratelimit/
+
+# Build output. dist_pyarmor holds obfuscated copies of every source file, so committing it
+# would ship the same code twice and rot the moment the originals change.
+bot/build/
+bot/dist/
+bot/dist_pyarmor/
+bot/Version/
+# Holds the real signing key server_version.py uses during build.bat.
+bot/.build_env
+
+# Runtime state, not source: accounts mid-flight, the worker's file claims, and its logs.
+bot/execute/
+bot/login failed/
+bot/src/log/
+bot/src/split-ID/
+# The user's own config carries their licence email; default_config/ is the tracked copy.
+bot/src/config.ini
+bot/src/configRangers.ini
+bot/src/configGears.ini
+
+# Bundled third-party binaries pulled in by the build, not authored here.
+bot/src/Tesseract-OCR/
+bot/src/adb/
+# Screen-match templates for the ADB automation; megabytes of PNG that no API mode reads.
+bot/src/image/
+
+# One-off captures kept next to the code while reversing an endpoint.
+bot/enter_dump.json
+tools/lfac_probe.txt
