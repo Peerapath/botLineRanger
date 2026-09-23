@@ -169,6 +169,98 @@ def _export_name(s: AccountSession) -> str:
     return "%s_Rb%s_Tk%s_%s_Lv%s" % (s.rangers, s.ruby, s.ticket, s.rsn, s.level)
 
 
+# ที่ _create_account เขียนไฟล์ .xml ของบัญชีใหม่ที่เพิ่ง mint - CWD-relative เหมือนโค้ดเดิมทั้งไฟล์
+# (os.path.join("execute", FILENAME) ฯลฯ ใน botLineRanger.py) และเหมือน sketch เดิมของ brief
+# (os.path.join(os.getcwd(), "execute")) แค่ยกขึ้นเป็นตัวแปรระดับโมดูลตามข้อบังคับข้อ 3 (เทสต์ต้อง
+# monkeypatch ได้) นี่คือค่าคงที่ที่อ่านอย่างเดียว ไม่มีเธรดไหนเขียนทับมันขณะรัน จึงไม่ใช่ mutable
+# state ที่ข้อบังคับข้อ 1 ห้าม (เหมือน MAX_ATTEMPTS/RETRY_BACKOFF_SECONDS ข้างบน) - ตอน Task 9 ต่อสาย
+# engine_main จริง ต้องชี้ค่านี้ไปที่ root เดียวกับที่ WorkQueue(root=...) ใช้ (bot/engine/queue.py)
+# เหมือนที่ต้องยัด cfg["_rangers_config"] ให้ _account_info (ดู run_login's docstring ด้านบน)
+EXECUTE_DIR = os.path.join(os.getcwd(), "execute")
+
+
+def _level_up(s: AccountSession, cfg: dict) -> str:
+    """เล่น st01 ซ้ำจนถึง leveltarget - ย้ายมาจาก apiLevelUpByStage1()
+
+    วัดจริง: st01 จ่าย 600 exp ทุกรอบ เลเวล 1 -> 3 ใช้สองรอบ และการเลเวลอัพเติม heart
+    ให้เอง (5 -> 9 -> 13) จึงไม่มีทาง heart หมดก่อนถึงเป้า
+
+    คืน reason ("done"/"hearts"/"flagged"/...) จาก stage_forge.level_up - ต้นฉบับ
+    (startBotLevel3_API_headless) เช็ค result["stop"] == "flagged" แยกจาก level<target เพื่อ
+    ตั้ง sessionStatus "FLAG" กับ "LOWLV" ต่างกัน stage_forge.level_up คืน "flagged" ได้เฉพาะตอน
+    level ยังไม่ถึง target เท่านั้น (ทุก successful clear เช็ค level>=target แล้ว return "done"
+    ก่อนจะไปเช็ค error ต่อ - อ่านโค้ดจริงที่ tools/stage_forge.py:392-398) ดังนั้น "flagged" ไม่มี
+    ทางมาพร้อม level ที่ถึงเป้าแล้ว แต่ run_level3/run_genid ยังต้องอ่านค่านี้ไว้ตั้ง status ให้
+    ตรงกับต้นฉบับ ไม่ใช่แค่เดา "LOWLV" เสมอ
+    """
+    import stage_forge
+    target = int(cfg.get("leveltarget") or 3)
+    level, _plays, reason = stage_forge.level_up(s.cookie, s.rsn, target)
+    s.level = int(level or s.level)
+    return reason
+
+
+def _create_account(s: AccountSession, cfg: dict) -> None:
+    """สร้าง guest ใหม่ผ่าน /v12.3/signup/platform - ย้ายมาจาก _headlessCreateAccount()
+
+    make_account เขียนไฟล์ .xml ให้เองเมื่อได้ write_xml_dir และคืน dict ที่มี lf_ac/rsn แต่ไม่คืน
+    path ของไฟล์ (เปิด tools/new_account.py::write_account_xml ดูจริงแล้ว: name =
+    account.get("rsn") or account.get("gameId"); path = xml_dir/name.xml - เรียกซ้ำที่นี่จึงเขียน
+    ทับไฟล์เดิมด้วยเนื้อหาเดิม ไม่ใช่ไฟล์ใหม่ซ้อน มีไว้แค่ให้ได้ path คืนมาเท่านั้น)
+
+    status == "pending-login" แปลว่าสร้างเครดิทเชียลได้แต่ล็อกอินไม่ผ่าน - เครดิทยังถูก
+    เก็บไว้แล้วกู้ได้ด้วย --resume ห้ามถือว่าเป็นความสำเร็จ
+
+    ต่างจาก _relogin ที่ reset_token() เคลียร์แค่โทเค็นของบัญชีเดิม - รอบนี้ identity ทั้งใบเปลี่ยน
+    ("attempt ใหม่ = สร้างบัญชีใหม่สด (มินต์ก่อนหน้าถ้าพังหลัง signup ก็ปล่อยทิ้ง)" - คอมเมนต์เดิม
+    ของ startBotGenID_API_headless) gacha_status/gacha_units จึงต้องล้างด้วย ไม่งั้นบัญชีที่เพิ่ง
+    mint จะโดนสถานะของบัญชีก่อนหน้า (ที่พังกลางทางหลังสุ่มไปแล้วแล้วถูกทิ้ง) หลอกว่าเคยสุ่มไปแล้ว -
+    ทำให้ข้ามกาชาจริงของบัญชีนี้ไปเฉย ๆ (ถ้า run_genid guard ด้วย gacha_status=="-" แบบเดียวกับ
+    run_login) และแย่กว่านั้นคือเอา gacha_units ของบัญชีเก่ามาตัดสิน backup/output ให้บัญชีนี้ผิดๆ
+    """
+    import new_account
+    s.reset_token()
+    s.gacha_status, s.gacha_units = "-", []
+    acct = new_account.make_account(write_xml_dir=EXECUTE_DIR, skip_tut=True)
+    if acct.get("status") != "ready" or not acct.get("lf_ac"):
+        raise RuntimeError("signup incomplete (status=%s)" % acct.get("status"))
+    s.src = new_account.write_account_xml(acct, EXECUTE_DIR)
+    s.cookie = "LF_AC=" + acct["lf_ac"]
+    s.rsn = acct.get("rsn") or acct.get("gameId") or ""
+    s.level = 1
+
+
+def _force_stage(s: AccountSession, cfg: dict) -> str:
+    """ดันด่านถึง settings.stageend - ย้ายมาจาก apiForceStage()
+
+    clear_range รับ first และ last เป็นเลขด่าน (ไม่ใช่ stageCode) จุดเริ่มมาจาก start_stage()
+    ซึ่งอ่านด่านล่าสุดของบัญชีจาก /stage/last - เริ่มที่ 1 เสมอคือการเล่นซ้ำด่านที่ผ่านแล้วทั้งหมด
+    โดยจ่าย heart จริงทุกด่าน
+
+    คืน stop reason ของ clear_range ("done" เมื่อไม่มีอะไรต้องเล่นเพิ่ม) - ต้นฉบับ
+    (startBotStage_API_headless) เช็ค result["stop"] == "flagged" แล้วส่งไฟล์ไป 'login failed'
+    แทน output/ ถ้าทิ้งค่านี้ไป (ตามที่ sketch เดิมของ brief ทำ - เรียก clear_range แล้วไม่เก็บ
+    ค่าที่คืนมาเลย) บัญชีที่เซิร์ฟเวอร์ตีธงว่าโกงจะหลุดไปอยู่ output/ ปนกับไอดีที่ขายได้จริง
+
+    เคลียร์ด่านได้ก็แปลว่า exp/level อาจขยับ - ต้นฉบับ (apiForceStage) อ่าน player_info ใหม่หลัง
+    clear_range เพื่อได้ level หลังดัน (levelAfter) ซึ่งไหลต่อไปเป็น level ในชื่อไฟล์ที่ export
+    ผ่าน getAccoutInfo()'s currentLevel() ถ้าไม่รีเฟรช s.level ตรงนี้ ชื่อไฟล์จะโชว์เลเวลก่อนดัน
+    ด่าน (จาก _fetch_home) ทั้งที่ตอนนี้เลเวลขยับไปแล้วจริง ๆ
+    """
+    import stage_forge
+    player = stage_forge.player_info(s.cookie)
+    first = stage_forge.start_stage(s.cookie, player)
+    last = int(cfg.get("stageend") or 150)
+    if first > last:
+        return "done"          # ผ่านเป้าไปแล้ว ไม่มีอะไรต้องทำ
+    _cleared, reason = stage_forge.clear_range(s.cookie, s.rsn, first, last)
+    try:
+        s.level = int(stage_forge.player_info(s.cookie).get("level") or s.level)
+    except Exception:
+        pass    # อ่านเลเวลใหม่ไม่ได้ ไม่ใช่เหตุให้ทั้ง session พัง (เหมือน apiForceStage เดิม)
+    return reason
+
+
 # --- flow ต่อโหมด ---
 
 def run_login(s: AccountSession, cfg: dict) -> Outcome:
@@ -223,8 +315,130 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 
+def run_level3(s: AccountSession, cfg: dict) -> Outcome:
+    target = int(cfg.get("leveltarget") or 3)
+    last = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        s.attempts = attempt
+        try:
+            s.reset_token()
+            # reset_token() เพิ่งล้าง cache ทิ้ง - ยัด _rangers_config กลับเข้าไปใหม่ทุกรอบ
+            # เหมือน run_login (ดู docstring ของ _account_info)
+            s.cache["_rangers_config"] = cfg.get("_rangers_config")
+            _relogin(s)
+            _fetch_home(s)
+            level_reason = "done"
+            if s.level < target:
+                level_reason = _level_up(s, cfg) or "done"
+            if s.level < target:
+                # ไม่ถึงเป้า = โหมดนี้ยังทำงานไม่สำเร็จ ส่งลง output ไม่ได้ (จุดประสงค์ของโหมดคือ
+                # ได้ไอดีเลเวล 3 ปล่อยเลเวลต่ำปนลง output คือทำลายความหมายของโฟลเดอร์) ต้นฉบับแยก
+                # "FLAG" ออกจาก "LOWLV" ตาม stop reason จริง (result["stop"] == "flagged") - ไม่ใช่
+                # เดาว่า LOWLV เสมอ (level_up คืน "flagged" ได้เฉพาะตอน level ยังไม่ถึง target
+                # เท่านั้น ดู _level_up's docstring จึงไม่มีทางชนกับกรณีถึงเป้าแล้ว)
+                return Outcome(dest="login failed",
+                               status="FLAG" if level_reason == "flagged" else "LOWLV",
+                               error="level %s < target %s (stop=%s)" % (s.level, target, level_reason))
+            _claim_rewards(s, cfg)
+            # เหมือน run_login: กาชาหักตั๋วจริง ถ้าสุ่มไปแล้วแต่ขั้นหลังพัง retry ห้ามสุ่มซ้ำ
+            if cfg.get("gacharanger") and s.gacha_status == "-":
+                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
+            _account_info(s)
+            # เหมือน run_login: ต้นฉบับส่งบัญชีที่สุ่มได้เรนเจอร์เป้าหมายไป backup/ แทน output/ -
+            # gotTarget = any(RANGERSCONFIG.get(code.lower()) for code in gachaUnits)
+            targets = cfg.get("_rangers_config") or {}
+            dest = "backup" if any(targets.get(code.lower()) for code in s.gacha_units) else "output"
+            return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
+        except PermanentFailure as err:
+            # เหมือน run_login: เซิร์ฟเวอร์ตอบจริงแล้วว่าบัญชีนี้ตาย (401 ยืนยันสองรอบใน _relogin) -
+            # retry ซ้ำมีแต่จะเปลืองโควตา auth ร่วมเพื่อฟังคำตอบเดิม (constraint 10: แยก "รอคิว"
+            # ออกจาก "พัง")
+            return Outcome(dest="login failed", status="FAIL", error=str(err))
+        except Exception as err:   # อย่างอื่นทั้งหมดคือ "รอคิว" - รอแล้วลองใหม่
+            last = str(err)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+    return Outcome(dest="login failed", status="FAIL", error=last)
+
+
+def run_genid(s: AccountSession, cfg: dict) -> Outcome:
+    last = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        s.attempts = attempt
+        try:
+            _create_account(s, cfg)
+            # _create_account -> reset_token() เพิ่งล้าง cache ทิ้ง (บัญชีใหม่ทุก attempt) - ยัด
+            # _rangers_config กลับเข้าไปใหม่ทุกรอบเหมือน run_login/run_level3
+            s.cache["_rangers_config"] = cfg.get("_rangers_config")
+            _fetch_home(s)
+            if cfg.get("genidlevel3"):
+                target = int(cfg.get("leveltarget") or 3)
+                if s.level < target:
+                    _level_up(s, cfg)
+                if s.level < target:
+                    return Outcome(dest="login failed", status="LOWLV",
+                                   error="level %s < target %s" % (s.level, target))
+            _claim_rewards(s, cfg)
+            # เหมือน run_level3 - แต่ที่ทำให้ guard นี้ยังถูกต้องสำหรับ GenID คือ _create_account
+            # ล้าง gacha_status/gacha_units ทุก attempt (บัญชีใหม่ทุกครั้ง) ถ้าไม่ล้าง guard นี้จะ
+            # กลายเป็นบั๊กคนละแบบ: บัญชีใหม่ที่ยังไม่เคยสุ่มเลยจะถูกข้ามกาชาไปเฉยๆ เพราะสถานะเก่าของ
+            # บัญชีก่อนหน้าที่ถูกทิ้งยังค้างอยู่ (ดู docstring ของ _create_account)
+            if cfg.get("gacharanger") and s.gacha_status == "-":
+                _gacha(s, cfg)   # ตั้ง s.gacha_status เองจากผลจริง ห้ามเขียนทับ
+            _account_info(s)
+            # ต้นฉบับ (startBotGenID_API_headless) ก็มี gotTarget -> backup/ เหมือนกัน (คอมเมนต์เดิม
+            # "backup เฉพาะที่กาชารอบนี้ได้เรนเจอร์เป้าหมาย...นอกนั้นลง output" - แต่
+            # โค้ดจริงเรียก removeFileInExecute() ในกิ่ง else ซึ่งขัดกับคอมเมนต์ตัวเอง (ลบทิ้งเฉยๆ
+            # ไม่ export เลย) และ Outcome ของ Task 8/9 ไม่มีปลายทาง "ลบทิ้ง" ให้เลือก (มีแค่
+            # output/backup/login failed - ดู bot/engine/queue.py: DESTS) จึงยึดคอมเมนต์ + รูปแบบ
+            # เดียวกับ run_login/run_level3: ไม่เจอเป้าหมาย -> output เหมือนเดิม ไม่ใช่ลบ - ดู
+            # task-8-report.md สำหรับเหตุผลเต็ม
+            targets = cfg.get("_rangers_config") or {}
+            dest = "backup" if any(targets.get(code.lower()) for code in s.gacha_units) else "output"
+            return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
+        except PermanentFailure as err:
+            return Outcome(dest="login failed", status="FAIL", error=str(err))
+        except Exception as err:
+            last = str(err)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+    return Outcome(dest="login failed", status="FAIL", error=last)
+
+
+def run_stage(s: AccountSession, cfg: dict) -> Outcome:
+    last = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        s.attempts = attempt
+        try:
+            s.reset_token()
+            s.cache["_rangers_config"] = cfg.get("_rangers_config")
+            _relogin(s)
+            _fetch_home(s)
+            reason = _force_stage(s, cfg)
+            if reason == "flagged":
+                # ต้นฉบับ (startBotStage_API_headless): บัญชีที่เซิร์ฟเวอร์ตีธงโกงย้ายไป
+                # 'login failed' แทน output/ จะได้ไม่ปนกับไอดีที่ใช้ได้ - ไม่ retry ต่อ (เหมือน
+                # PermanentFailure: นี่คือคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว)
+                return Outcome(dest="login failed", status="FLAG",
+                               error="stage push flagged by server")
+            # ต้นฉบับไม่เคยเรียก apiAcceptAllRewards ในโหมด Stage เลย (ต่างจาก Level3/GenID) -
+            # ไม่มี _claim_rewards ตรงนี้จึงตรงกับของจริง ไม่ใช่ตกหล่น (ดู task-8-report.md)
+            _account_info(s)
+            return Outcome(dest="output", name=_export_name(s), status="OK", error=s.error)
+        except PermanentFailure as err:
+            return Outcome(dest="login failed", status="FAIL", error=str(err))
+        except Exception as err:
+            last = str(err)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+    return Outcome(dest="login failed", status="FAIL", error=last)
+
+
 MODES = {
     "ranger_api_Login": run_login,
+    "ranger_api_Level3": run_level3,
+    "ranger_api_GenID": run_genid,
+    "ranger_api_Stage": run_stage,
 }
 
 
