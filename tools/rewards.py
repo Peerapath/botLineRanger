@@ -58,22 +58,27 @@ def _get(cookie, path):
     return data.get("result")
 
 
-def check_session(cookie):
+def check_session(cookie, home=None):
     """Fail loudly on a dead token.
 
     Every collector treats a non-200 as "nothing here", so an expired session would
     otherwise render as a clean "nothing to claim" - the most misleading output this
-    tool could produce. LF_AC rotates each time the game is opened, so a stale account
-    file is the normal case, not an edge case.
+    tool could produce.
+
+    `home` lets a caller that already fetched /home hand it over. One account used to
+    pay for that same payload four times (here, in survey_attendance_package, in
+    currentLevel and in getRubyAndTicket) - the single most repeated call in the bot.
     """
-    status, data = call(cookie, "/home")
-    if status == 200 and isinstance(data, dict) and "result" in data:
-        return data["result"]["player"]
-    raise SystemExit(
-        "session rejected (HTTP %s) - the token in this account file is stale.\n"
-        "LF_AC changes every time the game is launched; refresh it with:\n"
-        "  python tools/account_file.py --from-device --device <serial> --out <that .xml>"
-        % status)
+    if home is None:
+        status, data = call(cookie, "/home")
+        if not (status == 200 and isinstance(data, dict) and "result" in data):
+            raise SystemExit(
+                "session rejected (HTTP %s) - the token in this account file is stale.\n"
+                "LF_AC changes every time the game is launched; refresh it with:\n"
+                "  python tools/account_file.py --from-device --device <serial> --out <that .xml>"
+                % status)
+        home = data["result"]
+    return home["player"]
 
 
 # --- one collector per reward system; each returns a list of claim jobs ---
@@ -86,14 +91,20 @@ def _pending_gifts(cookie):
     return [g for g in gift.get("playerGifts", []) if not g.get("receive")]
 
 
-def claim_giftbox(cookie):
-    """receive/all, then mop up the kinds it skips (MINI_GACHA boxes) one by one."""
+def claim_giftbox(cookie, pending=None):
+    """receive/all, then mop up the kinds it skips (MINI_GACHA boxes) one by one.
+
+    `pending` is the list survey_giftbox already fetched. Without it this function
+    listed the box twice more per call - once to find the leftovers and once to
+    confirm - on top of the listing the survey had just done.
+    """
     status, _data = call(cookie, "/giftbox/gift/receive/all", "POST")
     done = status == 200
-    for gift_entry in _pending_gifts(cookie):
+    leftovers = _pending_gifts(cookie) if pending is None else pending
+    for gift_entry in leftovers:
         sub, _ = call(cookie, "/giftbox/gift/receive/%s" % gift_entry.get("giftSn"), "POST")
         done = done or sub == 200
-    return done and not _pending_gifts(cookie)
+    return done
 
 
 def survey_giftbox(cookie):
@@ -103,7 +114,9 @@ def survey_giftbox(cookie):
     names = ", ".join("%s x%s" % (g.get("giftName"), g.get("giftCount")) for g in pending[:3])
     if len(pending) > 3:
         names += ", ..."
-    return [("giftbox", claim_giftbox, "%d gift(s): %s" % (len(pending), names))]
+    # ผูกรายการที่เพิ่งดึงมาเข้ากับงาน claim เลย ผู้เรียกจะได้ไม่ต้องไปถามซ้ำ
+    return [("giftbox", lambda c: claim_giftbox(c, pending),
+             "%d gift(s): %s" % (len(pending), names))]
 
 
 def survey_sevendays(cookie):
@@ -175,11 +188,7 @@ def survey_missions(cookie):
     return jobs
 
 
-def survey_attendance_package(cookie):
-    """The free 'Daily Free Item' package - the client fetches it with a GET that grants."""
-    result = _get(cookie, "/home")
-    if not result:
-        return []
+def _attendance_jobs(result):
     jobs = []
     for pack in result.get("attendancePackageList", []) or []:
         if pack.get("received") or pack.get("receiveReward"):
@@ -192,6 +201,18 @@ def survey_attendance_package(cookie):
                      ("GET", "/package/attendance?playerSeq=%s&packSeq=%s" % (player_seq, pack_seq)),
                      "attendance package seq=%s" % pack_seq))
     return jobs
+
+
+def survey_attendance_package(cookie, home=None):
+    """The free 'Daily Free Item' package - the client fetches it with a GET that grants.
+
+    `home` lets a caller that already fetched /home hand it over instead of paying for
+    the same payload again (see check_session).
+    """
+    result = home if home is not None else _get(cookie, "/home")
+    if not result:
+        return []
+    return _attendance_jobs(result)
 
 
 def survey_pass(cookie):
@@ -253,19 +274,26 @@ SOURCES = [
     ("attendance package", survey_attendance_package),
     ("rangers pass", survey_pass),
 ]
+# ตัวที่ต้องถามใหม่ทุกรอบมีแค่กล่องของขวัญ ระบบที่เหลือจ่ายของ *เข้า* กล่อง ไม่ได้จ่าย
+# เข้าหากัน การสำรวจครบเจ็ดแหล่งในรอบสองจึงเป็นการถามคำถามที่รู้คำตอบแล้วหกครั้ง
+REFRESH_SOURCES = [("gift box", survey_giftbox)]
 
 
-def survey(cookie):
+def survey(cookie, home=None, sources=None):
     """Collect claim jobs from every source.
 
     The collectors are independent read-only GETs, so they run concurrently: run
     back to back they cost the SUM of every round trip (~4.2s measured, with the
-    popup call alone ~1.5s), in parallel only the slowest one. Results are printed
-    in SOURCES order no matter which thread finished first, so output stays stable.
+    popup call alone ~1.5s), in parallel only the slowest one.
     """
-    with ThreadPoolExecutor(max_workers=len(SOURCES)) as pool:
-        pending = [(label, pool.submit(collect, cookie)) for label, collect in SOURCES]
-        # resolve inside the `with` so a raising collector cannot leak a live thread
+    sources = SOURCES if sources is None else sources
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        pending = []
+        for label, collect in sources:
+            if collect is survey_attendance_package:
+                pending.append((label, pool.submit(collect, cookie, home)))
+            else:
+                pending.append((label, pool.submit(collect, cookie)))
         results = []
         for label, future in pending:
             try:
@@ -283,17 +311,19 @@ def survey(cookie):
     return jobs
 
 
-def claim_all(cookie, confirm=True, passes=3):
+def claim_all(cookie, confirm=True, passes=2, home=None):
     """Sweep every reward source and claim what is claimable. Returns how many were taken.
 
-    Most systems pay out INTO the gift box rather than straight into the bag, so one
-    pass leaves the goods sitting there unclaimed. Keep sweeping until a pass finds
-    nothing new - bounded, so a permanently-failing item cannot spin forever.
+    Pass 1 surveys everything. Later passes re-check only the gift box, because that is
+    the one place the other systems deposit into - nothing else can have gained an item
+    as a result of pass 1. Three full passes used to cost 21 GETs per account to find,
+    almost always, nothing.
     """
     total = 0
     for attempt in range(1, passes + 1):
+        sources = SOURCES if attempt == 1 else REFRESH_SOURCES
         print("surveying reward sources (pass %d):" % attempt)
-        jobs = survey(cookie)
+        jobs = survey(cookie, home=home if attempt == 1 else None, sources=sources)
         if not jobs:
             print("\nnothing left to claim" if attempt > 1 else "\nnothing to claim right now")
             break
