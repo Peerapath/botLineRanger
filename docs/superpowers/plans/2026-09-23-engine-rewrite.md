@@ -1035,7 +1035,7 @@ git commit -m "feat(api): the proxy a call goes out on is the thread's, not the 
   ```python
   def check_session(cookie, home=None) -> dict          # home ที่ดึงมาแล้ว = ไม่ยิงซ้ำ
   def survey(cookie, home=None) -> list
-  def claim_all(cookie, confirm=True, passes=2, home=None) -> int
+  def claim_all(cookie, confirm=True, passes=3, home=None) -> int
   ```
 
 **ที่มาของตัวเลข** (นับจากโค้ดปัจจุบัน):
@@ -1264,7 +1264,7 @@ def survey(cookie, home=None, sources=None):
     return jobs
 
 
-def claim_all(cookie, confirm=True, passes=2, home=None):
+def claim_all(cookie, confirm=True, passes=3, home=None):
     """Sweep every reward source and claim what is claimable. Returns how many were taken.
 
     Pass 1 surveys everything. Later passes re-check only the gift box, because that is
@@ -1614,7 +1614,7 @@ class Lane:
     def note_fail(self): return False
 
 
-CFG = {"gacharanger": False, "rewardpasses": 2, "gachacycles": 1}
+CFG = {"gacharanger": False, "rewardpasses": 3, "gachacycles": 1}
 
 
 def make(tmp_path, name="a.xml"):
@@ -1845,7 +1845,7 @@ def _fetch_home(s: AccountSession) -> None:
 
 def _claim_rewards(s: AccountSession, cfg: dict) -> None:
     rewards.claim_all(s.cookie, confirm=True,
-                      passes=int(cfg.get("rewardpasses") or 2), home=s.home)
+                      passes=int(cfg.get("rewardpasses") or 3), home=s.home)
 
 
 def _gacha(s: AccountSession, cfg: dict) -> None:
@@ -2743,7 +2743,7 @@ git commit -m "feat(engine): one process, one thread per in-flight account, JSON
 เพิ่มใต้ `apiproxies =` ในหมวด `[settings]`:
 
 ```ini
-rewardpasses = 2
+rewardpasses = 3
 threadsperproxy = 96
 maxthreads = 4096
 ```
