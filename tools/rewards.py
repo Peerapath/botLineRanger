@@ -97,13 +97,18 @@ def claim_giftbox(cookie, pending=None):
     `pending` is the list survey_giftbox already fetched. Without it this function
     listed the box twice more per call - once to find the leftovers and once to
     confirm - on top of the listing the survey had just done.
+
+    Success requires the bulk call to have worked AND every leftover this call
+    attempted to be accepted - a single failed leftover must not hide behind an
+    earlier success, because a pass that is not followed by another survey has no
+    other way to notice a box that is still not empty.
     """
     status, _data = call(cookie, "/giftbox/gift/receive/all", "POST")
     done = status == 200
     leftovers = _pending_gifts(cookie) if pending is None else pending
     for gift_entry in leftovers:
         sub, _ = call(cookie, "/giftbox/gift/receive/%s" % gift_entry.get("giftSn"), "POST")
-        done = done or sub == 200
+        done = done and sub == 200
     return done
 
 
@@ -311,13 +316,18 @@ def survey(cookie, home=None, sources=None):
     return jobs
 
 
-def claim_all(cookie, confirm=True, passes=2, home=None):
+def claim_all(cookie, confirm=True, passes=3, home=None):
     """Sweep every reward source and claim what is claimable. Returns how many were taken.
 
-    Pass 1 surveys everything. Later passes re-check only the gift box, because that is
-    the one place the other systems deposit into - nothing else can have gained an item
-    as a result of pass 1. Three full passes used to cost 21 GETs per account to find,
-    almost always, nothing.
+    Pass 1 surveys everything. Later passes re-check only the gift box: the other six
+    systems pay INTO the gift box, never into each other, so none of them can hold
+    anything new as a result of pass 1 - narrowing THEM to skip is free. That argument
+    says nothing about the gift box itself, though: claim_giftbox mops up MINI_GACHA
+    boxes that receive/all skips, and whether claiming one can drop a further gift back
+    into the box is not established anywhere in this codebase. Three passes - not two -
+    give that possible second hop somewhere to be caught; two would drop it silently.
+    The extra pass costs one GET /giftbox/list in the common case where there was
+    nothing left, since an empty survey breaks before issuing any claim.
     """
     total = 0
     for attempt in range(1, passes + 1):
