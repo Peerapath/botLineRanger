@@ -19,6 +19,8 @@ from engine.queue import WorkQueue            # noqa: E402
 from engine.report import Reporter            # noqa: E402
 
 import ratelimit    # noqa: E402
+import rangers_api  # noqa: E402
+import relogin      # noqa: E402
 
 BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby")
 INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthreads",
@@ -125,6 +127,46 @@ def load_config(path, rangers_path=None, mode=None):
     return cfg
 
 
+def attach_cc_pools(lanes) -> None:
+    """Change 2 (Round 2): give each proxy lane its own relogin.CcPool, minted (or read
+    back from LGRGS_CC_FILE) once here - before any worker thread starts - instead of
+    once per _relogin() call.
+
+    bot/engine/flows.py's _relogin() already reads getattr(s.lane, "cc_pool", None) and
+    only falls back to a private, per-call CcPool() when that is absent - nothing before
+    this function ever set lane.cc_pool, so that fallback was the only path ever taken.
+    Measured effect: with LGRGS_CC_FILE unset (what `python bot/engine_main.py
+    ranger_api_Login` does from a shell, with no GUI to pre-mint one first), four accounts
+    caused four real guest mints - one per account - against a 2-per-lane-per-minute
+    quota, instead of at most one per LANE.
+
+    Must run sequentially, one lane at a time, on THIS thread, before pool.run() spawns
+    any worker thread: relogin.CcPool's mint call goes through tools/new_account.py's
+    _do(), which routes by rangers_api.current_lane() - a THREAD-LOCAL
+    (tools/rangers_api.py:72; that module's own comment: "lane บอกว่าออก IP ไหน... ถ้าเก็บ
+    ระดับโมดูล เธรดจะได้ socket ของ IP หนึ่งแต่ไปหักงบของอีก IP"). Binding each lane here
+    before handing it its pool means that lane's mint (if any) actually goes out THAT
+    lane's own proxy and spends from THAT lane's own auth_quota, instead of every one of
+    them silently sharing the no-lane CLI fallback (main() runs on this thread, and
+    nothing has bound it to any lane yet). Each worker thread rebinds its own thread-local
+    lane the instant it starts (bot/engine/pool.py's _worker calls use_lane() first thing),
+    so nothing this loop does here leaks into them.
+
+    share_file mirrors flows._relogin's own per-call fallback exactly (same env var, same
+    "" or unset -> None): bot/main.py's _prepare_shared_cc() pre-mints ONE cc into
+    LGRGS_CC_FILE before spawning the engine for Login/Level3/Stage, and every lane's
+    CcPool.__init__ will read that single fresh value back rather than minting again (see
+    relogin.CcPool._load_shared) - so the GUI path still costs zero mints, for any number
+    of lanes, exactly as already measured. Only a bare shell run (no env var) pays one
+    mint per lane - never sharing the file there would instead mint independently on every
+    renew too, which is not wrong, but it would throw away the zero-mint GUI behaviour for
+    no reason this task asked for.
+    """
+    for lane in lanes:
+        rangers_api.use_lane(lane)
+        lane.cc_pool = relogin.CcPool(share_file=os.environ.get("LGRGS_CC_FILE") or None)
+
+
 def main(argv):
     # stdout เป็นช่องรายงาน JSONL ข้อความไทยต้องไม่ตายที่ cp1252
     try:
@@ -167,6 +209,9 @@ def main(argv):
 
     proxies = ratelimit.parse_proxies(cfg.get("apiproxies", ""))
     pool = EnginePool(mode, cfg, queue, proxies, reporter)
+    # Change 2 (Round 2): one relogin.CcPool per lane, built now - before any worker
+    # thread exists - not once per _relogin() call. See attach_cc_pools' own docstring.
+    attach_cc_pools(pool.pool.lanes)
 
     stop_flag = os.path.join(root, "src", "log", STOP_FLAG)
     if os.path.exists(stop_flag):
