@@ -66,13 +66,27 @@ if !CHECK_RESULT! equ 0 (
     )
 )
 
-echo [3/8] Scanning and excluding unused modules...
-python find_unused_modules.py
+REM The "scan for unused modules" step that used to sit here is gone, along with
+REM find_unused_modules.py, exclude_modules.txt and safe_modules.txt.
+REM
+REM It never worked. The script collected every module name imported ANYWHERE under bot/,
+REM subtracted the stdlib and a hand-written whitelist, and wrote what was left out as
+REM "modules to exclude" - so anything genuinely used but not on the whitelist was listed
+REM for deletion. Its last run put engine, engine_main, new_account, gacha, cryptography
+REM and protection in there: the engine itself, the API layer, and the licence check.
+REM
+REM Nothing was ever harmed because the loop below it read the file into EXCLUDE_ARGS and
+REM then never passed it to pyinstaller. That made it a loaded gun rather than a wound -
+REM the next person to notice an unused variable and "fix" it would have cut the engine
+REM out of its own build.
+REM
+REM Real exclusions live in BotLineRanger.spec's own excludes=[] list, written by hand and
+REM reviewed: cv2, numpy, pytesseract, uiautomator2, adbutils, ppadb.
 
 REM ===============================
 REM PyArmor Obfuscation
 REM ===============================
-echo [3.5/9] Obfuscating source code with PyArmor...
+echo [3/8] Obfuscating source code with PyArmor...
 
 REM ลบ output เก่าของ PyArmor
 if exist dist_pyarmor rmdir /s /q dist_pyarmor
@@ -112,13 +126,7 @@ if %errorlevel% neq 0 (
 echo    - PyArmor obfuscation complete
 echo    - Obfuscated files in dist_pyarmor\
 
-REM โหลด exclude_modules.txt
-set EXCLUDE_ARGS=
-for /f "usebackq delims=" %%m in ("exclude_modules.txt") do (
-    set EXCLUDE_ARGS=!EXCLUDE_ARGS! --exclude-module %%m
-)
-
-echo [4/9] Building main executable with enhanced security...
+echo [4/8] Building main executable with enhanced security...
 echo    - Source: PyArmor obfuscated files (dist_pyarmor\)
 echo    - Optimization level: 0 (pyarmor runtime compatibility)
 echo    - Symbol stripping: DISABLED (Windows compatibility)
@@ -145,7 +153,7 @@ if %errorlevel% neq 0 (
 REM ===============================
 REM Build updater with spec file
 REM ===============================
-echo [5/9] Building updater executable...
+echo [5/8] Building updater executable...
 pyinstaller ^
  --clean ^
  --noconfirm ^
@@ -157,7 +165,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [6/9] Organizing build output...
+echo [6/8] Organizing build output...
 
 REM onedir: PyInstaller วาง dist\BotLineRanger\ ให้ครบแล้ว ไม่ต้องย้าย exe เอง
 if exist "dist\updater.exe" (
@@ -198,7 +206,7 @@ if exist "dist\BotLineRanger\src\log" del /Q "dist\BotLineRanger\src\log\*" 2>nu
 REM ====================================
 REM Security: Reset sensitive config
 REM ====================================
-echo [7/9] Applying security configurations...
+echo [7/8] Applying security configurations...
 set "CONFIG_FILE=dist\BotLineRanger\src\config.ini"
 
 if exist "%CONFIG_FILE%" (
@@ -219,7 +227,7 @@ del /Q "dist\BotLineRanger\*.spec" 2>nul
 REM ====================================
 REM Step 8: Create ZIP archives
 REM ====================================
-echo [8/9] Creating ZIP archives...
+echo [8/8] Creating ZIP archives...
 
 REM VERSION is already set at the pre-build step
 echo    - Version: %VERSION%
