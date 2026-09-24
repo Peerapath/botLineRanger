@@ -108,7 +108,7 @@ REM top-level module - see that file's own comment on the hiddenimports entries.
 REM
 REM Deliberately NOT here: device_snapshot, export_account, extract_battles, gifts,
 REM newbie_quest, ratelimit_probe, sevendays, summarize. grep confirms nothing in bot/, and
-REM nothing in the 11 modules above, imports any of them - they are CLI-only and must not
+REM nothing in the 12 modules above, imports any of them - they are CLI-only and must not
 REM ship at all, obfuscated or not (extract_battles also imports mitmproxy, not installed
 REM in this build environment, so including it would break this very step).
 pyarmor gen --output dist_pyarmor ^
