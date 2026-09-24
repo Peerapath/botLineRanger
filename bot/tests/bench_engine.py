@@ -33,6 +33,28 @@ Defender real-time scanning as the leading suspect, unconfirmed (a read-only
 Get-MpComputerStatus check hung and never returned output). Re-measure this bench on the
 actual deployment host before sizing a 50-proxy plan on the strength of the ~27-29
 crossover computed above.
+
+Correction (final whole-branch review, I3, re-verified 2026-09-24): the "Windows itself"
+diagnosis above was wrong, and the fix is three lines, not a redesign. The actual cause was
+bot/engine/queue.py's own lock discipline: claim() (input/ -> execute/) held self._lock for
+its rename, but _close() (execute/ -> output/backup/login failed) did not - two directions
+of UNSYNCHRONIZED concurrent renames landing on the SAME execute/ directory (every claim()
+writes into it, every _close() reads out of it), fighting each other for that directory's
+metadata lock rather than "os.replace() itself" being slow. Moving _close()'s rename under
+the same lock claim() already uses fixed it. Re-measured independently with this same
+script (2000 accounts, 256 threads), same correctness at every point (done=2000, 2000 files
+in output/, 0 stuck):
+
+  as shipped (lock outside _close):              ~150-210 accounts/s
+  _close() rename under the same lock (the fix):  ~1,680-1,750 accounts/s
+  fake queue touching no files (same LATENCY):    ~4,760 accounts/s
+
+(The review's own run measured 147.5 / 1,193 / 1,236 respectively - the exact numbers are
+machine-specific per the caveat above, but the ~10x effect of the lock fix and "fixed
+nearly reaches the no-file-I/O ceiling" shape reproduce on a different run of the same
+machine.) At the 5.6 accounts/s/proxy target this moves the crossover from ~27-29 proxies
+to roughly 210-310, well outside the 5-to-50 this design is sized for - no architecture
+change is needed.
 """
 import io
 import os

@@ -354,6 +354,33 @@ def test_recover_returns_a_claim_from_a_subfolder_to_the_same_subfolder(tmp_path
 # The old bot appended _2.._999 instead of overwriting, with a comment naming this exact
 # case (af264b0:bot/botLineRanger.py:3073-3081, :3136-3144).
 
+# --- I3 (final review): claim()'s rename runs INSIDE self._lock but _close()'s used to run
+# OUTSIDE it - two directions of unsynchronized concurrent renames landing on the SAME
+# execute/ directory (every claim() writes into it, every _close() reads out of it),
+# measured at 147.5 accounts/s on this machine against 1,193 accounts/s with _close()'s
+# rename moved under the same lock (see bot/tests/bench_engine.py). Proven here
+# deterministically, no timing and no threads needed: threading.Lock is non-reentrant, so a
+# second acquire from the SAME thread while a rename is in flight only succeeds if that
+# rename is running without the lock held.
+
+def test_finish_holds_the_queue_lock_for_its_rename_not_just_the_journal_write(tmp_path, monkeypatch):
+    q = build(tmp_path, ["a.xml"])
+    src = q.claim()
+    real_replace = os.replace
+    observed = {"held": None}
+
+    def spy_replace(s, d):
+        got = q._lock.acquire(blocking=False)   # succeeds only if nobody holds it right now
+        observed["held"] = not got
+        if got:
+            q._lock.release()
+        return real_replace(s, d)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    q.finish(src, "output")
+    assert observed["held"] is True
+
+
 def test_finish_numbers_a_colliding_export_name_instead_of_overwriting_it(tmp_path):
     q = build(tmp_path, ["a.xml", "b.xml"])
     src_a = q.claim()

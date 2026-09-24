@@ -364,6 +364,34 @@ startBot{Login,Level3,GenID,Stage}_API_headless
    ก่อนจะสรุปว่าต้องเปลี่ยนสถาปัตยกรรม ถ้าเพดานยังอยู่ ทางออกคือเลิกย้ายไฟล์ระหว่างโฟลเดอร์
    (เขียนสถานะลง journal อย่างเดียว แล้วย้ายไฟล์เป็นชุดตอนจบ) ซึ่งเกินขอบเขตรอบนี้
 
+   > **Correction (final whole-branch review, I3, re-verified 2026-09-24):** the diagnosis
+   > above is wrong. The ceiling was never Windows' rename throughput. The real cause was
+   > `bot/engine/queue.py`'s own lock discipline: `claim()` (input/ -> execute/) held
+   > `self._lock` for its rename, but `_close()` (execute/ -> output/backup/login failed)
+   > did not - two directions of UNSYNCHRONIZED concurrent renames landing on the SAME
+   > execute/ directory (every claim() writes into it, every _close() reads out of it),
+   > fighting each other for that directory's metadata lock. Fix: move _close()'s rename
+   > under the same lock claim() already uses (three lines, no redesign).
+   >
+   > Re-verified independently, same bench_engine.py, same 2000 accounts / 256 threads,
+   > same correctness (`done=2000`, 2000 files in `output/`, 0 stuck) at every point:
+   >
+   > | | accounts/s |
+   > |---|---|
+   > | as shipped (lock outside `_close`) | ~150-210 |
+   > | `_close()` rename under the same lock | ~1,680-1,750 |
+   > | fake queue touching no files (same fake network latency) | ~4,760 |
+   >
+   > (The review's own run measured 147.5 / 1,193 / 1,236 - the exact numbers are
+   > machine-specific, as this item's own caveat already warned, but the ~10x effect of the
+   > lock fix and "fixed almost reaches the no-file-I/O ceiling" shape reproduce on a
+   > different run of the same machine.) At the target 5.6 accounts/s/IP this moves the
+   > proxy count where the queue's own renames become the binding constraint from ~27-29
+   > (the wrong number above) to roughly 210-310 depending on whose run is used - well
+   > outside the 5-50 proxies this design is sized for. **No architecture change is
+   > needed**; the "stop moving files between folders" redesign this item originally
+   > prescribed is not required.
+
 
 ## 15. ข้อสมมติที่ตัดสินใจเอง
 

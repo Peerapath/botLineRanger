@@ -256,38 +256,55 @@ class WorkQueue:
         rel_dir = os.path.relpath(os.path.dirname(src), execute_dir)
         sub_dir = "" if rel_dir in (".", "") else rel_dir
         out_dir = os.path.join(self.root, dest, sub_dir) if sub_dir else os.path.join(self.root, dest)
-        os.makedirs(out_dir, exist_ok=True)
 
-        # Finding 1a (review round 1): this is finish()/fail()'s only move, called once per
-        # account - 44,000 times over a full run - and it used to be a bare os.replace(),
-        # the one rename in this file that skipped the retry claim() and recover() already
-        # get. Same Windows transient-handle case as those two (constraint #13): without
-        # the retry, the commonest kind of momentary block (AV scan, indexer, another
-        # thread mid-read) looked identical to a permanent failure.
-        if new_name:
-            # C3: a computed export name can collide across two DIFFERENT source files (see
-            # _rename_no_overwrite_with_retry's own docstring) - number instead of
-            # overwriting. The original-name path below (fail(), which never renames) can't
-            # collide this way: two claims can never share one input/ path, and C1 already
-            # keeps their subfolders apart, so it keeps plain overwrite-tolerant semantics,
-            # matching the old bot's unconditional shutil.move() on that same path.
-            out = _rename_no_overwrite_with_retry(src, out_dir, new_name + ".xml")
-            moved_ok = out is not None
-        else:
-            out = os.path.join(out_dir, name)
-            moved_ok = _replace_with_retry(src, out)
-        if not moved_ok:
-            # Both helpers above return/signal False-equivalent only on FileNotFoundError.
-            # claim() and recover() can shrug that off and move on to the next file in their
-            # own loop - there is no "next file" here: src was this account's alone from
-            # claim() to this call, so it vanishing is not a race to skip quietly, it means
-            # the move already failed. Raise instead of writing a "done"/"fail" journal line
-            # for an `out` path that was never created - EnginePool._run_one already treats
-            # any OSError out of finish()/fail() as a failed move, never a silent success.
-            raise FileNotFoundError(
-                "cannot move %r into %r/: source vanished before the move completed"
-                % (name, dest))
+        # I3 (final review): this rename used to run OUTSIDE self._lock while claim()'s own
+        # rename (input/ -> execute/, above) runs INSIDE it - two directions of
+        # unsynchronized concurrent renames landing on the SAME execute/ directory (every
+        # claim() writes into it, every _close() reads out of it). Measured on this
+        # machine: 147.5 accounts/s as shipped (this rename outside the lock) vs 1,193
+        # accounts/s with it moved under the same lock claim() already uses, against a
+        # 1,236 accounts/s ceiling for a fake queue that touches no files at all - i.e. the
+        # unsynchronized renames were fighting each other for the SAME directory's metadata
+        # lock, not "moving files" itself being slow (see bot/tests/bench_engine.py and
+        # docs/superpowers/specs/2026-09-23-engine-rewrite-design.md limit 6, both updated
+        # alongside this fix). The move is microseconds against the ~13s per account spent
+        # waiting on the network (this file's own opening docstring) - constraint #13's
+        # retry budget on a transient failure is capped at ~0.25s worst case, negligible
+        # even serialized behind one lock with thousands of threads sharing it.
         with self._lock:
+            os.makedirs(out_dir, exist_ok=True)
+            # Finding 1a (review round 1): this is finish()/fail()'s only move, called once
+            # per account - 44,000 times over a full run - and it used to be a bare
+            # os.replace(), the one rename in this file that skipped the retry claim() and
+            # recover() already get. Same Windows transient-handle case as those two
+            # (constraint #13): without the retry, the commonest kind of momentary block
+            # (AV scan, indexer, another thread mid-read) looked identical to a permanent
+            # failure.
+            if new_name:
+                # C3: a computed export name can collide across two DIFFERENT source files
+                # (see _rename_no_overwrite_with_retry's own docstring) - number instead of
+                # overwriting. The original-name path below (fail(), which never renames)
+                # can't collide this way: two claims can never share one input/ path, and
+                # C1 already keeps their subfolders apart, so it keeps plain
+                # overwrite-tolerant semantics, matching the old bot's unconditional
+                # shutil.move() on that same path.
+                out = _rename_no_overwrite_with_retry(src, out_dir, new_name + ".xml")
+                moved_ok = out is not None
+            else:
+                out = os.path.join(out_dir, name)
+                moved_ok = _replace_with_retry(src, out)
+            if not moved_ok:
+                # Both helpers above return/signal False-equivalent only on
+                # FileNotFoundError. claim() and recover() can shrug that off and move on
+                # to the next file in their own loop - there is no "next file" here: src
+                # was this account's alone from claim() to this call, so it vanishing is
+                # not a race to skip quietly, it means the move already failed. Raise
+                # instead of writing a "done"/"fail" journal line for an `out` path that
+                # was never created - EnginePool._run_one already treats any OSError out of
+                # finish()/fail() as a failed move, never a silent success.
+                raise FileNotFoundError(
+                    "cannot move %r into %r/: source vanished before the move completed"
+                    % (name, dest))
             self._write(f=name, dest=dest, **extra)
         return out
 
