@@ -343,6 +343,12 @@ class EmulatorManager(ctk.CTk):
         self._engine_last_stat = {}         # most recent "stat" row, for _updateEngineStats
         self._engine_lanes = {}             # lane name -> latest "lane" row
         self._engine_session_rows = []      # capped history of finished accounts ("acct" rows)
+        # Set when _read_engine dies from anything other than a bad JSON line (Finding 3 in
+        # the round-1 review) - reader death is _drain_engine_rows's only proof the engine
+        # process itself is gone, so a reader that crashes while the process is still alive
+        # must not be read as "done", or a second engine could be started over the same
+        # input/execute folders. Cleared once that run is confirmed truly over.
+        self._engine_reader_crashed = None
 
         # Config
         self.config = configparser.ConfigParser()
@@ -983,21 +989,35 @@ class EmulatorManager(ctk.CTk):
         elif choice == "🖼 Screen":
             self.open_screen_file(dev)
 
-    def stop_bot_processes(self):
+    def stop_bot_processes(self, force):
+        """Stops both process families this GUI can be running.
+
+        self.bot_processes (multiprocessing.Process, one per ADB device - the older
+        per-emulator flow) is always terminated immediately: each entry there is one
+        independent account, same as it always was, so killing one only ever loses that
+        one account, never a whole batch. That property is exactly why this task leaves
+        this half alone (see global-constraints: ADB removal is Task 11's job).
+
+        self.worker_procs now holds a single engine subprocess covering an entire run
+        instead (Task 10) - hard-killing it the way this method used to discards every
+        in-flight account in the whole batch, plus the final stat(final=True) summary
+        that reports them (a sibling project once under-reported a run by 1,427 accounts
+        this exact way - see _drain_worker_procs's docstring). `force` has no default on
+        purpose: every caller must say which it means, at that call site, rather than
+        this function guessing on their behalf - see each call site's own comment for
+        which it chose and why.
+        """
         for dev, p in list(self.bot_processes.items()):
             if p.is_alive():
                 p.terminate()
                 p.join(timeout=2)
         self.bot_processes.clear()
-        # หยุด Login workers (subprocess.Popen) ด้วย
-        for dev, p in list(getattr(self, "worker_procs", {}).items()):
-            try:
-                if p.poll() is None:
-                    p.terminate()
-            except Exception:
-                pass
-        if hasattr(self, "worker_procs"):
-            self.worker_procs.clear()
+        if not hasattr(self, "worker_procs"):
+            return
+        if force:
+            self._force_worker_procs()
+        else:
+            self._drain_worker_procs(silent=True)
 
     def _handle_kicked(self, payload):
         """
@@ -1010,7 +1030,11 @@ class EmulatorManager(ctk.CTk):
         print(f"{datetime.now().strftime('%H:%M:%S')} ⛔ Kicked by new login: {payload}")
         _stop_sse_listener()
         try:
-            self.stop_bot_processes()
+            # Drain, not force: self.on_close() below is the guaranteed hard-stop backstop
+            # (it always forces - see its own call site), and kill_server_adb() plus the
+            # blocking messagebox.showwarning() further down give the engine real wall-clock
+            # time to finish in-flight accounts first, for free, before that backstop runs.
+            self.stop_bot_processes(force=False)
         except Exception:
             pass
         try:
@@ -1036,7 +1060,12 @@ class EmulatorManager(ctk.CTk):
         # Checkout เพื่อปลดล็อค device_id
         self.checkout_subscription()
 
-        self.stop_bot_processes()
+        # Force: self.destroy()/sys.exit(0) below run synchronously right after this - a
+        # background grace-then-terminate thread started here would be killed along with
+        # the whole process before it ever got to wait or fall back to terminate(),
+        # silently orphaning the engine with nobody left to eventually stop it if it
+        # never exits on its own. The window also has to close now; the user asked for that.
+        self.stop_bot_processes(force=True)
 
         # ลบโฟลเดอร์ย่อยที่ว่างเปล่า
         for folder in ["input", "output", "execute", "backup"]:
@@ -1121,7 +1150,12 @@ class EmulatorManager(ctk.CTk):
             print("✅ Logout สำเร็จ - กำลังปิดโปรแกรม...")
 
             # 4. หยุด bot processes
-            self.stop_bot_processes()
+            # Force: unlike on_close(), nothing after this point calls stop_bot_processes()
+            # again as a backstop - this function runs straight through to os._exit(0),
+            # which is an even harder cutoff than sys.exit(0) (no cleanup/finally at all).
+            # A drain here could leave the engine orphaned mid-run with nothing left to
+            # ever terminate it if it hangs, the instant os._exit(0) fires.
+            self.stop_bot_processes(force=True)
 
             # 5. แสดงข้อความและปิดโปรแกรม
             messagebox.showinfo("Logout สำเร็จ", "คุณได้ทำการ Logout เรียบร้อยแล้ว\nโปรแกรมจะปิด")
@@ -1494,7 +1528,11 @@ class EmulatorManager(ctk.CTk):
             print(f"Failed to open {path}: {e}")
 
     def start_adb(self):
-        self.stop_bot_processes()
+        # Drain: this does not close the app or the window - it only switches the left
+        # panel over to an ADB device scan, running in its own background thread right
+        # below. There is no imminent process exit here, so the full 90s grace protection
+        # applies exactly as it would for a manual Stop click.
+        self.stop_bot_processes(force=False)
         for widget in self.left_frame.winfo_children():
             widget.destroy()
         loading_frame = ctk.CTkFrame(self.left_frame, fg_color="#303030")
@@ -1788,10 +1826,20 @@ class EmulatorManager(ctk.CTk):
             except Exception:
                 pass
         self._engine_err = open(err_path, "w", encoding="utf-8")
-        return subprocess.Popen(
-            args, cwd=botdir, creationflags=no_window, env=self._worker_env(),
-            stdout=subprocess.PIPE, stderr=self._engine_err,
-            text=True, encoding="utf-8", errors="replace", bufsize=1)
+        try:
+            return subprocess.Popen(
+                args, cwd=botdir, creationflags=no_window, env=self._worker_env(),
+                stdout=subprocess.PIPE, stderr=self._engine_err,
+                text=True, encoding="utf-8", errors="replace", bufsize=1)
+        except Exception:
+            # Popen (or _worker_env(), evaluated as one of its own arguments) can raise
+            # AFTER engine.err has already been opened and truncated just above - without
+            # this, that handle stays open and an empty engine.err sits on disk with
+            # nothing left to ever close it, until some unrelated LATER spawn attempt
+            # happens to close it as a side effect of its own "close the previous handle"
+            # step above.
+            self._engine_err.close()
+            raise
 
     def log(self, msg):
         """Bridges engine notes into this build's only "log" - the console - reusing
@@ -1805,17 +1853,29 @@ class EmulatorManager(ctk.CTk):
 
         วาดทุกบรรทัดคือการวาดหลายร้อยครั้งต่อวินาทีตอนฝูงเต็มกำลัง แผงคุมจะช้าลง
         เรื่อย ๆ ตลอดเวลาที่บอทรัน
+
+        The outer try/except is the fix for Finding 3 in the round-1 review: this used to
+        catch only json.loads's ValueError, so any OTHER exception (a bad pipe read, a
+        lock failure, anything) killed this thread silently. _drain_engine_rows's only
+        proof the engine process itself has exited is this thread dying - so a crash here
+        (not a real EOF) used to be indistinguishable from a genuine finish, and could let
+        _start_workers spawn a SECOND engine over the same input/execute folders while the
+        first one is still alive. Recording the exception here, instead of just vanishing,
+        is what lets _drain_engine_rows tell the two apart (see its own docstring).
         """
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            with self._engine_lock:
-                self._engine_rows.append(row)
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                with self._engine_lock:
+                    self._engine_rows.append(row)
+        except Exception as exc:
+            self._engine_reader_crashed = exc
 
     def _dispatch_engine_row(self, row):
         """One JSONL row -> the GUI state it updates. Called only from _drain_engine_rows,
@@ -1863,6 +1923,31 @@ class EmulatorManager(ctk.CTk):
         if reader is not None and reader.is_alive():
             self._worker_monitor_job = self.after(1000, self._drain_engine_rows)
             return
+
+        # Finding 3 in the round-1 review: the reader thread dying is not, by itself,
+        # proof the engine process is gone - _read_engine can also die from an unrelated
+        # exception (see its own docstring) while the OS process is still very much
+        # alive. proc.poll() is an independent, OS-level source of truth checked here
+        # before anything is treated as finished - trusting the reader's death alone
+        # would let _start_workers spawn a SECOND engine over the same input/execute
+        # folders the still-running one already owns.
+        proc = self.worker_procs.get("engine")
+        if proc is not None and proc.poll() is None:
+            if self._engine_reader_crashed is None:
+                # Logged only on the first tick this is noticed - otherwise this would
+                # repeat every second for as long as the orphaned process keeps running.
+                self._engine_reader_crashed = True
+                self.log("engine output reader stopped unexpectedly while the engine "
+                          "process is still running - progress will no longer update for "
+                          "this run, and a new run is refused until this one actually exits")
+            # worker_procs["engine"] is deliberately left in place - _start_workers's own
+            # "is an engine already alive" guard is what refuses a second Start while this
+            # keeps polling. Rescheduling (instead of giving up here) means the block lifts
+            # on its own once the process genuinely exits, rather than needing an app
+            # restart to recover from what might just be a one-off reader glitch.
+            self._worker_monitor_job = self.after(1000, self._drain_engine_rows)
+            return
+        self._engine_reader_crashed = None   # that run is over now - a new Start is safe again
 
         # Reader thread is confirmed dead (proc.stdout hit EOF) - one last drain for
         # anything appended between the copy above and this check, then stop for good.
@@ -1942,7 +2027,17 @@ class EmulatorManager(ctk.CTk):
         try:
             proc = self._spawn_engine(mode_key)
         except Exception as e:
-            print(f"spawn engine failed: {e}", flush=True)
+            # A bare print() here is invisible in the shipped build: BotLineRanger.spec
+            # sets console=False, so there is no console for it to reach at all - this is
+            # the exact class of bug run_bot's own docstring above already calls out for a
+            # different, also console-less path. self.log() at least reaches the console
+            # build; messagebox guarantees the windowed build's user sees it too, on the
+            # one path they hit just by clicking Start into a broken install.
+            self.log("spawn engine failed: %s" % e)
+            messagebox.showerror(
+                "Engine failed to start",
+                "Could not start the engine process:\n%s\n\n"
+                "Check bot/src/log/engine.err for details." % e)
             return
         self.worker_procs["engine"] = proc
         self._engine_reader_thread = threading.Thread(
@@ -1952,6 +2047,91 @@ class EmulatorManager(ctk.CTk):
         if getattr(self, "_worker_monitor_job", None) is None:
             self._worker_monitor_job = self.after(1000, self._drain_engine_rows)
 
+    def _drain_worker_procs(self, silent=True, grace_seconds=90):
+        """Ask every still-alive engine process to wind down, then fall back to a hard
+        terminate() only if it ignores that for too long (Finding 1 in the round-1
+        review). This is the one place stop.flag gets written and the grace-then-force
+        sequence gets spawned - both the Stop button (_stop_workers) and every
+        drain-choosing call of stop_bot_processes(force=False) share it, so this and
+        Finding 4 (tell the truth about the flag write, right below) only have to be got
+        right once instead of twice.
+
+        Non-blocking by design: the wait + fallback terminate() always run on a background
+        daemon thread, never on the caller's thread - for the Stop button that is the Tk
+        main thread, and proc.wait(timeout=90) called there would freeze the whole window
+        for up to a minute and a half. _drain_engine_rows - already running on its own
+        self.after(1000, ...) timer for as long as an engine is alive - notices proc.poll()
+        go non-None by itself once the engine actually exits (drained or forced) and does
+        the worker_procs/label cleanup; this method never touches self.worker_procs itself.
+        """
+        procs = [p for p in self.worker_procs.values() if p.poll() is None]
+        if not procs:
+            return
+
+        # ขอให้ engine หยุดรับงานใหม่แล้วปล่อยให้บัญชีที่ค้างอยู่จบ - terminate() ทันที
+        # ทิ้งทั้งงานครึ่งทางและยอดสุดท้ายของมัน (เคยขาดไป 1,427 ใบในรอบ mint จริง)
+        flag = os.path.join(self._app_root(), "src", "log", "stop.flag")
+        flag_written = False
+        try:
+            os.makedirs(os.path.dirname(flag), exist_ok=True)
+            open(flag, "w").close()
+            flag_written = True
+        except OSError as err:
+            # Finding 4: a failed write here is not the same as the engine agreeing to
+            # drain. Without saying so explicitly, right now, the grace wait below looks
+            # identical to a normal graceful stop - same wait, same eventual cleanup if the
+            # engine happens to finish on its own anyway - while actually guaranteeing it
+            # cannot drain: the engine never sees any request and simply gets forced once
+            # the grace period elapses, having appeared to "wait" the whole time.
+            self.log("stop flag failed: %s - the engine will NOT be told to stop; it keeps "
+                      "running until it exits on its own or the %ds grace period elapses "
+                      "and it is forced to stop" % (err, grace_seconds))
+
+        # The grace window + fallback terminate() run on a throwaway thread, not here: for
+        # the Stop button this method runs directly on the click handler, on the GUI
+        # thread, and proc.wait(timeout=...) right here would freeze the whole window for
+        # up to a minute and a half. _drain_engine_rows notices proc.poll() go non-None by
+        # itself once the engine actually exits (drained or forced) and does the
+        # worker_procs/label cleanup; this thread's only job is the wait and, if it comes
+        # to that, the forced terminate().
+        def _grace_then_force(proc):
+            try:
+                proc.wait(timeout=grace_seconds)   # ให้เวลาระบายงานที่ค้าง
+            except subprocess.TimeoutExpired:
+                proc.terminate()                    # ไม่ยอมจบใน 90 วิถึงค่อยบังคับ
+
+        for proc in procs:
+            threading.Thread(target=_grace_then_force, args=(proc,), daemon=True,
+                              name="engine-stop-grace").start()
+
+        if silent:
+            return
+        if flag_written:
+            self.log("stop requested - waiting for in-flight accounts to finish (up to %ds)"
+                      % grace_seconds)
+        else:
+            self.log("stop NOT requested gracefully - stop flag failed to write; this run "
+                      "will be forced to stop after %ds if it has not exited by itself"
+                      % grace_seconds)
+
+    def _force_worker_procs(self):
+        """Immediate, unconditional terminate() - no stop.flag, no grace wait, and the
+        dict is cleaned up synchronously instead of being left for _drain_engine_rows to
+        notice. Reserved for call sites that are themselves about to end the whole GUI
+        process right after (on_close, logout): a background grace-then-force thread
+        started there would be killed along with the rest of the process before it ever
+        got to wait or fall back to terminate(), silently orphaning the engine with nobody
+        left to eventually stop it if it never exits on its own. See each of those call
+        sites' own comments for why they chose this over _drain_worker_procs.
+        """
+        for dev, p in list(self.worker_procs.items()):
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+        self.worker_procs.clear()
+
     def _stop_workers(self, silent=False):
         proc = self.worker_procs.get("engine")
         if proc is None or proc.poll() is not None:
@@ -1959,31 +2139,7 @@ class EmulatorManager(ctk.CTk):
             if not silent:
                 print("No running workers to stop.")
             return
-        # ขอให้ engine หยุดรับงานใหม่แล้วปล่อยให้บัญชีที่ค้างอยู่จบ - terminate() ทันที
-        # ทิ้งทั้งงานครึ่งทางและยอดสุดท้ายของมัน (เคยขาดไป 1,427 ใบในรอบ mint จริง)
-        flag = os.path.join(self._app_root(), "src", "log", "stop.flag")
-        try:
-            os.makedirs(os.path.dirname(flag), exist_ok=True)
-            open(flag, "w").close()
-        except OSError as err:
-            self.log("stop flag failed: %s" % err)
-
-        # The 90s grace window + fallback terminate() run on a throwaway thread, not here:
-        # this method runs directly on the Stop button's click handler, on the GUI thread,
-        # and proc.wait(timeout=90) right here would freeze the whole window for up to 90
-        # seconds. _drain_engine_rows - already running on its own self.after(1000, ...)
-        # timer since Start was clicked - notices proc.poll() go non-None by itself once the
-        # engine actually exits (drained or forced) and does the worker_procs/label cleanup;
-        # this thread's only job is the wait and, if it comes to that, the forced terminate().
-        def _grace_then_force():
-            try:
-                proc.wait(timeout=90)       # ให้เวลาระบายงานที่ค้าง
-            except subprocess.TimeoutExpired:
-                proc.terminate()            # ไม่ยอมจบใน 90 วิถึงค่อยบังคับ
-
-        threading.Thread(target=_grace_then_force, daemon=True, name="engine-stop-grace").start()
-        if not silent:
-            self.log("stop requested - waiting for in-flight accounts to finish (up to 90s)")
+        self._drain_worker_procs(silent=silent)
 
     def monitor_bot(self, dev, p):
         if p.is_alive():
@@ -2328,7 +2484,11 @@ class EmulatorManager(ctk.CTk):
             if data["status"] in ["auth_error", "token_expired"]:
                 print(f"🔐 Auth error in heartbeat: {data.get('message')}")
                 _session_token = None
-                self.stop_bot_processes()
+                # Drain: self.on_close() a few lines down always forces (see its own call
+                # site) and is the guaranteed backstop; kill_server_adb() and the blocking
+                # messagebox.showwarning() below give the engine real time to finish
+                # in-flight accounts first, for free, before that backstop runs.
+                self.stop_bot_processes(force=False)
                 self.kill_server_adb()
                 self.after(10000, self.on_close)
                 messagebox.showwarning("Auth Error", f"❌ {data.get('message', 'Session expired')}\n\nกรุณาเปิดโปรแกรมใหม่")
@@ -2340,7 +2500,9 @@ class EmulatorManager(ctk.CTk):
                     reset_config_email()
 
                 print(f"❌ {data.get('message', 'Unknown error')}")
-                self.stop_bot_processes()
+                # Drain: same reasoning as the auth_error/token_expired branch above -
+                # self.on_close() below always forces and is the guaranteed backstop.
+                self.stop_bot_processes(force=False)
                 self.kill_server_adb()
                 self.after(10000, self.on_close)
                 messagebox.showwarning("Verify", f"❌ {data.get('message', 'Unknown error')}")
@@ -2368,7 +2530,9 @@ class EmulatorManager(ctk.CTk):
             # 🔐 เข้มงวดขึ้น: fail 2 ครั้ง = หยุด (จากเดิม 8 ครั้ง)
             if (not Authorized and AuthorizedFailed >= 6) or AuthorizedFailed >= 7:
                 print("⚠️ Network error:", e)
-                self.stop_bot_processes()
+                # Drain: same reasoning again - self.on_close() below always forces and is
+                # the guaranteed backstop.
+                self.stop_bot_processes(force=False)
                 self.kill_server_adb()
                 self.after(10000, self.on_close)
                 messagebox.showwarning("Network error", f"❌ ไม่สามารถเชื่อมต่อเซิฟเวอร์ได้\nตรวจสอบอินเตอร์เน็ต และ ลองอีกครั้ง")
