@@ -58,6 +58,7 @@ import os
 import random
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,6 +69,13 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ratelimit  # noqa: E402
+# C5 (final review): thread-local lane binding (use_lane/current_lane) already lives here,
+# set once per worker thread by bot/engine/pool.py's _worker before it ever calls this
+# module. Both files are stdlib-only, so importing it does not pull anything beyond what
+# ratelimit.py already does (this module's own "standard library only" docstring promise is
+# about third-party PyPI packages, not sibling tools/ modules - relogin.py already imports
+# both). No cycle: rangers_api.py never imports new_account.
+import rangers_api  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -207,12 +215,34 @@ def _build_opener(url):
     return urllib.request.build_opener(urllib.request.ProxyHandler({"http": url, "https": url}))
 
 
-_OPENER = _build_opener(ratelimit.proxy_url())
+_OPENER = _build_opener(ratelimit.proxy_url())     # CLI fallback: LGRGS_PROXY, no lane bound
+
+# C5 (final review): _OPENER above was the ONLY opener this module ever used - built once at
+# import from LGRGS_PROXY (a single env var frozen at process start), so every account's
+# first request left through whichever one proxy happened to be in that var (proxy[0] under
+# ratelimit.spawn_env's round-robin, or the user's own IP when apiproxies was empty) no
+# matter which of the engine's many lanes the calling thread was actually bound to. One
+# opener per distinct (host, port, auth) - not one per lane object, in case two lanes are
+# ever built from the same proxy - cached so a hot loop of thousands of calls on one lane
+# does not rebuild a urllib opener per request.
+_LANE_OPENERS: dict = {}
+_LANE_OPENERS_LOCK = threading.Lock()
+
+
+def _opener_for_lane(lane):
+    key = lane.parts        # (host, port, auth) or None = direct - same shape proxy_parts() returns
+    with _LANE_OPENERS_LOCK:
+        if key not in _LANE_OPENERS:
+            url = ratelimit.proxy_url_from_parts(key)
+            _LANE_OPENERS[key] = _build_opener(url)     # None (direct) is a valid cached value
+        return _LANE_OPENERS[key]
 
 
 def _open(req):
-    if _OPENER is not None:
-        return _OPENER.open(req, timeout=25)
+    lane = rangers_api.current_lane()
+    opener = _opener_for_lane(lane) if lane is not None else _OPENER
+    if opener is not None:
+        return opener.open(req, timeout=25)
     return urllib.request.urlopen(req, timeout=25)
 
 
@@ -234,7 +264,14 @@ def _do(req):
     # because game-api.line.me and rangers-api.line-apps.com have separate limits.
     key = req.get_header("Cookie") or req.full_url
     host = req.host
-    bucket = ratelimit.bucket_for(host)
+    # C5 (final review): this used to be ratelimit.bucket_for(host) UNCONDITIONALLY - the
+    # file-lock bucket the thread-pool rewrite exists to retire, taking msvcrt.locking per
+    # request from every thread regardless of which lane it was on. A thread bound to a
+    # lane (bot/engine/pool.py's _worker calls rangers_api.use_lane once, before any of
+    # this) spends from that lane's own in-memory TokenBucket instead - same fallback rule
+    # as tools/rangers_api.py's own call(): no lane bound (every CLI tool) keeps the old,
+    # file-backed behavior unchanged.
+    lane = rangers_api.current_lane()
     # Send a FRESH Request per attempt: urllib's ProxyHandler mutates the one it is given
     # (set_proxy rewrites host/type/selector, add_unredirected_header adds Proxy-Authorization),
     # so reusing it would send attempt 2 with an absolute-form URI and attempt 3+ through the
@@ -245,12 +282,20 @@ def _do(req):
     # queue every attempt through it, and when the server still says 429 wait a good chunk of the
     # window instead of the usual sub-second backoff (a 429 there costs nothing but time).
     is_auth = "/auth/v3.8/authentication" in req.full_url
-    quota = ratelimit.auth_quota() if is_auth else None
+    quota = None
+    if is_auth:
+        # C6: the lane's OWN quota, not the process-wide ratelimit.auth_quota() every lane
+        # used to share (see ProxyLane.auth_quota's own comment) - same lane/no-lane
+        # fallback rule as the bucket above.
+        quota = lane.auth_quota if lane is not None else ratelimit.auth_quota()
     raw, status, resp_headers, parsed = b"", 0, None, {}
     net_fail = 0
     for attempt in range(_MAX_ATTEMPTS):
         ratelimit.PACER.wait(key)
-        bucket.acquire()
+        if lane is not None:
+            lane.acquire()
+        else:
+            ratelimit.bucket_for(host).acquire()
         if quota is not None:
             quota.acquire()
         attempt_req = urllib.request.Request(template[0], data=template[1],

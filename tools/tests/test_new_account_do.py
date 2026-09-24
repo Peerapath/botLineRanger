@@ -14,6 +14,21 @@ import pytest
 
 import new_account as na
 import ratelimit
+import rangers_api as ra
+
+
+@pytest.fixture(autouse=True)
+def _no_stale_lane_binding(monkeypatch):
+    """lane เป็น thread-local ที่ผูกกับเธรดของ pytest เอง (เทสต์ C5/C6 ด้านล่างเรียก
+    ra.use_lane() บนเธรดนี้) - ถ้าไม่ล้างก่อน/หลังทุกเทสต์ การรันไฟล์เทสต์อื่นในเธรดเดียวกัน
+    ก่อนหรือหลังไฟล์นี้จะเห็น lane ที่ทดสอบทิ้งไว้ (เหมือน fixture เดียวกันใน
+    tools/tests/test_rangers_api.py, สโคปเฉพาะไฟล์นั้น - อันนี้สโคปไฟล์นี้) - also gives every
+    test a fresh per-lane opener cache, so one test's cached opener can't hide whether the
+    next one actually built its own."""
+    ra.use_lane(None)
+    monkeypatch.setattr(na, "_LANE_OPENERS", {})
+    yield
+    ra.use_lane(None)
 
 APP429 = json.dumps({"errorCode": 429, "extras": {"current": 20, "previous": 10}}).encode()
 OK = json.dumps({"result": {"rsn": "abc"}}).encode()
@@ -256,3 +271,98 @@ def test_register_guest_raises_systemexit_with_status(monkeypatch):
     with pytest.raises(SystemExit) as info:
         na.register_guest("d" * 32)
     assert "HTTP 429" in str(info.value)
+
+
+# --- C5/C6 (final review): login/signup never went through a proxy lane -----------------------
+#
+# _OPENER used to be built ONCE at import from LGRGS_PROXY, and _do() always spent from
+# ratelimit.bucket_for(host)/ratelimit.auth_quota() (the file-lock bucket/quota) - never
+# rangers_api.current_lane(). So every account's first request left through whichever proxy
+# happened to be in the env var at process start (proxy[0], or the user's own IP when
+# apiproxies was empty), and the guest-mint quota was shared by the whole engine instead of
+# per lane (see test_each_lane_has_its_own_independent_guest_mint_quota in
+# bot/tests/test_proxy.py for that half). Fix: use the calling thread's bound lane
+# (rangers_api.use_lane/current_lane - the exact mechanism tools/rangers_api.py already
+# uses), falling back to the module-level value when no lane is bound so the CLI tools
+# still work unchanged.
+
+class FakeLane:
+    def __init__(self, parts):
+        self.parts = parts
+        self.acquired = 0
+        self.auth_quota = FakeQuota()
+
+    def acquire(self):
+        self.acquired += 1
+
+
+def test_open_uses_the_bound_lanes_proxy_not_the_frozen_module_opener(monkeypatch):
+    """C5: every request must leave through the LANE this thread is bound to, not
+    proxy[0]/LGRGS_PROXY frozen at import. Proven two ways at once: the module-level opener
+    (what a bare CLI run would have built) must never be touched, and the opener that IS
+    used must be built from the lane's own proxy, not the module's. No real socket is
+    opened anywhere here - _build_opener itself is replaced with a fake that hands back a
+    fake opener, the same shape test_open_uses_proxy_opener_when_configured already uses.
+    """
+    class ExplodingOpener:
+        def open(self, req, timeout=None):
+            raise AssertionError("must not use the module-level opener when a lane is bound")
+    monkeypatch.setattr(na, "_OPENER", ExplodingOpener())
+
+    built = {}
+
+    class FakeOpener:
+        def open(self, req, timeout=None):
+            built["opened"] = True
+            return "opened-via-lane"
+
+    def fake_build_opener(url):
+        built["url"] = url
+        return FakeOpener()
+    monkeypatch.setattr(na, "_build_opener", fake_build_opener)
+
+    lane = FakeLane(("10.0.0.9", 8080, None))
+    ra.use_lane(lane)
+    assert na._open(_req()) == "opened-via-lane"
+    assert built == {"url": "http://10.0.0.9:8080", "opened": True}
+
+
+def test_open_falls_back_to_the_module_opener_when_no_lane_is_bound(monkeypatch):
+    """CLI tools (no engine, no lane) must keep behaving exactly as before - unchanged
+    regression check alongside the existing test_open_uses_proxy_opener_when_configured."""
+    assert ra.current_lane() is None
+    seen = {}
+
+    class FakeOpener:
+        def open(self, req, timeout=None):
+            seen["req"] = req
+            return "opened"
+    monkeypatch.setattr(na, "_OPENER", FakeOpener())
+    assert na._open(_req()) == "opened"
+
+
+def test_do_uses_the_bound_lanes_bucket_not_the_file_backed_one(monkeypatch, wired):
+    """C5's other half: _do spent from ratelimit.bucket_for(host) - the file-lock bucket
+    the rewrite exists to retire - unconditionally, taking msvcrt.locking per request from
+    every thread regardless of which lane it was on.
+    """
+    lane = FakeLane(None)
+    ra.use_lane(lane)
+    _script(monkeypatch, [(200, OK, _headers())])
+    na._do(_req("c=1"))
+    assert lane.acquired == 1
+    assert wired.hosts == []       # the file-backed bucket must never have been touched
+
+
+def test_do_queues_authentication_through_the_lanes_own_quota(monkeypatch, wired):
+    """C6: the guest-mint quota must come from the bound lane, not the process-wide
+    ratelimit.auth_quota() every lane used to share (see bot/tests/test_proxy.py)."""
+    module_quota = FakeQuota()
+    monkeypatch.setattr(ratelimit, "auth_quota", lambda: module_quota)
+    lane = FakeLane(None)
+    ra.use_lane(lane)
+    _script(monkeypatch, [(200, OK, _headers())])
+    req = urllib.request.Request("https://game-api.line.me" + na.AUTH_PATH, data=b"x", method="POST")
+    na._do(req)
+    assert lane.auth_quota.acquired == 1
+    assert module_quota.acquired == 0

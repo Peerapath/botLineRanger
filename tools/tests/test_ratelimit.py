@@ -506,3 +506,62 @@ def test_the_old_file_backed_bucket_is_still_available_under_its_new_name():
     """ของเดิมต้องไม่หาย มันคือทางเดียวที่กันข้ามโปรเซสได้ถ้าวันหนึ่งต้องกลับไปหลาย engine"""
     assert hasattr(ratelimit, "FileTokenBucket")
     assert hasattr(ratelimit.FileTokenBucket, "acquire")
+
+
+# --- InMemoryQuota (C6: in-process sibling of SlidingQuota, one per ProxyLane) -----------------
+
+def test_in_memory_quota_allows_limit_then_waits_for_oldest_to_expire():
+    clock, waits = _FakeClock(), []
+    q = ratelimit.InMemoryQuota(2, 60.0, clock=clock,
+                                sleep=lambda s: (waits.append(s), clock.advance(s)), margin=1.0)
+    q.acquire()
+    clock.advance(10)
+    q.acquire()
+    clock.advance(10)                   # two sends at t=0 and t=10, now t=20
+    assert waits == []
+    q.acquire()                         # third: oldest(0) + 60 + margin 1 - 20 = 41 (+jitter <= 0.25)
+    assert len(waits) == 1 and 41.0 <= waits[0] <= 41.25
+
+
+def test_in_memory_quota_disabled_when_limit_is_zero():
+    clock, waits = _FakeClock(), []
+    q = ratelimit.InMemoryQuota(0, 60.0, clock=clock, sleep=lambda s: waits.append(s))
+    for _ in range(5):
+        q.acquire()
+    assert waits == []
+
+
+def test_two_in_memory_quotas_never_share_a_budget():
+    """C6's whole point: one lane's mints must not count against another lane's quota."""
+    clock, waits = _FakeClock(), []
+    sleep = lambda s: waits.append(s)
+    a = ratelimit.InMemoryQuota(1, 60.0, clock=clock, sleep=sleep)
+    b = ratelimit.InMemoryQuota(1, 60.0, clock=clock, sleep=sleep)
+    a.acquire()
+    b.acquire()          # independent counter - must not wait for a's single slot
+    assert waits == []
+
+
+def test_parse_quota_spec():
+    assert ratelimit.parse_quota_spec("2/60") == (2, 60)
+    assert ratelimit.parse_quota_spec("0") == (0, 1)
+    assert ratelimit.parse_quota_spec("") == (0, 1)
+    with pytest.raises(ValueError):
+        ratelimit.parse_quota_spec("two/60")
+
+
+# --- proxy_url_from_parts (C5: rebuild an opener URL from an already-split ProxyLane.parts) ---
+
+def test_proxy_url_from_parts_direct():
+    assert ratelimit.proxy_url_from_parts(None) is None
+
+
+def test_proxy_url_from_parts_without_credentials():
+    assert ratelimit.proxy_url_from_parts(("10.0.0.1", 8080, None)) == "http://10.0.0.1:8080"
+
+
+def test_proxy_url_from_parts_round_trips_credentials_through_proxy_parts():
+    """proxy_parts() throws away the raw user:pass, keeping only the pre-built Basic header -
+    this must recover the same URL proxy_url() would have built from the original string."""
+    parts = ratelimit.proxy_parts("10.0.0.1:8080:bob:hunter2")
+    assert ratelimit.proxy_url_from_parts(parts) == ratelimit.proxy_url("10.0.0.1:8080:bob:hunter2")

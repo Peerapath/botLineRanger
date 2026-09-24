@@ -31,6 +31,16 @@ class ProxyLane:
         if sleep is not None:
             kw["sleep"] = sleep
         self.bucket = ratelimit.TokenBucket(rate=rps, **kw)
+        # C6 (final review): the guest-mint quota (game-api allows 2 mints/IP/~60s) used to
+        # be ratelimit.quota_for("linegame-auth", ...) - ONE quota cached on the name alone
+        # for the WHOLE PROCESS, so every lane shared a single 2-per-minute budget instead
+        # of getting its own (a regression from the old fleet's 2 per process = 2 per
+        # proxy). Each lane now owns an in-memory quota exactly like it owns its own
+        # TokenBucket (spec sec 7/14.3: "ผูกกับ lane ไม่ใช่ทั้งโปรแกรม" - 50 proxy must mint
+        # 100 accounts/minute, not 2 for the whole fleet). Consumed by
+        # tools/new_account.py's _do() via rangers_api.current_lane().auth_quota.
+        limit, window = ratelimit.parse_quota_spec(ratelimit.AUTH_QUOTA)
+        self.auth_quota = ratelimit.InMemoryQuota(limit, window, **kw)
         self._lock = threading.Lock()
         self._fails = 0
 

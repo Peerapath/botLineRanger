@@ -284,9 +284,56 @@ def bucket_for(host: str) -> IpBucket:
         return b
 
 
-# --- endpoint quotas (cross-process, sliding window) ------------------------------------------
+# --- endpoint quotas: in-memory (InMemoryQuota) and file-backed (SlidingQuota) ----------------
+# One process on this egress IP -> InMemoryQuota (a Lock); several processes sharing it -> SlidingQuota (a lock file).
 
 AUTH_QUOTA = os.environ.get("LGRGS_AUTH_QUOTA") or "2/60"   # "<calls>/<seconds>", "0" = off
+
+
+def parse_quota_spec(spec) -> tuple:
+    """"<calls>/<seconds>" -> (limit, window); "0" or empty = disabled ((0, 1))."""
+    if not spec or spec.strip() in ("0", ""):
+        return 0, 1
+    parts = spec.split("/")
+    if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
+        raise ValueError("quota spec must be <calls>/<seconds>, got %r" % spec)
+    return int(parts[0]), int(parts[1])
+
+
+class InMemoryQuota:
+    """ในแรม: อย่างมาก `limit` ครั้งต่อ `window` วินาที คุมด้วย list ของเวลาที่ส่งจริง + Lock เดียว
+
+    ใช้แทน SlidingQuota (โควตาแบบไฟล์) ตั้งแต่ engine เหลือโปรเซสเดียว เหมือนที่ TokenBucket
+    แทน FileTokenBucket - ผูกกับ ProxyLane เดียวกับที่ TokenBucket ผูกอยู่ เพราะโควตา mint
+    เป็นของ IP หนึ่งเส้นเหมือนกัน ไม่ใช่ของทั้งโปรแกรม (C6 / spec ข้อ 7, 14.3: 50 proxy ต้อง
+    mint ได้ 100 บัญชี/นาที ไม่ใช่ 2 ทั้งฝูง)
+    """
+
+    def __init__(self, limit, window, clock=time.monotonic, sleep=time.sleep, margin=1.0):
+        self.limit = int(limit)
+        self.window = float(window)
+        self.margin = float(margin)
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._stamps: list = []      # sorted send times still inside the last `window` seconds
+        # Same "limit<=0 = disabled" contract as SlidingQuota (module docstring/AUTH_QUOTA).
+        self._disabled = self.limit <= 0 or self.window <= 0
+
+    def acquire(self) -> None:
+        if self._disabled:
+            return
+        while True:
+            with self._lock:
+                now = self._clock()
+                self._stamps = [t for t in self._stamps if now - t < self.window]
+                if len(self._stamps) < self.limit:
+                    self._stamps.append(now)
+                    return
+                wait = self._stamps[0] + self.window - now + self.margin
+            # jittered like SlidingQuota.acquire(), same reason: several threads waking on
+            # the exact same lane at the exact same instant must not retry in lockstep.
+            self._sleep(wait + random.uniform(0, 0.25))
 
 
 class SlidingQuota:
@@ -374,16 +421,15 @@ _QUOTAS: dict = {}
 
 
 def quota_for(name: str, spec: str) -> SlidingQuota:
-    """Process-wide SlidingQuota for `name` from a "<calls>/<seconds>" spec ("0" = disabled)."""
+    """Process-wide, file-backed SlidingQuota for `name` from a "<calls>/<seconds>" spec
+    ("0" = disabled) - the CLI/no-lane fallback. A worker thread bound to a ProxyLane uses
+    that lane's own InMemoryQuota instead (see ProxyLane.auth_quota in bot/engine/proxy.py
+    and C6's own note in tools/new_account.py's _do) - one file here is correct for a CLI
+    tool, which is already one process per proxy, same as the old fleet."""
     with _BUCKETS_LOCK:
         q = _QUOTAS.get(name)
         if q is None:
-            limit, window = 0, 1
-            if spec and spec.strip() not in ("0", ""):
-                parts = spec.split("/")
-                if len(parts) != 2 or not parts[0].strip().isdigit() or not parts[1].strip().isdigit():
-                    raise ValueError("quota spec must be <calls>/<seconds>, got %r" % spec)
-                limit, window = int(parts[0]), int(parts[1])
+            limit, window = parse_quota_spec(spec)
             q = _QUOTAS[name] = SlidingQuota(name, limit, window)
         return q
 
@@ -447,6 +493,26 @@ def proxy_url(proxy=None):
     if len(parts) == 4:
         cred = "%s:%s@" % (urllib.parse.quote(parts[2], safe=""), urllib.parse.quote(parts[3], safe=""))
     return "http://%s%s:%s" % (cred, parts[0], parts[1])
+
+
+def proxy_url_from_parts(parts) -> str | None:
+    """Inverse of proxy_parts(): rebuild the http://[user:pass@]host:port form
+    urllib.request.ProxyHandler wants from an already-split (host, port, auth) tuple - the
+    shape ProxyLane.parts carries per thread (bot/engine/proxy.py). `auth`, when present,
+    is the "Basic <base64>" header proxy_parts() already built from the original
+    "host:port:user:pass" string; decoding it back to "user:pass" is a lossless round trip
+    and avoids adding a second, raw-credential field to ProxyLane just for this one caller
+    (tools/new_account.py, C5) - a lane cannot reach the original string it was built from,
+    only its already-parsed parts.
+    """
+    if not parts:
+        return None
+    host, port, auth = parts
+    cred = ""
+    if auth and auth.startswith("Basic "):
+        user, _, pw = base64.b64decode(auth[len("Basic "):].encode()).decode().partition(":")
+        cred = "%s:%s@" % (urllib.parse.quote(user, safe=""), urllib.parse.quote(pw, safe=""))
+    return "http://%s%s:%s" % (cred, host, port)
 
 
 def parse_proxies(text) -> list:

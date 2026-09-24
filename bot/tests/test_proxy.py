@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "tools"))
+import ratelimit                                            # noqa: E402
 from engine.proxy import ProxyLane, ProxyPool, LANE_DEATH  # noqa: E402
 
 
@@ -109,3 +110,23 @@ def test_acquire_spends_a_token_from_the_lanes_own_bucket():
     for _ in range(lane.bucket.burst + 1):
         lane.acquire()
     assert waits, "acquire() never paced once the burst was spent - is it still calling its TokenBucket?"
+
+
+def test_each_lane_has_its_own_independent_guest_mint_quota(monkeypatch):
+    """C6 (final review): the guest-mint quota (game-api allows 2 mints/IP/~60s) used to be
+    ratelimit.quota_for("linegame-auth", ...) - cached on the name ALONE for the whole
+    process, so every lane shared one 2-per-minute budget - GenID was capped at 2
+    accounts/minute TOTAL no matter how many proxies were configured, a regression from the
+    old fleet's 2 per PROCESS (= 2 per proxy, one process per proxy). Each lane must own an
+    in-memory quota the same way it owns its own TokenBucket.
+    """
+    monkeypatch.setattr(ratelimit, "AUTH_QUOTA", "1/60")
+    clock = _FakeClock()
+    waits = []
+    sleep = lambda s: (waits.append(s), clock.advance(s))
+    a = ProxyLane("1.1.1.1:8000", None, rps=1000, threads=8, clock=clock, sleep=sleep)
+    b = ProxyLane("2.2.2.2:8000", None, rps=1000, threads=8, clock=clock, sleep=sleep)
+    assert a.auth_quota is not b.auth_quota
+    a.auth_quota.acquire()
+    b.auth_quota.acquire()      # independent budget - must not wait for a's single slot
+    assert waits == []
