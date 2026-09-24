@@ -34,13 +34,12 @@ from device_session import decrypt_lfac  # noqa: E402
 import new_account as na  # noqa: E402
 import rangers_api  # noqa: E402
 import ratelimit  # noqa: E402
+import client_version  # noqa: E402
 
 ENC_RE = re.compile(r'(<string name="_ENC_LF_AC_KEY">)(.*?)(</string>)', re.S)
 
-UA_GAME = "LGRGS/%s (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)" % rangers_api.CLIENT_VERSION
-APP_VERSION = "LGRGS/%s;android/12" % rangers_api.CLIENT_VERSION
 RANGERS_HOST = rangers_api.HOST
-LOGIN_PATH = rangers_api.API + "/login"
+LOGIN_ROUTE = "/login"   # prefix and App-Version come from client_version
 PROVEN_WINDOW = 60.0  # วินาที: cc ที่เพิ่งสำเร็จภายในช่วงนี้ ถือว่า 401 = ไฟล์เสียเอง
 RETRY_WAITS = (2, 4, 8)  # backoff เมื่อเจอ 429 / app-429 / 5xx (network error: na._do retry ให้เองแล้ว)
 
@@ -84,36 +83,39 @@ class Transient(Exception):
 
 
 def login(cc, udid, guest_cookie, nation, language="en"):
-    """ยิง GET /v12.3/login คืน (status, result_or_None, lf_ac_or_None).
+    """ยิง GET <prefix>/login คืน (status, result_or_None, lf_ac_or_None).
 
     retry เองเมื่อเจอ 429 / app-429 (HTTP 400+errorCode 429) / 5xx (RETRY_WAITS). ถ้ายังไม่หายหลัง
     retry ครบ -> raise Transient ให้ process_file นับเป็น error. network error -> raise Transient
     ทันที (na._do retry ให้แล้ว). 401 ไม่ retry (เป็นคำตอบจริงของเซิร์ฟเวอร์ ไม่ใช่ปัญหาชั่วคราว).
     """
     cookie = "cc=%s; udid=%s; guestCookie=%s;" % (cc, udid, guest_cookie)
-    last = None
-    for attempt in range(len(RETRY_WAITS) + 1):
-        ts_ms = str(int(time.time() * 1000))
+
+    def send(prefix, app_version):
+        version_headers = client_version.headers(app_version)
         headers = {
-            "App-Version": APP_VERSION,
+            "App-Version": version_headers["App-Version"],
             "userType": "",
             "Nation-Code": nation,
             "Accept-Language": language,
-            "User-Agent": UA_GAME,
+            "User-Agent": version_headers["User-Agent"],
             "marketId": "",
             "useLGC": "true",
             "X-LINEGAME-MCC": "000",
             "X-LINEGAME-MNC": "00",
-            "X-LINEGAME-TIMESTAMP": ts_ms,
+            "X-LINEGAME-TIMESTAMP": str(int(time.time() * 1000)),
             "Host": RANGERS_HOST,
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
             "Cookie": cookie,
         }
-        req = urllib.request.Request("https://" + RANGERS_HOST + LOGIN_PATH,
-                                     headers=headers, method="GET")
+        return na._do(urllib.request.Request("https://" + RANGERS_HOST + prefix + LOGIN_ROUTE,
+                                             headers=headers, method="GET"))
+
+    last = None
+    for attempt in range(len(RETRY_WAITS) + 1):
         try:
-            status, res, cookies = na._do(req)
+            status, res, cookies = client_version.request(LOGIN_ROUTE, send)
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             # na._do already retried the network error with backoff (_NET_ATTEMPTS); looping
             # again here would multiply the wait (8 x 4 ~ 16 min per file when the net is down).

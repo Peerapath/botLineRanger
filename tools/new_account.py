@@ -76,6 +76,7 @@ import ratelimit  # noqa: E402
 # about third-party PyPI packages, not sibling tools/ modules - relogin.py already imports
 # both). No cycle: rangers_api.py never imports new_account.
 import rangers_api  # noqa: E402
+import client_version  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -96,31 +97,6 @@ LANG = "en"
 # Device fingerprint copied from a real client. The DeviceId is randomised per
 # account; the rest only has to look like a plausible install.
 UA_SDK = "android;12;V417IR;GOOGLEPLAY;en"
-UA_GAME = "LGRGS/12.3.0 (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)"
-APP_VERSION = "LGRGS/12.3.0;android/12"
-
-# /signup/platform ONLY - every other call still sends APP_VERSION above.
-#
-# Measured 2026-09-24: the signup endpoint now answers HTTP 401 for App-Version 12.3.0,
-# which made GenID produce zero accounts (auth 200 -> refresh 200 -> authorize 200 ->
-# signup 401 -> login 401 -> "pending-login", every single time). The URL prefix is NOT
-# what it keys on: /v12.3/signup/platform with this 12.2.0 header returns 200, and
-# /v12.2/signup/platform with the 12.3.0 header returns 401. Full matrix, one fresh
-# pending guest per cell so a success could not contaminate the next:
-#     URL 12.3 + hdr 12.3.0 -> 401      URL 12.3 + hdr 12.2.0 -> 200
-#     URL 12.2 + hdr 12.3.0 -> 401      URL 12.2 + hdr 12.2.0 -> 200 (x2)
-# Sweeping the header alone separates "unknown version" from "rejected version": 11.9.0,
-# 12.0.0, 12.1.0, 12.2.9 and 13.0.0 all return HTTP 400 errorCode 119801 (the server does
-# not know that build), while 12.2.0 returns 200 and 12.3.0/12.4.0 return 401. So the
-# server knows 12.3.0 and refuses it here specifically - consistent with this project's
-# standing X-LINEGAME-APPSECRET theory (see the lgrgs-business-api-401-appsecret memory):
-# 12.2.0 predates that requirement, 12.3+ is expected to carry a header we cannot forge
-# off-device. It is NOT a maintenance window: /v12.3/login answers 200 with the ordinary
-# 12.3.0 header throughout, and so does every later call in the flow.
-#
-# The account this produces is a normal fresh guest - isNew=true, level 1, ruby 20, the
-# same shape this function's docstring recorded on 2026-09-14.
-SIGNUP_APP_VERSION = "LGRGS/12.2.0;android/12"
 
 # Terms the server currently requires. If these fall out of date the auth step
 # returns the up-to-date list in its error body - copy it back in here.
@@ -408,36 +384,40 @@ def authorize(device_id: str, user_token: str) -> bool:
 
 
 def game_login(cc: str, udid: str, guest_cookie: str | None = None) -> dict:
-    """GET /v12.3/login exactly as the client sends it (captured from a real session).
+    """GET <prefix>/login exactly as the client sends it (captured from a real session).
 
     The client's cookie jar carries three things: `cc` (the fresh SDK userToken),
     `udid` (the game's own device uuid, also the AES key for the stored token) and,
     once a session exists, `guestCookie` - the first 16 chars of the previous LF_AC.
+    Prefix and App-Version come from client_version.
     """
     cookie = "cc=%s; udid=%s;" % (cc, udid)
     if guest_cookie:
         cookie += " guestCookie=%s" % guest_cookie
-    ts_ms = str(int(time.time() * 1000))
-    headers = {
-        "App-Version": APP_VERSION,
-        "userType": "",
-        "Nation-Code": NATION,
-        "Accept-Language": LANG,
-        "User-Agent": UA_GAME,
-        "marketId": "",
-        "useLGC": "true",
-        "X-LINEGAME-MCC": "000",
-        "X-LINEGAME-MNC": "00",
-        "X-LINEGAME-TIMESTAMP": ts_ms,
-        "Host": RANGERS_HOST,
-        "Connection": "Keep-Alive",
-        "Accept-Encoding": "gzip",
-        "Cookie": cookie,
-    }
-    # login is GET-only; POST returns 405.
-    req = urllib.request.Request("https://" + RANGERS_HOST + "/v12.3/login",
-                                 headers=headers, method="GET")
-    st, res, cookies = _do(req)
+
+    def send(prefix, app_version):
+        version_headers = client_version.headers(app_version)
+        headers = {
+            "App-Version": version_headers["App-Version"],
+            "userType": "",
+            "Nation-Code": NATION,
+            "Accept-Language": LANG,
+            "User-Agent": version_headers["User-Agent"],
+            "marketId": "",
+            "useLGC": "true",
+            "X-LINEGAME-MCC": "000",
+            "X-LINEGAME-MNC": "00",
+            "X-LINEGAME-TIMESTAMP": str(int(time.time() * 1000)),
+            "Host": RANGERS_HOST,
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Cookie": cookie,
+        }
+        # login is GET-only; POST returns 405.
+        return _do(urllib.request.Request("https://" + RANGERS_HOST + prefix + "/login",
+                                          headers=headers, method="GET"))
+
+    st, res, cookies = client_version.request("/login", send)
     lf_ac = _cookie_value(cookies, "LF_AC")
     if not isinstance(res, dict) or "result" not in res:
         hint = ""
@@ -456,37 +436,44 @@ def game_login(cc: str, udid: str, guest_cookie: str | None = None) -> dict:
 
 
 def signup_platform(cc: str, udid: str, user_type: str = "LINE") -> dict | None:
-    """GET /v12.3/signup/platform - creates the rangers PLAYER for a brand-new guest.
+    """GET <prefix>/signup/platform - creates the rangers PLAYER for a brand-new guest.
 
     This is the endpoint the native client hits on a genuine first login (a fresh guest
-    has no player yet, so /v12.3/login returns 401). It is NOT certificate-pinned and
-    carries no X-LINEGAME-APPSECRET: the same cc+udid cookie jar as a relogin, plus an
-    empty LF_AC to signal "no session yet". Response body already includes the starter
-    ruby/coin/level and a Set-Cookie: LF_AC for every subsequent authenticated call.
+    has no player yet, so /login returns 401). It is NOT certificate-pinned and carries no
+    X-LINEGAME-APPSECRET: the same cc+udid cookie jar as a relogin, plus an empty LF_AC to
+    signal "no session yet". Response body already includes the starter ruby/coin/level and
+    a Set-Cookie: LF_AC for every subsequent authenticated call.
     Verified live 2026-09-14: fresh guest -> HTTP 200, isNew=true, level 1, ruby 20.
+
+    Since 2026-09-24 this route refuses App-Version 12.3.0 with 401 while every other route
+    takes it; client_version pins it to a version it accepts (see DEFAULT_PINS there) and
+    finds a new one by itself if that pin stops working.
     """
     cookie = "cc=%s; udid=%s;, LF_AC=; udid=%s;" % (cc, udid, udid)
-    ts_ms = str(int(time.time() * 1000))
-    headers = {
-        "App-Version": SIGNUP_APP_VERSION,   # 12.3.0 is refused here - see the constant
-        "userType": user_type,
-        "Nation-Code": NATION,
-        "Accept-Language": LANG,
-        "User-Agent": UA_GAME,
-        "marketId": "",
-        "useLGC": "true",
-        "X-LINEGAME-MCC": "000",
-        "X-LINEGAME-MNC": "00",
-        "X-LINEGAME-TIMESTAMP": ts_ms,
-        "Host": RANGERS_HOST,
-        "Connection": "Keep-Alive",
-        "Accept-Encoding": "gzip",
-        "Cookie": cookie,
-    }
-    req = urllib.request.Request("https://" + RANGERS_HOST + "/v12.3/signup/platform",
-                                 headers=headers, method="GET")
+
+    def send(prefix, app_version):
+        version_headers = client_version.headers(app_version)
+        headers = {
+            "App-Version": version_headers["App-Version"],
+            "userType": user_type,
+            "Nation-Code": NATION,
+            "Accept-Language": LANG,
+            "User-Agent": version_headers["User-Agent"],
+            "marketId": "",
+            "useLGC": "true",
+            "X-LINEGAME-MCC": "000",
+            "X-LINEGAME-MNC": "00",
+            "X-LINEGAME-TIMESTAMP": str(int(time.time() * 1000)),
+            "Host": RANGERS_HOST,
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Cookie": cookie,
+        }
+        return _do(urllib.request.Request("https://" + RANGERS_HOST + prefix + "/signup/platform",
+                                          headers=headers, method="GET"))
+
     global LAST_SIGNUP_HTTP
-    st, res, cookies = _do(req)
+    st, res, cookies = client_version.request("/signup/platform", send)
     LAST_SIGNUP_HTTP = st
     lf_ac = _cookie_value(cookies, "LF_AC")
     if not isinstance(res, dict) or "result" not in res:
