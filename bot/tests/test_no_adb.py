@@ -343,15 +343,79 @@ def test_botlineranger_function_bodies_only_load_resolvable_names():
     the check that would have caught all seven guaranteed NameErrors without
     anyone having to call them first.
     """
-    path = os.path.join(BOT, "botLineRanger.py")
+    assert _unresolved_in(os.path.join(BOT, "botLineRanger.py")) == []
+
+
+def _unresolved_in(path):
+    """Names a function body loads that nothing binds - one guaranteed NameError each."""
     with open(path, encoding="utf-8") as fh:
-        source = fh.read()
-    tree = ast.parse(source, filename=path)
+        return _unresolved_in_source(fh.read(), filename=path)
 
+
+def _unresolved_in_source(source, filename="<test>"):
+    tree = ast.parse(source, filename=filename)
     module_bound, _module_loaded, module_children = _scan_scope(tree.body)
-
     violations = []
     for func in module_children:
         _collect_unresolved(func, [], module_bound, violations)
+    return violations
 
-    assert violations == [], violations
+
+_DELETED_CALLEE = '''
+import os
+KEPT = 1
+def survivor():
+    return deleted_helper(KEPT, os.sep)
+'''
+
+_THE_USUAL_FALSE_POSITIVES = '''
+TARGETS = {}
+def survivor(rows, fallback=3):
+    import relogin
+    names = [r.name for r in rows if r]
+    if (n := len(names)) > fallback:
+        names = names[:n]
+    try:
+        relogin.login(TARGETS)
+    except OSError as err:
+        return str(err)
+    return names
+'''
+
+
+def test_the_resolvable_names_scanner_actually_flags_a_deleted_callee():
+    """Tests the test. The scanner above only ever asserts "no violations in the file
+    as it currently stands", so a later edit that quietly weakened it - a wider builtin
+    list, an early return - would leave this suite green with nothing to notice. That is
+    the same shape as the bug it was written to catch, one level up. This feeds it the
+    exact situation Task 11 shipped seven times, a kept function calling a name whose
+    def was deleted, and requires it to say so.
+    """
+    found = _unresolved_in_source(_DELETED_CALLEE)
+    assert len(found) == 1, found
+    assert "deleted_helper" in found[0] and "survivor" in found[0], found[0]
+
+
+def test_the_resolvable_names_scanner_does_not_cry_wolf():
+    """The false positives that would make it useless, all of them shapes this repo
+    really uses: a module imported lazily inside the function, a comprehension variable,
+    an `except X as e` name, a parameter with a default, and a walrus. None is a
+    NameError, so none may be reported.
+    """
+    assert _unresolved_in_source(_THE_USUAL_FALSE_POSITIVES) == []
+
+
+def test_no_engine_module_calls_a_name_nothing_binds():
+    """The same check, widened past the file Task 11 happened to delete from.
+    bot/engine/ is where accounts actually get processed, and the bug class is not
+    specific to botLineRanger.py. bot/main.py is left out on purpose: it does
+    `from botLineRanger import *`, and the scanner deliberately contributes no bindings
+    for a star-import, so every name main.py uses that way would read as a violation.
+    """
+    engine = os.path.join(BOT, "engine")
+    checked = []
+    for name in sorted(os.listdir(engine)):
+        if name.endswith(".py"):
+            checked.append(name)
+            assert _unresolved_in(os.path.join(engine, name)) == [], name
+    assert "flows.py" in checked and "pool.py" in checked, checked
