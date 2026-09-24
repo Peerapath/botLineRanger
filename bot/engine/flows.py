@@ -594,6 +594,16 @@ MODES = {
     "ranger_api_Stage": run_stage,
 }
 
+# C2 (final review): modes whose flow mints its own account file (_create_account writes
+# it into execute/ directly) instead of consuming one EnginePool claimed from input/. The
+# pool must not gate these on queue.claim() finding work - the original
+# (startBotGenID_API_headless, af264b0:bot/botLineRanger.py:8488) looped `while True:`
+# forever and never touched an input file at all, which bot/main.py:1332 still tells the
+# user ("ไม่กินไฟล์ input"). Read by bot/engine/pool.py; kept here (not in pool.py) so a
+# future mode with the same shape only needs a MODES entry plus a membership here - matching
+# the design rule that adding a mode must not require editing pool.py or queue.py (spec 1.5).
+SELF_SUPPLIED_MODES = frozenset({"ranger_api_GenID"})
+
 
 def run(mode: str, s: AccountSession, cfg: dict) -> Outcome:
     flow = MODES.get(mode)

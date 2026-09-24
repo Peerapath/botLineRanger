@@ -232,6 +232,36 @@ def test_a_worker_thread_binds_exactly_one_lane_for_its_whole_life(tmp_path):
     assert all(len(lanes) == 1 for lanes in by_thread.values())
 
 
+def test_genid_mode_does_not_claim_from_input_and_moves_the_file_the_flow_produced(tmp_path):
+    """C2 (final review): GenID mints its own account file mid-flow (flows._create_account
+    sets s.src to the freshly minted path) instead of consuming one queue.claim() handed
+    out. Two bugs, one test: (a) the pool must not gate GenID on queue.claim() - input/ is
+    empty here, and the old code returned None immediately so no account was ever
+    processed; (b) the file that reaches output/ must be the one the flow actually wrote,
+    not some other file the pool claimed - proven here by there being nothing to claim.
+    """
+    q = build(tmp_path, 0)      # empty input/ - GenID must still run
+    buf = io.StringIO()
+    minted = []
+
+    def flow(mode, s, cfg):
+        n = len(minted) + 1
+        minted.append(n)
+        path = tmp_path / "execute" / ("minted-%d.xml" % n)
+        path.write_text("<map/>", encoding="utf-8")
+        s.src = str(path)              # the flow "mints" a brand-new account file itself
+        if n >= 3:
+            pool.request_stop()        # GenID loops forever otherwise - stop after 3
+        return Outcome(dest="output", name="acct-%d" % n)
+
+    pool = EnginePool("ranger_api_GenID", {"threadsperproxy": 1}, q, [], Reporter(buf), flow=flow)
+    pool.run()
+
+    assert minted == [1, 2, 3]
+    assert sorted(os.listdir(tmp_path / "output")) == ["acct-1.xml", "acct-2.xml", "acct-3.xml"]
+    assert os.listdir(tmp_path / "execute") == []
+
+
 def test_a_flow_returning_an_unrecognized_destination_fails_that_file_but_not_the_thread(tmp_path):
     """A flow bug (typo'd dest, a path nobody wired into DESTS) must not kill the worker
     thread that hit it - that would strand the claimed file in execute/ for the rest of

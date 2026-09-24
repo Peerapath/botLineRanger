@@ -28,6 +28,64 @@ _REPLACE_MAX_ATTEMPTS = 5
 _REPLACE_RETRY_DELAY_S = 0.05
 
 
+def _walk_relative_xml(base: str) -> list[str]:
+    """เดินทุกโฟลเดอร์ย่อยของ base หาไฟล์ .xml คืน path สัมพัทธ์ (เทียบกับ base)
+
+    C1 (final review): _scan()/recover() เคยใช้ os.listdir แบนราบ ชั้นบนสุดอย่างเดียว -
+    ผู้ใช้เก็บบัญชีไว้ในโฟลเดอร์ย่อยจริง เช่น "input/ฝากล็อกอิน 7วัน/" (90 ไฟล์ ระดับบนสุด
+    ว่างเปล่า) engine เห็นคิวว่างทั้งที่มีงาน 90 บัญชี บอทเดิมเดิน os.walk("input") ตั้งใจไว้
+    แล้ว (af264b0:bot/botLineRanger.py:3313-3320, "ลองใช้ relative path ตรงๆ ก่อน
+    (รองรับ subfolder)") - เดินซ้ำที่นี่แทนของเดิม
+    """
+    found = []
+    for dirpath, _dirs, files in os.walk(base):
+        rel_dir = os.path.relpath(dirpath, base)
+        for name in files:
+            if name.endswith(".xml"):
+                found.append(name if rel_dir in (".", "") else os.path.join(rel_dir, name))
+    return found
+
+
+def _rename_no_overwrite_with_retry(src: str, dst_dir: str, base_name: str) -> str | None:
+    """ย้าย src ไปเป็น dst_dir/base_name - ถ้าชื่อนั้นถูกใช้แล้วให้ลองต่อท้าย _2.._999 แทน
+
+    C3 (final review): os.replace() เขียนทับปลายทางเงียบ ๆ บน Windows ไฟล์ input/ สองใบเป็น
+    บัญชีเดียวกันได้จริง (flows.py's AccountClaimRegistry docstring อ้างเคสที่เจอจริง:
+    a0bfb087 สองไฟล์) และชื่อ export มาจากข้อมูลในบัญชี ไม่ใช่ชื่อไฟล์ต้นทาง ไฟล์ต้นทางสอง
+    ไฟล์ที่ต่างกันจึงคำนวณชื่อ export ชนกันได้จริง os.rename() บน Windows ไม่เขียนทับ (ต่าง
+    จาก os.replace()/shutil.move()) - ใช้ FileExistsError นั้นเป็นสัญญาณให้ลองเลขถัดไปแทนการ
+    ทำลายไฟล์ที่ไปถึงก่อน (คอมเมนต์เดิมชี้เคสนี้ตรง ๆ ที่ af264b0:bot/botLineRanger.py:
+    3073-3081, 3136-3144)
+
+    แต่ละชื่อที่ลองยังผ่าน retry เดียวกับ _replace_with_retry (constraint #13): handle ค้าง
+    ชั่วคราวบนชื่อหนึ่ง ต้อง retry ชื่อเดิม ไม่ใช่ถูกอ่านผิดว่า "ชื่อนี้ถูกจองตลอดไป" แล้วข้ามไป
+    เลขถัดไปทั้งที่ยังไม่มีใครใช้จริง
+
+    คืน path เต็มของปลายทาง หรือ None ถ้า src หายไปเองก่อนจะย้ายสำเร็จ (FileNotFoundError)
+    """
+    stem, ext = os.path.splitext(base_name)
+    n = 1
+    while n < 1000:
+        candidate = base_name if n == 1 else "%s_%d%s" % (stem, n, ext)
+        dst = os.path.join(dst_dir, candidate)
+        attempt = 1
+        while True:
+            try:
+                os.rename(src, dst)
+                return dst
+            except FileNotFoundError:
+                return None
+            except FileExistsError:
+                n += 1
+                break            # ชื่อนี้ถูกไฟล์อื่นจองแล้วจริง ๆ - ลองเลขถัดไป ไม่ retry ชื่อเดิม
+            except OSError:
+                if attempt == _REPLACE_MAX_ATTEMPTS:
+                    raise
+                attempt += 1
+                time.sleep(_REPLACE_RETRY_DELAY_S)
+    raise FileExistsError("too many files named %r in %r" % (base_name, dst_dir))
+
+
 def _replace_with_retry(src: str, dst: str) -> bool:
     """os.replace(src, dst), retrying a transient OSError up to _REPLACE_MAX_ATTEMPTS times.
 
@@ -131,11 +189,14 @@ class WorkQueue:
             stale = self._open_claims()
             moved = 0
             self.recover_failures = 0
-            for name in sorted(os.listdir(execute)):
-                if not name.endswith(".xml"):
-                    continue
+            # C1: walk execute/ recursively too - a crash mid-run strands a claimed file at
+            # execute/<sub>/name.xml exactly as easily as at the top level, and it must come
+            # back to the SAME subfolder under input/, not get flattened into input/'s top
+            # level (which would silently merge unrelated batches together on the next scan).
+            for name in sorted(_walk_relative_xml(execute)):
                 src = os.path.join(execute, name)
                 dst = os.path.join(self.root, "input", name)
+                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
                 try:
                     moved_ok = _replace_with_retry(src, dst)
                 except OSError as exc:
@@ -152,9 +213,9 @@ class WorkQueue:
             return moved
 
     def _scan(self) -> None:
+        # C1: recurse into subfolders of input/ - see _walk_relative_xml's own docstring.
         folder = os.path.join(self.root, "input")
-        self._pending.extend(
-            sorted(n for n in os.listdir(folder) if n.endswith(".xml")))
+        self._pending.extend(sorted(_walk_relative_xml(folder)))
         self._scanned = True
 
     def claim(self) -> str | None:
@@ -165,6 +226,8 @@ class WorkQueue:
                 name = self._pending.popleft()
                 src = os.path.join(self.root, "input", name)
                 dst = os.path.join(self.root, "execute", name)
+                # name can carry a subfolder (C1) - execute/<sub>/ may not exist yet.
+                os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
                 try:
                     moved_ok = _replace_with_retry(src, dst)
                 except OSError as exc:
@@ -183,22 +246,44 @@ class WorkQueue:
         if dest not in DESTS:
             raise ValueError("unknown destination %r (expected one of %r)" % (dest, DESTS))
         name = os.path.basename(src)
-        out_name = (new_name + ".xml") if new_name else name
-        out = os.path.join(self.root, dest, out_name)
+        # C1: preserve the account's subfolder across execute/ -> a destination - the old
+        # bot's exportFileFromExecuteTo{Output,Backup} both rebuild `sub_dir` under the
+        # destination (af264b0:bot/botLineRanger.py:3068-3070, 3131-3134); a claim from
+        # input/<sub>/x.xml must land in <dest>/<sub>/, not flatten every subfolder into the
+        # destination's top level. GenID's own minted files sit directly in execute/ (no
+        # subfolder - see flows.EXECUTE_DIR), so rel_dir is "." there and this is a no-op.
+        execute_dir = os.path.join(self.root, "execute")
+        rel_dir = os.path.relpath(os.path.dirname(src), execute_dir)
+        sub_dir = "" if rel_dir in (".", "") else rel_dir
+        out_dir = os.path.join(self.root, dest, sub_dir) if sub_dir else os.path.join(self.root, dest)
+        os.makedirs(out_dir, exist_ok=True)
+
         # Finding 1a (review round 1): this is finish()/fail()'s only move, called once per
         # account - 44,000 times over a full run - and it used to be a bare os.replace(),
         # the one rename in this file that skipped the retry claim() and recover() already
         # get. Same Windows transient-handle case as those two (constraint #13): without
         # the retry, the commonest kind of momentary block (AV scan, indexer, another
         # thread mid-read) looked identical to a permanent failure.
-        if not _replace_with_retry(src, out):
-            # _replace_with_retry only returns False on FileNotFoundError. claim() and
-            # recover() can shrug that off and move on to the next file in their own loop -
-            # there is no "next file" here: src was this account's alone from claim() to
-            # this call, so it vanishing is not a race to skip quietly, it means the move
-            # already failed. Raise instead of writing a "done"/"fail" journal line for an
-            # `out` path that was never created - EnginePool._run_one already treats any
-            # OSError out of finish()/fail() as a failed move, never a silent success.
+        if new_name:
+            # C3: a computed export name can collide across two DIFFERENT source files (see
+            # _rename_no_overwrite_with_retry's own docstring) - number instead of
+            # overwriting. The original-name path below (fail(), which never renames) can't
+            # collide this way: two claims can never share one input/ path, and C1 already
+            # keeps their subfolders apart, so it keeps plain overwrite-tolerant semantics,
+            # matching the old bot's unconditional shutil.move() on that same path.
+            out = _rename_no_overwrite_with_retry(src, out_dir, new_name + ".xml")
+            moved_ok = out is not None
+        else:
+            out = os.path.join(out_dir, name)
+            moved_ok = _replace_with_retry(src, out)
+        if not moved_ok:
+            # Both helpers above return/signal False-equivalent only on FileNotFoundError.
+            # claim() and recover() can shrug that off and move on to the next file in their
+            # own loop - there is no "next file" here: src was this account's alone from
+            # claim() to this call, so it vanishing is not a race to skip quietly, it means
+            # the move already failed. Raise instead of writing a "done"/"fail" journal line
+            # for an `out` path that was never created - EnginePool._run_one already treats
+            # any OSError out of finish()/fail() as a failed move, never a silent success.
             raise FileNotFoundError(
                 "cannot move %r into %r/: source vanished before the move completed"
                 % (name, dest))

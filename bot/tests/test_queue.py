@@ -279,3 +279,89 @@ def test_close_reports_a_failure_to_stderr_instead_of_swallowing_it_silently(tmp
     q._journal = _BrokenJournal()
     q.close()                 # must not raise even though the underlying close() failed
     assert "disk full" in capsys.readouterr().err
+
+
+# --- C1 (final review): _scan/recover used a flat os.listdir, so any account kept in a
+# subfolder of input/ (the user's real layout: "input/ฝากล็อกอิน 7วัน/" holds 90 files,
+# the top level holds none) was invisible - remaining() said 0, claim() returned nothing.
+# The old bot walked input/ recursively ON PURPOSE (af264b0:bot/botLineRanger.py:3313-3320)
+# and every export preserved the subdirectory (:3070, :3134).
+
+def test_remaining_counts_a_file_that_is_only_in_a_subfolder(tmp_path):
+    q = build(tmp_path, [])
+    sub = tmp_path / "input" / "ฝากล็อกอิน 7วัน"
+    sub.mkdir(parents=True)
+    (sub / "a.xml").write_text("<map/>", encoding="utf-8")
+    assert q.remaining() == 1
+
+
+def test_claim_finds_and_moves_a_file_that_is_only_in_a_subfolder(tmp_path):
+    q = build(tmp_path, [])
+    sub = tmp_path / "input" / "ฝากล็อกอิน 7วัน"
+    sub.mkdir(parents=True)
+    (sub / "a.xml").write_text("<map/>", encoding="utf-8")
+    got = q.claim()
+    assert got == str(tmp_path / "execute" / "ฝากล็อกอิน 7วัน" / "a.xml")
+    assert os.path.isfile(got)
+    assert not os.path.exists(sub / "a.xml")
+
+
+def test_finish_preserves_the_subfolder_from_input_through_to_the_destination(tmp_path):
+    """input/<sub>/a.xml -> claim -> finish ต้องลงเอยที่ output/<sub>/... ไม่ใช่ output/ ระดับบนสุด"""
+    q = build(tmp_path, [])
+    sub = tmp_path / "input" / "ฝากล็อกอิน 7วัน"
+    sub.mkdir(parents=True)
+    (sub / "a.xml").write_text("<map/>", encoding="utf-8")
+    src = q.claim()
+    out = q.finish(src, "output", "brown_Rb10_Tk2_ID1_Lv3")
+    assert out == str(tmp_path / "output" / "ฝากล็อกอิน 7วัน" / "brown_Rb10_Tk2_ID1_Lv3.xml")
+    assert os.path.isfile(out)
+
+
+def test_fail_preserves_the_subfolder_from_input_through_to_login_failed(tmp_path):
+    q = build(tmp_path, [])
+    sub = tmp_path / "input" / "15-3"
+    sub.mkdir(parents=True)
+    (sub / "a.xml").write_text("<map/>", encoding="utf-8")
+    src = q.claim()
+    out = q.fail(src, "HTTP 401")
+    assert out == str(tmp_path / "login failed" / "15-3" / "a.xml")
+    assert os.path.isfile(out)
+
+
+def test_recover_returns_a_claim_from_a_subfolder_to_the_same_subfolder(tmp_path):
+    """โปรเซสตายหลัง claim ไฟล์จาก execute/<sub>/ ต้องกลับไป input/<sub>/ ไม่ใช่ input/ เฉย ๆ"""
+    q = build(tmp_path, [])
+    sub = tmp_path / "input" / "15-3"
+    sub.mkdir(parents=True)
+    (sub / "a.xml").write_text("<map/>", encoding="utf-8")
+    q.claim()
+    q.close()
+
+    q2 = WorkQueue(str(tmp_path), str(tmp_path / "log" / "run.jsonl"))
+    assert q2.recover() == 1
+    assert os.path.isfile(tmp_path / "input" / "15-3" / "a.xml")
+    # the file itself must be gone from execute/15-3/ - an emptied-out leftover subfolder
+    # is harmless (nothing here promises to rmdir it; bot/main.py's own periodic
+    # _cleanup_empty_subdirs is the GUI-side tidy-up for that, not this class's job)
+    assert not os.path.isfile(tmp_path / "execute" / "15-3" / "a.xml")
+
+
+# --- C3 (final review): _close() used os.replace, which overwrites on Windows. Two input
+# files can be the same account (flows.py's AccountClaimRegistry docstring cites an
+# observed pair, a0bfb087) and the export name comes from the account's contents, not the
+# input filename, so two DIFFERENT files can legitimately compute the SAME export name.
+# The old bot appended _2.._999 instead of overwriting, with a comment naming this exact
+# case (af264b0:bot/botLineRanger.py:3073-3081, :3136-3144).
+
+def test_finish_numbers_a_colliding_export_name_instead_of_overwriting_it(tmp_path):
+    q = build(tmp_path, ["a.xml", "b.xml"])
+    src_a = q.claim()
+    src_b = q.claim()
+    out_a = q.finish(src_a, "output", "brown_Rb10_Tk2_ID1_Lv3")
+    out_b = q.finish(src_b, "output", "brown_Rb10_Tk2_ID1_Lv3")   # same computed export name
+    assert out_a != out_b
+    assert os.path.isfile(out_a)
+    assert os.path.isfile(out_b)
+    assert sorted(os.listdir(tmp_path / "output")) == [
+        "brown_Rb10_Tk2_ID1_Lv3.xml", "brown_Rb10_Tk2_ID1_Lv3_2.xml"]

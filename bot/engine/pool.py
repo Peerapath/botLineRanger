@@ -102,14 +102,23 @@ class EnginePool:
         # current_lane() (tools/rangers_api.py:183,192), so a thread that ever rebinds
         # would attribute a connection failure to the wrong lane's health counter.
         rangers_api.use_lane(lane)
+        # C2 (final review): GenID must not need queue.claim() to find work - it mints its
+        # own account instead of consuming an input/ file (see flows.SELF_SUPPLIED_MODES's
+        # own docstring). Gating it on claim() made it consume one input file per account
+        # AND stop dead the moment input/ ran dry, when the mode is meant to run until told
+        # to stop.
+        self_supplied = self.mode in flows_mod.SELF_SUPPLIED_MODES
         while not self._stop.is_set():
             if not lane.alive:
                 # proxy ของเธรดนี้ตาย - ออกไปเลย งานที่ยังไม่ถูก claim ยังอยู่ในคิวให้ lane
                 # อื่นหยิบต่อ ไม่มีอะไรหาย
                 return
-            src = self.queue.claim()
-            if src is None:
-                return
+            if self_supplied:
+                src = ""       # _run_one's session starts empty; the flow fills s.src itself
+            else:
+                src = self.queue.claim()
+                if src is None:
+                    return
             self._run_one(lane, src)
 
     def _run_one(self, lane, src) -> None:
@@ -126,27 +135,48 @@ class EnginePool:
         except Exception as err:
             out = Outcome(dest="login failed", status="FAIL", error=str(err)[:200])
 
+        # C2 (final review): a flow can replace session.src with a file IT produced (GenID
+        # mints a brand-new account and writes its own .xml - flows._create_account,
+        # bot/engine/flows.py:295) instead of the file this call started with. The file
+        # that must move to out.dest is whichever one the flow actually ended up holding -
+        # `src` (the queue.claim() result, "" for a self-supplied mode) is stale the moment
+        # the flow reassigns it. For every non-self-supplied mode s.src never changes, so
+        # this is a no-op there. Outcome still only NAMES a destination; the pool still does
+        # the moving - only which path it moves has changed.
+        moved_src = session.src
+
         moved = True
         move_err = ""
-        try:
-            if out.dest == "login failed":
-                self.queue.fail(src, out.error or out.status)
-            else:
-                self.queue.finish(src, out.dest, out.name)
-        except OSError as err:
-            # Finding 1b (review round 1): this used to be logged and nothing else - the
-            # account was then still counted and reported below as if the move above had
-            # succeeded, while its file stayed in execute/ (queue.py's _close now retries
-            # the move itself; this is what happens once those retries are also exhausted).
-            # moved=False is what stops that: out.status/out.dest are still the flow's own,
-            # genuine verdict (that work really happened), but nothing past this point may
-            # claim the file reached out.dest, because it did not.
-            moved = False
-            move_err = str(err)
-            self.reporter.note("could not move %s: %s" % (os.path.basename(src), err))
+        if not moved_src:
+            # A self-supplied mode (GenID) whose every mint attempt raised before a file
+            # ever reached disk - nothing exists to move. The original
+            # (startBotGenID_API_headless) took the same path on a total failure: log and
+            # let the outer while True: mint a fresh attempt, no export call at all.
+            pass
+        else:
+            try:
+                if out.dest == "login failed":
+                    self.queue.fail(moved_src, out.error or out.status)
+                else:
+                    self.queue.finish(moved_src, out.dest, out.name)
+            except OSError as err:
+                # Finding 1b (review round 1): this used to be logged and nothing else - the
+                # account was then still counted and reported below as if the move above had
+                # succeeded, while its file stayed in execute/ (queue.py's _close now retries
+                # the move itself; this is what happens once those retries are also exhausted).
+                # moved=False is what stops that: out.status/out.dest are still the flow's own,
+                # genuine verdict (that work really happened), but nothing past this point may
+                # claim the file reached out.dest, because it did not.
+                moved = False
+                move_err = str(err)
+                self.reporter.note("could not move %s: %s" % (os.path.basename(moved_src), err))
 
         with self._lock:
-            if not moved:
+            if not moved_src:
+                # No file was ever produced (see above) - a real, counted failure, but not
+                # "stuck": nothing is stranded in execute/ for recover() to pick up later.
+                self._fail += 1
+            elif not moved:
                 # Neither done nor fail: out.dest was never reached, so counting this
                 # under either would claim a destination folder holds a file that is
                 # still sitting in execute/ - reproduced as the Critical finding this
@@ -161,8 +191,9 @@ class EnginePool:
                 self._fail += 1
         self.reporter.account(status=out.status, rsn=session.rsn, lv=session.level,
                               ms=int((time.time() - started) * 1000),
-                              dest=(out.dest if moved else "execute"), moved=moved,
-                              lane=lane.name, err=(out.error or "")[:120],
+                              dest=(out.dest if (moved and moved_src)
+                                    else ("execute" if moved_src else "none")),
+                              moved=moved, lane=lane.name, err=(out.error or "")[:120],
                               move_err=move_err[:120])
 
     def _spawn(self, lane, threads: list, prefix: str = "") -> None:
