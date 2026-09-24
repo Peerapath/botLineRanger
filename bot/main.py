@@ -23,6 +23,8 @@ import time
 import threading
 import re
 import configparser
+import json   # parses engine JSONL lines (bot/engine/report.py) - explicit rather than relying
+              # on botLineRanger's own `import json` riding in through `from botLineRanger import *`
 
 
 # ------------------------
@@ -324,10 +326,23 @@ class EmulatorManager(ctk.CTk):
         self.check_vars = []
         self.all_selected = False
         self.bot_processes = {}
-        self.worker_procs = {}            # Login headless workers (subprocess.Popen ของ bot_worker.py)
+        self.worker_procs = {}            # holds one subprocess.Popen under key "engine" while
+                                           # a headless (Login/Level3/GenID/Stage) run is active
         self.status_labels = {}
         self.control_buttons = {}
-        self._worker_monitor_job = None   # ตัวจับเวลาตัวเดียวคุมทุก worker ในโหมด Login (headless)
+        self._worker_monitor_job = None   # after() id of the currently-scheduled _drain_engine_rows
+
+        # State for the single engine subprocess (Task 10: one engine process instead of up to
+        # 128 bot_worker.py processes). Global constraint: nothing module-level that a thread
+        # touches - _engine_rows/_engine_lock are instance attributes for exactly that reason,
+        # shared only between the reader thread (_read_engine) and the GUI thread (_drain_engine_rows).
+        self._engine_reader_thread = None  # Thread running _read_engine(proc), or None
+        self._engine_lock = threading.Lock()
+        self._engine_rows = []             # JSONL rows buffered since the last _drain_engine_rows tick
+        self._engine_err = None            # open file handle backing the engine's stderr (never DEVNULL)
+        self._engine_last_stat = {}         # most recent "stat" row, for _updateEngineStats
+        self._engine_lanes = {}             # lane name -> latest "lane" row
+        self._engine_session_rows = []      # capped history of finished accounts ("acct" rows)
 
         # Config
         self.config = configparser.ConfigParser()
@@ -1680,7 +1695,7 @@ class EmulatorManager(ctk.CTk):
         if TOOLSDIR not in sys.path:
             sys.path.insert(0, TOOLSDIR)
         import ratelimit
-        rps = self.config.get("settings", "apirps", fallback="80").strip() or "80"
+        rps = self.config.get("settings", "apirps", fallback="90").strip() or "90"
         proxies = ratelimit.parse_proxies(self.config.get("settings", "apiproxies", fallback=""))
         # ตรวจค่าตรงนี้ ไม่งั้น worker (CREATE_NO_WINDOW) จะตายเงียบตอน import ratelimit
         # และผู้ใช้เห็นแค่ "0/N thread" โดยไม่รู้สาเหตุ -> ใช้ค่าเริ่มต้นแทนแล้วเตือนครั้งเดียว
@@ -1688,8 +1703,8 @@ class EmulatorManager(ctk.CTk):
         try:
             float(rps)
         except ValueError:
-            bad.append("apirps = %r (ต้องเป็นตัวเลข เช่น 80)" % rps)
-            rps = "80"
+            bad.append("apirps = %r (ต้องเป็นตัวเลข เช่น 90)" % rps)
+            rps = "90"
         good_proxies = []
         for proxy in proxies:
             try:
@@ -1733,33 +1748,170 @@ class EmulatorManager(ctk.CTk):
                                  "ถ้าเป็น HTTP 429 ให้รอ 1 นาทีแล้วกดเริ่มใหม่ (โควตา 2 ครั้ง/นาที/IP)")
             return False
 
-    def _spawn_worker(self, device, mode="ranger_api_Login"):
-        """สปอว์น 1 worker เป็น subprocess ของ bot_worker.py (ไม่ re-import main = ไม่โหลด GUI)
+    def _app_root(self):
+        """Base directory for the engine subprocess's cwd and stderr-log path.
 
-        subprocess แทน multiprocessing เพราะบน Windows multiprocessing spawn จะ re-import main.py
-        (มี class EmulatorManager(ctk.CTk) ระดับ module) ทำให้ทุก worker โหลด customtkinter+u2 (~59MB)
-        subprocess ของไฟล์เบา bot_worker.py -> ~30-45MB/worker -> รันเป็นพันตัวได้
-
-        mode บอก worker ว่าจะรัน Login (relogin จากไฟล์) หรือ GenID (mint บัญชีใหม่) headless
+        Beside the exe when frozen - __file__ resolves into PyInstaller onefile's temp
+        extraction dir instead of the real install location (the same problem _rl_dir()
+        above solves the same way for .ratelimit), so sys.executable is used instead of
+        __file__ in that case. The bot/ source directory otherwise. engine_main.py assumes
+        its cwd IS this directory: it reads src/config.ini and the input/output/execute/
+        backup folders relative to os.getcwd(), never relative to its own __file__.
         """
-        botdir = os.path.dirname(os.path.abspath(__file__))
-        no_window = 0x08000000  # CREATE_NO_WINDOW: ไม่เด้ง console ต่อ worker (สำคัญตอนมีพันตัว)
-        if getattr(sys, 'frozen', False):
-            # frozen: exe รันสคริปต์ .py ไม่ได้ -> re-exec exe ในโหมด --worker (main.py __main__ จัดการ)
-            args = [sys.executable, "--worker", device, mode]
-        else:
-            args = [sys.executable, os.path.join(botdir, "bot_worker.py"), device, mode]
-        return subprocess.Popen(args, cwd=botdir, creationflags=no_window, env=self._worker_env())
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
 
-    def _monitor_workers(self):
-        """ตัวจับเวลาตัวเดียวคุมทุก worker (แทน monitor ต่อโปรเซส) - ลื่นแม้มีเป็นพันตัว"""
-        for dev in [d for d, p in list(self.worker_procs.items()) if p.poll() is not None]:
-            self.worker_procs.pop(dev, None)
-        self._update_worker_summary()
-        if self.worker_procs:
-            self._worker_monitor_job = self.after(1000, self._monitor_workers)
+    def _spawn_engine(self, mode="ranger_api_Login"):
+        """สปอว์น engine หนึ่งตัว - ไม่ใช่ N worker อีกแล้ว
+
+        เดิม N worker คูณทุกอย่าง: 128 โปรเซส x 44 MB และเมื่อ frozen ยังคูณการแตก
+        บันเดิล onefile 87 MB ลง %TEMP% ของแต่ละตัวอีกชั้น ตอนนี้เธรดอยู่ในโปรเซสเดียว
+        และ engine เป็นคนแบ่งเธรดตาม proxy เอง
+        """
+        botdir = self._app_root()
+        no_window = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        if getattr(sys, "frozen", False):
+            args = [sys.executable, "--engine", mode]
         else:
-            self._worker_monitor_job = None
+            args = [sys.executable, os.path.join(botdir, "engine_main.py"), mode]
+        err_path = os.path.join(botdir, "src", "log", "engine.err")
+        os.makedirs(os.path.dirname(err_path), exist_ok=True)
+        # stderr ลงไฟล์ ไม่ใช่ DEVNULL: traceback ของลูกที่ตายเงียบคือหลักฐานชิ้นเดียวที่มี
+        if self._engine_err is not None:
+            # Close the previous run's handle first - without this, each Start click
+            # opened a fresh handle without ever closing the last one: a real fd leak
+            # over a long GUI session (the new "w" open still truncates the same path,
+            # so it is invisible in engine.err's contents, only in open-handle count).
+            try:
+                self._engine_err.close()
+            except Exception:
+                pass
+        self._engine_err = open(err_path, "w", encoding="utf-8")
+        return subprocess.Popen(
+            args, cwd=botdir, creationflags=no_window, env=self._worker_env(),
+            stdout=subprocess.PIPE, stderr=self._engine_err,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+
+    def log(self, msg):
+        """Bridges engine notes into this build's only "log" - the console - reusing
+        botLineRanger.log()'s own timestamp format (imported via `from botLineRanger
+        import *` above) so this reads the same as every other headless print already does.
+        """
+        log(msg)   # module-level botLineRanger.log, not self-recursion - see docstring above
+
+    def _read_engine(self, proc):
+        """อ่าน JSONL จาก engine สะสมไว้ แล้วให้ตัวจับเวลาของ GUI ไปวาดทีเดียว
+
+        วาดทุกบรรทัดคือการวาดหลายร้อยครั้งต่อวินาทีตอนฝูงเต็มกำลัง แผงคุมจะช้าลง
+        เรื่อย ๆ ตลอดเวลาที่บอทรัน
+        """
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            with self._engine_lock:
+                self._engine_rows.append(row)
+
+    def _dispatch_engine_row(self, row):
+        """One JSONL row -> the GUI state it updates. Called only from _drain_engine_rows,
+        never directly from the reader thread (see that method's own docstring)."""
+        kind = row.get("t")
+        if kind == "stat":
+            self._updateEngineStats(row)
+        elif kind == "acct":
+            self._appendSessionRow(row)
+        elif kind == "lane":
+            self._updateLane(row)
+        elif kind == "note":
+            self.log(row.get("msg", ""))
+
+    def _drain_engine_rows(self):
+        """เรียกจาก self.after(1000, ...) ของ GUI
+
+        วาดทุกบรรทัดคือการวาดหลายร้อยครั้งต่อวินาทีตอนฝูงเต็มกำลัง แผงคุมจะช้าลง
+        เรื่อย ๆ ตลอดเวลาที่บอทรัน
+
+        Reschedules on the reader thread's liveness, not on self.worker_procs: the reader
+        (_read_engine) only returns once proc.stdout hits EOF, i.e. once the engine has
+        genuinely exited and closed the pipe, and every row it ever wrote is guaranteed to
+        already be in _engine_rows by the time that happens (each line is appended
+        synchronously inside its own read loop, before that loop can move on to notice EOF).
+        Checking self.worker_procs instead - true the instant Start is clicked, and nothing
+        here would ever pop it back out - would simply never stop rescheduling; popping it
+        eagerly on the process's own exit instead could drop whatever the reader thread was
+        still one line behind on, and the final stat(final=True) summary line is exactly the
+        one line that must never be the line a race like that drops (see the Stop button's
+        own docstring for the sibling project this class of bug once cost 1,427 accounts).
+        """
+        with self._engine_lock:
+            rows, self._engine_rows = self._engine_rows, []
+        for row in rows:
+            try:
+                self._dispatch_engine_row(row)
+            except Exception as exc:
+                # One odd-shaped row must not silently kill this loop for the rest of the
+                # run - if the `after` reschedule below never runs, nothing ever drains
+                # _engine_rows again even though the engine process keeps writing to it.
+                print("drain_engine_rows: bad row %r: %s" % (row, exc), flush=True)
+
+        reader = self._engine_reader_thread
+        if reader is not None and reader.is_alive():
+            self._worker_monitor_job = self.after(1000, self._drain_engine_rows)
+            return
+
+        # Reader thread is confirmed dead (proc.stdout hit EOF) - one last drain for
+        # anything appended between the copy above and this check, then stop for good.
+        with self._engine_lock:
+            rows, self._engine_rows = self._engine_rows, []
+        for row in rows:
+            try:
+                self._dispatch_engine_row(row)
+            except Exception as exc:
+                print("drain_engine_rows: bad row %r: %s" % (row, exc), flush=True)
+
+        self.worker_procs.pop("engine", None)
+        self._worker_monitor_job = None
+        self._update_worker_summary()
+
+    def _updateEngineStats(self, row):
+        """Repaints the one summary label from the latest "stat" row. Only ever called
+        from within _drain_engine_rows's once-a-second batch, never per JSONL line -
+        see that method's docstring for why redrawing per line is the mistake to avoid."""
+        self._engine_last_stat = row
+        if not hasattr(self, "worker_summary_label") or not self.worker_summary_label.winfo_exists():
+            return
+        text = ("engine: done %(done)s / fail %(fail)s / stuck %(stuck)s / left %(left)s "
+                "- %(rate)s acc/s - %(threads)s thread / %(lanes)s lane" % {
+                    "done": row.get("done", 0), "fail": row.get("fail", 0),
+                    "stuck": row.get("stuck", 0), "left": row.get("left", 0),
+                    "rate": row.get("rate", 0), "threads": row.get("threads", "-"),
+                    "lanes": row.get("lanes", "-")})
+        if row.get("final"):
+            text = "engine finished - " + text
+        self.worker_summary_label.configure(text=text, text_color=whiteblue)
+
+    def _appendSessionRow(self, row):
+        """Capped in-memory history of finished accounts, plus one console line per
+        account. Both are cheap even at hundreds/sec because this only ever runs from
+        within _drain_engine_rows's once-a-second batch, not once per line."""
+        self._engine_session_rows.append(row)
+        del self._engine_session_rows[:-500]   # keep only the most recent 500
+        extra = (" err=%s" % row["err"]) if row.get("err") else ""
+        self.log("%s rsn=%s lv=%s dest=%s ms=%s%s" % (
+            row.get("status", "?"), row.get("rsn", "?"), row.get("lv", "?"),
+            row.get("dest", "?"), row.get("ms", "?"), extra))
+
+    def _updateLane(self, row):
+        """Lane state changes are rare (a handful per run, not per account) so there is
+        no per-line-cost concern here the way there is for _appendSessionRow."""
+        self._engine_lanes[row.get("name", "?")] = row
+        extra = (" (%s)" % row["reason"]) if row.get("reason") else ""
+        self.log("lane %s: %s%s" % (row.get("name", "?"), row.get("state", "?"), extra))
 
     def _start_workers(self):
         self.save_config()
@@ -1767,64 +1919,71 @@ class EmulatorManager(ctk.CTk):
             return
         readConfigFile()
 
-        # หยุด worker เก่าก่อน (กัน spawn ซ้อน)
-        self._stop_workers(silent=True)
+        # Refuse a second engine instead of silently stopping-then-starting: unlike the old
+        # N-worker model where Stop was an instant terminate(), stopping the engine now means
+        # asking it to drain (see _stop_workers below), which can take up to 90s. Restarting
+        # here without waiting for that could leave two engines alive at once, each claiming
+        # files out of the same input/execute folders the other already owns.
+        old = self.worker_procs.get("engine")
+        if old is not None and old.poll() is None:
+            messagebox.showwarning(
+                "Engine already running",
+                "A run is already in progress. Click Stop and wait for it to finish "
+                "before starting a new one.")
+            return
+        self.worker_procs.pop("engine", None)
 
-        # โหมดปัจจุบัน (Login = relogin จาก input, GenID = mint บัญชีใหม่) worker ใช้ค่านี้เลือกฟังก์ชัน
+        # โหมดปัจจุบัน (Login = relogin จาก input, GenID = mint บัญชีใหม่) engine ใช้ค่านี้เลือก flow
         mode_key = self._currentModeKey() or "ranger_api_Login"
-        # Login/Stage ใช้ cc ร่วมตัวเดียว (mint ที่นี่) GenID mint ต่อบัญชีเองผ่านคิวโควตาใน tools/
+        # Login/Level3/Stage ใช้ cc ร่วมตัวเดียว (mint ที่นี่) GenID mint ต่อบัญชีเองผ่านคิวโควตาใน tools/
         if mode_key != "ranger_api_GenID" and not self._prepare_shared_cc():
             return
 
-        # รันตามจำนวนที่ตั้งไว้เต็ม ๆ (ปลด cap ตาม RAM แล้ว) - แค่เตือนถ้าเกินที่ RAM น่าจะรับไหว
-        run_count = self.thread_count
-        _fit, cap = self._safe_worker_cap(self.thread_count)
-        if run_count > cap:
-            print(f"เตือน: รัน {run_count} thread แต่ RAM น่าจะรับไหวราว ~{cap} "
-                  f"(แต่ละ worker ~45MB) เสี่ยงหน่วยความจำหมด/ช้า", flush=True)
-        serials = [f"worker-{i+1}" for i in range(run_count)]
-        # Login แบ่งไฟล์ input/ ให้แต่ละ worker + ล้าง lock ค้าง; GenID สร้างบัญชีใหม่เอง ไม่กินไฟล์ input
-        if mode_key != "ranger_api_GenID":
-            note_file_in_folder(serials)
+        try:
+            proc = self._spawn_engine(mode_key)
+        except Exception as e:
+            print(f"spawn engine failed: {e}", flush=True)
+            return
+        self.worker_procs["engine"] = proc
+        self._engine_reader_thread = threading.Thread(
+            target=self._read_engine, args=(proc,), daemon=True, name="engine-reader")
+        self._engine_reader_thread.start()
         self._update_worker_summary()
-
-        def start_with_delay(i):
-            if i >= len(serials):
-                return
-            dev = serials[i]
-            try:
-                self.worker_procs[dev] = self._spawn_worker(dev, mode_key)
-            except Exception as e:
-                print(f"spawn worker {dev} failed: {e}", flush=True)
-            self._update_worker_summary()
-            # stagger การเริ่ม เพื่อไม่ให้ยิง login พร้อมกันทั้งหมด (กันเซิร์ฟเวอร์ rate-limit)
-            self.after(int(timeInterval) if timeInterval else 300, lambda: start_with_delay(i + 1))
-
-        start_with_delay(0)
-        # ตัวจับเวลาตัวเดียวคุมทุก worker
         if getattr(self, "_worker_monitor_job", None) is None:
-            self._monitor_workers()
+            self._worker_monitor_job = self.after(1000, self._drain_engine_rows)
 
     def _stop_workers(self, silent=False):
-        stopped = []
-        for dev, p in list(self.worker_procs.items()):
-            if p.poll() is None:
-                try:
-                    p.terminate()
-                    stopped.append(dev)
-                except Exception:
-                    pass
-            self.worker_procs.pop(dev, None)
-        job = getattr(self, "_worker_monitor_job", None)
-        if job is not None:
+        proc = self.worker_procs.get("engine")
+        if proc is None or proc.poll() is not None:
+            self.worker_procs.pop("engine", None)
+            if not silent:
+                print("No running workers to stop.")
+            return
+        # ขอให้ engine หยุดรับงานใหม่แล้วปล่อยให้บัญชีที่ค้างอยู่จบ - terminate() ทันที
+        # ทิ้งทั้งงานครึ่งทางและยอดสุดท้ายของมัน (เคยขาดไป 1,427 ใบในรอบ mint จริง)
+        flag = os.path.join(self._app_root(), "src", "log", "stop.flag")
+        try:
+            os.makedirs(os.path.dirname(flag), exist_ok=True)
+            open(flag, "w").close()
+        except OSError as err:
+            self.log("stop flag failed: %s" % err)
+
+        # The 90s grace window + fallback terminate() run on a throwaway thread, not here:
+        # this method runs directly on the Stop button's click handler, on the GUI thread,
+        # and proc.wait(timeout=90) right here would freeze the whole window for up to 90
+        # seconds. _drain_engine_rows - already running on its own self.after(1000, ...)
+        # timer since Start was clicked - notices proc.poll() go non-None by itself once the
+        # engine actually exits (drained or forced) and does the worker_procs/label cleanup;
+        # this thread's only job is the wait and, if it comes to that, the forced terminate().
+        def _grace_then_force():
             try:
-                self.after_cancel(job)
-            except Exception:
-                pass
-            self._worker_monitor_job = None
-        self._update_worker_summary()
-        if not silent and not stopped:
-            print("No running workers to stop.")
+                proc.wait(timeout=90)       # ให้เวลาระบายงานที่ค้าง
+            except subprocess.TimeoutExpired:
+                proc.terminate()            # ไม่ยอมจบใน 90 วิถึงค่อยบังคับ
+
+        threading.Thread(target=_grace_then_force, daemon=True, name="engine-stop-grace").start()
+        if not silent:
+            self.log("stop requested - waiting for in-flight accounts to finish (up to 90s)")
 
     def monitor_bot(self, dev, p):
         if p.is_alive():
@@ -2529,15 +2688,11 @@ def note_file_in_folder(selected_devices: list):
         print(f"{device} = {count} ไฟล์")
 
 if __name__ == "__main__":
-    # โหมด worker (เฉพาะ frozen exe ที่รันสคริปต์ .py ไม่ได้): รัน Login headless แล้วออก ไม่เปิด GUI
-    # dev รันผ่าน bot_worker.py โดยตรง จึงไม่เข้าเงื่อนไขนี้
-    if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
-        try:
-            from bot_worker import run_worker
-            _mode = sys.argv[3] if len(sys.argv) > 3 else "ranger_api_Login"
-            run_worker(sys.argv[2], _mode)
-        finally:
-            sys.exit(0)
+    # โหมด engine (เฉพาะ frozen exe ที่รันสคริปต์ .py ไม่ได้) - รันคิวจนหมดแล้วออก ไม่เปิด GUI
+    # dev รันผ่าน engine_main.py โดยตรง จึงไม่เข้าเงื่อนไขนี้
+    if len(sys.argv) > 1 and sys.argv[1] == "--engine":
+        from engine_main import main as engine_main
+        sys.exit(engine_main(["engine"] + sys.argv[2:]))
 
     # ===== Runtime Protection Checks =====
     if _HAS_PROTECTION:
