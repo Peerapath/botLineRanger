@@ -32,6 +32,9 @@ MAX_ATTEMPTS = 3
 # relogin.login (e.g. a bad account file).
 RETRY_BACKOFF_SECONDS = (5.0, 15.0)
 
+# รอบของ _force_stage: clear_range จบด้วย "failed" แล้วดันต่อจากด่านล่าสุดได้อีกกี่ครั้ง (รวมรอบแรก)
+STAGE_PUSH_ROUNDS = 3
+
 
 class PermanentFailure(Exception):
     """The server's real answer about this account, not a transient condition - e.g. a
@@ -334,21 +337,42 @@ def _force_stage(s: AccountSession, cfg: dict) -> str:
     ด่าน (จาก _fetch_home) ทั้งที่ตอนนี้เลเวลขยับไปแล้วจริง ๆ
     """
     import stage_forge
-    player = stage_forge.player_info(s.cookie)
-    first = stage_forge.start_stage(s.cookie, player)
     last = int(cfg.get("stageend") or 150)
-    if first > last:
-        return "done"          # ผ่านเป้าไปแล้ว ไม่มีอะไรต้องทำ
-    # ดีเลย์ระหว่างด่าน (settings.stagedelay) ค่าเริ่มต้น 0: rate limit ทั้งสองชั้นมีตัวคุมอยู่แล้วใน
-    # rangers_api (ช่องว่าง 350 ms ต่อบัญชี + ถังต่อ IP) ค่า 3 วิของ CLI เคยกินเวลาครึ่งหนึ่งของแต่ละด่าน
-    _cleared, reason = stage_forge.clear_range(s.cookie, s.rsn, first, last,
-                                               delay=float(cfg.get("stagedelay") or 0),
-                                               progress=_quiet)
+    failures: list[str] = []
+    reason = "done"
+    for _round in range(STAGE_PUSH_ROUNDS):
+        player = stage_forge.player_info(s.cookie)
+        first = stage_forge.start_stage(s.cookie, player)
+        if first > last:
+            reason = "done"    # ผ่านเป้าไปแล้ว ไม่มีอะไรต้องทำ
+            break
+        # ดีเลย์ระหว่างด่าน (settings.stagedelay) ค่าเริ่มต้น 0: rate limit ทั้งสองชั้นมีตัวคุมอยู่แล้วใน
+        # rangers_api (ช่องว่าง 350 ms ต่อบัญชี + ถังต่อ IP) ค่า 3 วิของ CLI เคยกินเวลาครึ่งหนึ่งของแต่ละด่าน
+        _cleared, reason = stage_forge.clear_range(s.cookie, s.rsn, first, last,
+                                                   delay=float(cfg.get("stagedelay") or 0),
+                                                   progress=_failure_log(failures))
+        if reason != "failed":
+            break
+        # "failed" = เซฟ/enter พังซ้ำจน clear_range ยอมแพ้ที่ด่านนั้น ส่วนใหญ่เป็นอาการชั่วคราวของ
+        # เซิร์ฟเวอร์ (วัดสด 2026-09-24: ไอดีที่หยุดแบบนี้ที่ ~st109 ดันต่อจนถึง st150 ได้ทันทีไม่มีสะดุด)
+        # เริ่มรอบใหม่จากด่านล่าสุดของ /stage/last - ด่านที่ผ่านแล้วไม่ถูกเล่นซ้ำ
+    s.cache["stage_note"] = ("stage stop=%s%s" % (reason, " (%s)" % failures[-1][:90] if failures else "")
+                             if reason != "done" else "")
     try:
         s.level = int(stage_forge.player_info(s.cookie).get("level") or s.level)
     except Exception:
         pass    # อ่านเลเวลใหม่ไม่ได้ ไม่ใช่เหตุให้ทั้ง session พัง (เหมือน apiForceStage เดิม)
     return reason
+
+
+def _failure_log(sink: list):
+    """progress ของ clear_range ที่ไม่ print (ดู _quiet) แต่เก็บบรรทัดที่บอกว่าทำไมหยุดไว้ใน sink
+    ให้แถวของบัญชีใน GUI บอกได้ว่าติดที่ด่านไหนเพราะอะไร แทนที่จะเห็นแค่ "stage stop=failed"
+    """
+    def progress(msg, *_args, **_kwargs):
+        if "FAILED" in msg or "out of hearts" in msg:
+            sink.append(msg)
+    return progress
 
 
 def _quiet(*_args, **_kwargs) -> None:
@@ -677,8 +701,11 @@ def run_stage(s: AccountSession, cfg: dict) -> Outcome:
                                error="stage push flagged by server")
             # ต้นฉบับไม่เคยเรียก apiAcceptAllRewards ในโหมด Stage เลย (ต่างจาก Level3/GenID) -
             # ไม่มี _claim_rewards ตรงนี้จึงตรงกับของจริง ไม่ใช่ตกหล่น (ดู task-8-report.md)
+            # ดันไม่ถึงเป้า (heart หมด/ด่านล็อก/เซฟพังซ้ำ) ยังส่งออกตามเดิม แต่ต้องบอกให้เห็นในแถวของบัญชี
+            stage_note = s.cache.get("stage_note") or ""
             _account_info(s)
-            return Outcome(dest="output", name=_export_name(s), status="OK", error=s.error)
+            return Outcome(dest="output", name=_export_name(s), status="OK",
+                           error="; ".join(n for n in (s.error, stage_note) if n))
         except client_version.VersionUnavailable:
             raise           # ให้ pool หยุด engine - ดูคอมเมนต์เดียวกันใน run_login
         except PermanentFailure as err:
@@ -704,7 +731,7 @@ def run_quest(s: AccountSession, cfg: dict) -> Outcome:
     """
     last = ""
     tutorial_done = stage_done = quest_done = False
-    stage_reason = quest_note = ""
+    stage_reason = stage_note = quest_note = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         s.attempts = attempt
         try:
@@ -721,6 +748,7 @@ def run_quest(s: AccountSession, cfg: dict) -> Outcome:
                     # start_stage อ่านด่านล่าสุดจาก /stage/last รอบหน้าจึงดันต่อจากจุดที่ค้าง ไม่ซ้ำ
                     raise RuntimeError("stage push: token rejected (HTTP 401)")
                 stage_done = True
+                stage_note = s.cache.get("stage_note") or ""   # cache ถูกล้างทุก attempt เก็บไว้เอง
                 if stage_reason == "flagged":
                     # เหมือน run_stage: ไอดีที่โดนตีธงห้ามปนกับไอดีที่ใช้ได้ใน output/ และห้ามยิงต่อ
                     return Outcome(dest="login failed", status="FLAG",
@@ -732,10 +760,8 @@ def run_quest(s: AccountSession, cfg: dict) -> Outcome:
             # (หลักไมล์รูบี้ 50/150/200 ได้ระหว่าง walk)
             _fetch_home(s)
             _account_info(s)
-            notes = [s.error, quest_note]
-            if stage_reason != "done":
-                # ดันไม่ถึงเป้า (heart หมด/ด่านล็อก/เซฟไม่ผ่าน) ไม่ใช่เหตุให้ทิ้งไอดี แต่ต้องบอกให้เห็น
-                notes.insert(1, "stage stop=%s" % stage_reason)
+            # ดันไม่ถึงเป้า (heart หมด/ด่านล็อก/เซฟไม่ผ่าน) ไม่ใช่เหตุให้ทิ้งไอดี แต่ต้องบอกให้เห็น
+            notes = [s.error, stage_note, quest_note]
             return Outcome(dest="output", name=_export_name(s), status="OK",
                            error="; ".join(n for n in notes if n))
         except client_version.VersionUnavailable:

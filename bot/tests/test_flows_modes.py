@@ -580,7 +580,12 @@ def test_genid_ignores_account_claims_even_when_present(tmp_path, monkeypatch):
 def quest_stub(monkeypatch, calls, stage="done", quest="quest 18/29 blocked@idx18 exp_booster"):
     stub(monkeypatch, calls)
     monkeypatch.setattr(flows, "_skip_tutorial", lambda s: (calls.append("tutorial"), (65, 67))[1])
-    monkeypatch.setattr(flows, "_force_stage", lambda s, cfg: (calls.append("stage"), stage)[1])
+    def fake_force_stage(s, cfg):
+        calls.append("stage")
+        s.cache["stage_note"] = "" if stage == "done" else "stage stop=%s" % stage   # same as the real one
+        return stage
+
+    monkeypatch.setattr(flows, "_force_stage", fake_force_stage)
     monkeypatch.setattr(flows, "_newbie_quest", lambda s: (calls.append("quest"), quest)[1])
 
 
@@ -787,22 +792,81 @@ def test_newbie_quest_raises_when_the_token_dies_mid_walk(monkeypatch):
         flows._newbie_quest(s)
 
 
-def test_force_stage_keeps_clear_range_progress_off_stdout(monkeypatch):
+def test_force_stage_keeps_clear_range_progress_off_stdout(monkeypatch, capsys):
     """stdout ของ engine คือช่อง JSONL - clear_range ต้องไม่ print ทีละด่านลงไปแทรกแถวของ Reporter"""
     import stage_forge
 
-    seen = {}
     monkeypatch.setattr(stage_forge, "player_info", lambda cookie: {"rsn": "ID1", "level": 5})
     monkeypatch.setattr(stage_forge, "start_stage", lambda cookie, player: 3)
 
-    def fake_clear_range(cookie, rsn, first, last, **kw):
-        seen.update(kw)
+    def fake_clear_range(cookie, rsn, first, last, progress=print, **kw):
+        progress("st03 cleared  level=6 exp=+1 coin=+1 hearts=5")
+        progress("st04 FAILED (try 1/3) {}")
         return last, "done"
 
     monkeypatch.setattr(stage_forge, "clear_range", fake_clear_range)
     s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t", rsn="ID1")
     flows._force_stage(s, dict(CFG, stageend=150))
-    assert seen["progress"] is flows._quiet
+    assert capsys.readouterr().out == ""
+
+
+def _pushes(monkeypatch, reasons, starts=None):
+    """_force_stage against scripted clear_range stop reasons; returns (reason, note, calls)."""
+    import stage_forge
+
+    calls = {"clear_range": 0, "start_stage": 0}
+    reasons = iter(reasons)
+    starts = iter(starts or [3, 60, 90, 120])
+    monkeypatch.setattr(stage_forge, "player_info", lambda cookie: {"rsn": "ID1", "level": 5})
+
+    def fake_start(cookie, player):
+        calls["start_stage"] += 1
+        return next(starts)
+
+    def fake_clear_range(cookie, rsn, first, last, progress=print, **kw):
+        calls["clear_range"] += 1
+        reason = next(reasons)
+        if reason != "done":
+            progress('st%02d FAILED (try 3/3) {"step": "save", "http": 400, "errorCode": 500}' % first)
+        return last, reason
+
+    monkeypatch.setattr(stage_forge, "start_stage", fake_start)
+    monkeypatch.setattr(stage_forge, "clear_range", fake_clear_range)
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t", rsn="ID1")
+    reason = flows._force_stage(s, dict(CFG, stageend=150))
+    return reason, s.cache["stage_note"], calls
+
+
+def test_force_stage_resumes_from_the_frontier_after_a_failed_push(monkeypatch):
+    """วัดสด 2026-09-24: ไอดีที่ clear_range ยอมแพ้ที่ ~st109 ดันต่อถึง st150 ได้ทันที - อาการชั่วคราว"""
+    reason, note, calls = _pushes(monkeypatch, ["failed", "done"])
+    assert reason == "done"
+    assert note == ""
+    assert calls == {"clear_range": 2, "start_stage": 2}
+
+
+def test_force_stage_gives_up_after_its_rounds_and_says_where(monkeypatch):
+    reason, note, calls = _pushes(monkeypatch, ["failed"] * flows.STAGE_PUSH_ROUNDS)
+    assert reason == "failed"
+    assert calls["clear_range"] == flows.STAGE_PUSH_ROUNDS
+    assert note.startswith("stage stop=failed (st90 FAILED")
+
+
+def test_force_stage_does_not_retry_hearts_or_a_locked_stage(monkeypatch):
+    """heart หมด/ด่านล็อก ดันซ้ำทันทีก็ได้คำตอบเดิม - มีแต่ "failed" ที่ควรลองรอบใหม่"""
+    for stop in ("hearts", "locked", "flagged"):
+        reason, note, calls = _pushes(monkeypatch, [stop, "done"])
+        assert reason == stop
+        assert calls["clear_range"] == 1
+        assert note.startswith("stage stop=%s" % stop)
+
+
+def test_stage_reports_a_short_push_in_the_account_row(tmp_path, monkeypatch):
+    calls = []
+    quest_stub(monkeypatch, calls, stage="hearts")
+    out = flows.run("ranger_api_Stage", make(tmp_path), CFG)
+    assert out.dest == "output"
+    assert out.error == "stage stop=hearts"
 
 
 def _delay_seen(monkeypatch, cfg):

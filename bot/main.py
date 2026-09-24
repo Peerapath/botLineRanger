@@ -1393,7 +1393,7 @@ class EmulatorManager(ctk.CTk):
             hint = "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วดันด่านผ่าน API (ไม่เปิดเกม)"
         elif isQuest:
             hint = ("แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วข้ามการสอน ดันด่าน และทำเควสมือใหม่ผ่าน API\n"
-                    "ดันด่าน 150 ด่านใช้เวลาหลายนาทีต่อไอดี (ตั้งดีเลย์ระหว่างด่านได้ในแผงตั้งค่าโหมด)")
+                    "ดันด่าน 150 ด่าน ~9 นาทีต่อไอดี (ตั้งดีเลย์ระหว่างด่านได้ในแผงตั้งค่าโหมด)")
         ctk.CTkLabel(self.left_frame, text=hint,
                      text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=8, pady=(2, 6))
 
