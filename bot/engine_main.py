@@ -163,8 +163,50 @@ def attach_cc_pools(lanes) -> None:
     no reason this task asked for.
     """
     for lane in lanes:
-        rangers_api.use_lane(lane)
-        lane.cc_pool = relogin.CcPool(share_file=os.environ.get("LGRGS_CC_FILE") or None)
+        lane.cc_pool = _LazyCcPool()
+
+
+class _LazyCcPool:
+    """One lane's CcPool, built on first use rather than at startup.
+
+    The first version of attach_cc_pools built a real CcPool per lane right here, which
+    looked harmless and was not: relogin.CcPool.__init__ ends in self._mint() whenever the
+    shared file holds nothing fresh, so CONSTRUCTING one registers a real guest account
+    against game-api.line.me. Attaching eagerly therefore minted one guest per lane on
+    every engine start, for every mode - including a run that then found an empty input/
+    and had nothing to do at all. At the 50 proxies this design is for, that is 50 throwaway
+    LINE accounts per start, against a quota of 2 per IP per minute. Caught when a build
+    smoke test with an empty input/ made two real calls to the game's auth endpoint.
+
+    Deferring also removes the reason attach_cc_pools had to bind each lane to this thread
+    before minting: the first get() now happens inside a worker, which called
+    rangers_api.use_lane(lane) as its first statement (bot/engine/pool.py's _worker), so a
+    mint that does happen already goes out that lane's proxy and spends that lane's quota.
+
+    The lock matters: every thread on a lane shares this object, and without it two threads
+    arriving together would each see _pool as None and build one - which is the per-account
+    minting this whole mechanism exists to stop, just narrowed to a startup race.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pool = None
+
+    def _real(self):
+        with self._lock:
+            if self._pool is None:
+                self._pool = relogin.CcPool(
+                    share_file=os.environ.get("LGRGS_CC_FILE") or None)
+            return self._pool
+
+    def get(self):
+        return self._real().get()
+
+    def renew(self, cc):
+        return self._real().renew(cc)
+
+    def mark_proven(self):
+        return self._real().mark_proven()
 
 
 def main(argv):

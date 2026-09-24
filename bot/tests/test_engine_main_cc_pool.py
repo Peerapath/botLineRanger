@@ -63,20 +63,47 @@ class FakeCcPool:
         self.bound_lane = ra.current_lane()
         FakeCcPool.instances.append(self)
 
+    # The real CcPool's surface, as flows._relogin uses it. Needed now that the pool is
+    # built on first use rather than at attach time: these tests have to reach through
+    # _LazyCcPool to trigger the build, and a fake that only records construction would
+    # fail on the very call that does the triggering.
+    def get(self):
+        return "cc-%d" % FakeCcPool.instances.index(self)
+
+    def renew(self, cc):
+        return self.get()
+
+    def mark_proven(self):
+        pass
+
 
 def test_each_lane_gets_its_own_pool_built_while_that_lane_is_bound(monkeypatch):
+    """The mint must happen while ITS OWN lane is the thread-local current_lane(), or it
+    goes out through the no-lane CLI fallback instead of that lane's proxy and spends the
+    wrong quota.
+
+    attach_cc_pools used to guarantee this by binding each lane itself and minting on the
+    spot. It no longer mints at startup at all - constructing a CcPool registers a real
+    guest account, so doing that per lane cost one throwaway LINE account per lane on every
+    engine start, including a run that found an empty input/ and did nothing. The guarantee
+    now comes from where the first use happens: a worker thread calls use_lane(lane) as its
+    first statement (bot/engine/pool.py's _worker) and only then reaches _relogin. This
+    test plays that worker.
+    """
     monkeypatch.setattr(engine_main.relogin, "CcPool", FakeCcPool)
     monkeypatch.delenv("LGRGS_CC_FILE", raising=False)
     FakeCcPool.instances = []
     lanes = [FakeLane("1.2.3.4:8000"), FakeLane("5.6.7.8:9000"), FakeLane("direct")]
 
     engine_main.attach_cc_pools(lanes)
+    assert FakeCcPool.instances == [], "attaching alone must not mint"
 
-    assert [inst.bound_lane for inst in FakeCcPool.instances] == lanes, (
-        "each pool must be minted while ITS OWN lane is the thread-local current_lane() - "
-        "otherwise the mint goes out via the no-lane CLI fallback, not that lane's proxy")
-    assert all(isinstance(lane.cc_pool, FakeCcPool) for lane in lanes)
-    assert len({id(lane.cc_pool) for lane in lanes}) == 3, (
+    for lane in lanes:                      # what a worker thread does, in its own order
+        ra.use_lane(lane)
+        lane.cc_pool.get()
+
+    assert [inst.bound_lane for inst in FakeCcPool.instances] == lanes
+    assert len({id(inst) for inst in FakeCcPool.instances}) == 3, (
         "three lanes must get three distinct pool objects, not one shared instance")
 
 
@@ -92,6 +119,7 @@ def test_attach_cc_pools_passes_lgrgs_cc_file_through_like_the_per_call_fallback
     lanes = [FakeLane("only")]
 
     engine_main.attach_cc_pools(lanes)
+    lanes[0].cc_pool.get()          # the env var is read when the pool is really built
 
     assert FakeCcPool.instances[0].share_file == r"C:\fake\cc.txt"
 
@@ -106,5 +134,6 @@ def test_attach_cc_pools_treats_a_blank_lgrgs_cc_file_as_unset(monkeypatch):
     lanes = [FakeLane("only")]
 
     engine_main.attach_cc_pools(lanes)
+    lanes[0].cc_pool.get()          # the env var is read when the pool is really built
 
     assert FakeCcPool.instances[0].share_file is None
