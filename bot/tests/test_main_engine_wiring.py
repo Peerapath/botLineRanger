@@ -362,6 +362,12 @@ def test_drain_engine_rows_second_phase_catches_a_row_that_lands_in_the_exact_ga
         "drained, not lost - this is the mechanism behind the 1,427-account story above")
     assert not scheduled, "reader is dead -> must not reschedule even though a late row arrived"
     assert gui.worker_procs.get("engine") is None
+    assert "done 9" in gui.worker_summary_label.texts[-1], (
+        "the tally has to survive on the LABEL, not just in _engine_last_stat: "
+        "_update_worker_summary counts worker_procs, which is emptied one line earlier, so "
+        "calling it here repaints the idle placeholder over the final numbers in the same "
+        "synchronous call and the user never sees what the run did. texts[-1] was "
+        "'กด ▶ Start เพื่อเริ่ม' until that call was removed")
 
 
 # --- log(): must delegate, not recurse ------------------------------------------------------

@@ -1961,7 +1961,13 @@ class EmulatorManager(ctk.CTk):
 
         self.worker_procs.pop("engine", None)
         self._worker_monitor_job = None
-        self._update_worker_summary()
+        # NOT _update_worker_summary() here. The rows just dispatched normally include the
+        # engine's final stat, and _updateEngineStats has already painted the tally onto this
+        # very label. _update_worker_summary counts worker_procs, which the pop above just
+        # emptied, so it would repaint "กด ▶ Start เพื่อเริ่ม" over those numbers in the same
+        # synchronous call - before Tk ever renders the frame in between. The user would see
+        # the label reset and never learn what the run did. The crashed-reader branch above
+        # deliberately does not call it either, for the same reason.
 
     def _updateEngineStats(self, row):
         """Repaints the one summary label from the latest "stat" row. Only ever called
