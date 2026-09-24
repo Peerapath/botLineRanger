@@ -103,6 +103,32 @@ def test_botlineranger_still_imports_and_the_adb_vision_ocr_surface_is_gone():
         "apiGachaWithTicket", "_gachaGroupPull", "matchGachaName", "add_ranger_name",
         "getTeanInfo", "getRubyAndTicket", "getAccoutInfo", "currentLevel",
         "apiGetPlayer",
+        # Fix round 1: the *_API_headless entry-point family and the pure-API/file-
+        # management cluster that only they reached - the Task 11 report found these
+        # unreachable and flagged them as a concern instead of deleting them; finished
+        # here after re-confirming (fresh grep) that no live caller was ever added.
+        "setUpHeadless", "_loadBotConfig",
+        "startBotCheckGameInfo_API", "startBotLogin_API_headless",
+        "startBotStage_API_headless", "startBotLevel3_API_headless",
+        "startBotGenID_API_headless",
+        "apiAcceptAllRewards", "apiForceStage", "apiLevelUpByStage1",
+        "_headlessCreateAccount", "logSession", "printRosterSummary",
+        "getLFACHeadless", "getLFACFromFile", "_importApiTools", "_prefValue",
+        "updateFileInExecute", "updateFileWithStage", "exportFileFromExecuteToBackup",
+        "exportFileFromExecuteToInput", "exportFileFromExecuteToOutput",
+        "removeFileInExecute", "exportFileFromExecuteToLoginFailed",
+        "reImportFileInExecute", "_claimInputFile", "_claimAccountThisRun",
+        "_releaseAccountThisRun", "importFileFromInputToExecute", "in_current_file",
+        "removeAllFiles",
+        # Same round: classes/module state a call-site grep can't see (nothing ever
+        # "calls" a class or a bare variable) - found by re-deriving reachability
+        # instead of trusting absence of a call site.
+        "Color", "Location", "Region", "extract_clean_text", "fuzzy_match",
+        "slotItem1", "slotItem2", "slotItem3", "slotItem4", "slotItem5",
+        "current_screen", "current_screen_gray", "_last_capture_time", "_template_cache",
+        "usenemu", "_nemu", "_nemu_next_try", "_nemu_black_streak",
+        "NEMU_RETRY_SEC", "NEMU_BLACK_STREAK", "NEMU_MIN_INTERVAL",
+        "cooldowncapturescreen", "timeoutopengame", "current_use_ruby",
     )
     still_there = [n for n in gone_names if hasattr(botLineRanger, n)]
     assert still_there == [], still_there
@@ -120,12 +146,7 @@ def test_botlineranger_still_imports_and_the_adb_vision_ocr_surface_is_gone():
     # caller the way the sibling project's folder-helper deletion did.
     kept_names = (
         "log", "reloginFromInput", "getGachaBanner",       # main.py's refresh_gacha_banners
-        "setUpHeadless", "_loadBotConfig",                  # the *_API_headless family's setup
         "apiEnterStage", "apiSaveTeam", "apiUnitSpecs",     # pure-API layer, untouched
-        "_claimAccountThisRun", "importFileFromInputToExecute",  # file-queue management
-        "startBotLogin_API_headless", "startBotGenID_API_headless",
-        "startBotStage_API_headless", "startBotLevel3_API_headless",
-        "startBotCheckGameInfo_API",
     )
     missing = [n for n in kept_names if not hasattr(botLineRanger, n)]
     assert missing == [], missing
