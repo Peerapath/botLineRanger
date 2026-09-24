@@ -61,10 +61,26 @@ class EnginePool:
         self._drain_limit = drain_limit
         self._lane_retry = lane_retry
         self._sleep = sleep if sleep is not None else time.sleep
+        # I2 (final review): threadcount is the GUI's thread-count spinner
+        # (bot/main.py:1180-1360, saved at :1353) - it wrote a number nothing engine-side
+        # read. threadsperproxy is a NEW, PER-LANE knob this rewrite introduced (spec sec 6)
+        # that scales UP as proxies are added; threadcount meant "total concurrency" back
+        # when 1 process was 1 unit of concurrency in the old fleet, and the user's real
+        # config sets it (threadcount = 90, apiproxies empty -> exactly one lane, so the two
+        # numbers mean the same thing there). Chosen: threadcount, when present, is the
+        # TOTAL thread budget, divided evenly across lanes (>= 1 each, same rule maxthreads'
+        # own overflow already uses below) - not a second, independently-set per-lane
+        # number. threadsperproxy stays the direct per-lane override for any caller (tests,
+        # a future non-GUI caller) that never sets threadcount.
+        lane_count = len(proxies) or 1     # ProxyPool falls back to one "direct" lane too
+        if "threadcount" in cfg:
+            threads_per = max(1, int(cfg["threadcount"]) // lane_count)
+        else:
+            threads_per = int(cfg.get("threadsperproxy") or 96)
         self.pool = ProxyPool(
             proxies,
             rps=float(cfg.get("apirps") or 90),
-            threads_per=int(cfg.get("threadsperproxy") or 96),
+            threads_per=threads_per,
             max_threads=int(cfg.get("maxthreads") or 4096))
         if self.pool.capped:
             self.reporter.note(

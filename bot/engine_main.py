@@ -20,12 +20,55 @@ from engine.report import Reporter            # noqa: E402
 
 import ratelimit    # noqa: E402
 
-BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound")
+BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby")
 INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthreads",
-        "gachacycles")
+        "gachacycles", "threadcount")
+
+# C4 (final review): "useruby" used to be missing from BOOLS. cfg["useruby"] then stayed the
+# raw ini STRING "False" all the way to flows.py's bool(cfg.get("useruby", False)) -  and
+# bool("False") is True in Python (any non-empty string is truthy). default_config/
+# config.ini ships useruby = False, so a fresh install drew gacha with ruby too, on every
+# account, while the file said ruby was off. Audited every other key the engine coerces at
+# the same time: everything flows.py reads with bool(cfg.get(...)) is in BOOLS, everything
+# it reads with int(cfg.get(...)) is in INTS (gachamode is a string enum - "giveItAll" /
+# "NumberOfCycles" / "LimitOfRuby" - and needs neither).
+
+# I1 (final review): the engine read stopwhenfound/gachacycles/gachamode/useruby - names
+# neither the GUI nor the user's real config ever writes. The GUI still keeps two
+# independent copies of every gacha setting - Login-family ("r") vs GenID ("g") - because a
+# user commonly wants Login conservative (NumberOfCycles) while GenID drains ruby on every
+# freshly minted account (LimitOfRuby): bot/src/config.ini has only
+# rstopwhenfound/gstopwhenfound, rgachamode/ggachamode, rgachacycles/ggachacycles,
+# ruseruby/guse200ruby ("useruby"'s g-side key is spelled guse200ruby, not guseruby - kept
+# exactly as the user's file has it: global constraint 4 forbids renaming a key that
+# already exists there). The old reader picked the pair by which startBot*_API_headless
+# function was running (af264b0:bot/botLineRanger.py:353-356,368-371); this does the same
+# by mode. Login and Level3 both read the "r" globals in the original
+# (startBotLevel3_API_headless, af264b0:bot/botLineRanger.py:8366, reads RGACHACYCLES, not
+# a level3-specific pair); Stage reads neither - it never gachas at all (flows.run_stage).
+_MODE_KEY_ALIASES = {
+    "stopwhenfound": {"r": "rstopwhenfound", "g": "gstopwhenfound"},
+    "gachamode": {"r": "rgachamode", "g": "ggachamode"},
+    "gachacycles": {"r": "rgachacycles", "g": "ggachacycles"},
+    "useruby": {"r": "ruseruby", "g": "guse200ruby"},
+}
+_GENID_MODES = ("ranger_api_GenID",)
 
 
-def load_config(path, rangers_path=None):
+def _resolve_mode_aliases(cfg, mode):
+    """Copy the mode-appropriate r/g-prefixed raw string into cfg's generic key name, so the
+    BOOLS/INTS loop right after this call coerces it exactly like every other setting -
+    one coercion path, not two. A config missing the per-mode split (default_config/
+    config.ini's own shape: only the generic key, no prefix) is untouched here, so its
+    generic value survives as the fallback I1 asks for."""
+    prefix = "g" if mode in _GENID_MODES else "r"
+    for generic, per_mode in _MODE_KEY_ALIASES.items():
+        specific = per_mode[prefix]
+        if specific in cfg:
+            cfg[generic] = cfg[specific]
+
+
+def load_config(path, rangers_path=None, mode=None):
     # strict=False on every parser here, deliberately. These are files the user edits by
     # hand, and a repeated key is the normal way that goes wrong - bot/src/configRangers.ini
     # has u1206e-moon twice at line 137 right now. A strict parser answers that with
@@ -36,6 +79,10 @@ def load_config(path, rangers_path=None):
     parser = configparser.ConfigParser(strict=False)
     parser.read(path, encoding="utf-8")
     cfg = dict(parser["settings"]) if parser.has_section("settings") else {}
+    # I1: resolve the r/g-prefixed pair for this mode into the generic key BEFORE the
+    # BOOLS/INTS loop below, so the resolved value is coerced through the exact same path
+    # as every other setting instead of a second, parallel one.
+    _resolve_mode_aliases(cfg, mode)
     for key in BOOLS:
         if key in cfg:
             cfg[key] = str(cfg[key]).strip().lower() in ("true", "1", "yes")
@@ -74,7 +121,7 @@ def main(argv):
     mode = argv[1] if len(argv) > 1 else "ranger_api_Login"
     root = os.getcwd()
     cfg = load_config(os.path.join(root, "src", "config.ini"),
-                      os.path.join(root, "src", "configRangers.ini"))
+                      os.path.join(root, "src", "configRangers.ini"), mode)
 
     # สองค่าที่ flows อ่านจาก cfg แต่ cfg เองสร้างเองไม่ได้ - ถ้าไม่ใส่ตรงนี้
     # flows จะทำงานต่อได้เงียบ ๆ โดยปิดความสามารถไปทีละอย่าง โดยเทสต์ยังเขียวหมด

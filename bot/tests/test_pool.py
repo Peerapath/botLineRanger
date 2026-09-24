@@ -232,6 +232,33 @@ def test_a_worker_thread_binds_exactly_one_lane_for_its_whole_life(tmp_path):
     assert all(len(lanes) == 1 for lanes in by_thread.values())
 
 
+def test_threadcount_sets_the_total_thread_budget_divided_across_lanes(tmp_path):
+    """I2 (final review): bot/main.py:1353 writes cfg["threadcount"] from the GUI's
+    thread-count spinner; nothing engine-side read it - EnginePool used threadsperproxy,
+    a key absent from the user's real config, so the spinner (threadcount = 90 in their
+    file) had zero effect and the engine silently ran the 96-default instead. Chosen:
+    threadcount, when present, means the TOTAL thread budget across the whole pool
+    (matching what it meant when 1 process was 1 unit of concurrency in the old fleet),
+    divided evenly across lanes - not a second, independently-set per-lane number.
+    """
+    q = build(tmp_path, 1)
+    buf = io.StringIO()
+    solo = EnginePool("ranger_api_Login", {"threadcount": 90}, q, [], Reporter(buf),
+                      flow=lambda m, s, c: Outcome(dest="output"))
+    assert solo.pool.lanes[0].threads == 90     # apiproxies empty -> one lane, all of it
+
+    split = EnginePool("ranger_api_Login", {"threadcount": 90},
+                       q, ["1.1.1.1:8000", "2.2.2.2:8000", "3.3.3.3:8000"], Reporter(buf),
+                       flow=lambda m, s, c: Outcome(dest="output"))
+    assert [lane.threads for lane in split.pool.lanes] == [30, 30, 30]
+
+    # threadsperproxy is still the direct per-lane override when threadcount is absent -
+    # existing callers (tests, and any future non-GUI caller) must see no change at all.
+    unaffected = EnginePool("ranger_api_Login", {"threadsperproxy": 8}, q, [], Reporter(buf),
+                            flow=lambda m, s, c: Outcome(dest="output"))
+    assert unaffected.pool.lanes[0].threads == 8
+
+
 def test_genid_mode_does_not_claim_from_input_and_moves_the_file_the_flow_produced(tmp_path):
     """C2 (final review): GenID mints its own account file mid-flow (flows._create_account
     sets s.src to the freshly minted path) instead of consuming one queue.claim() handed
