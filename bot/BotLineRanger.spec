@@ -77,17 +77,44 @@ a = Analysis(
         'multiprocessing',
         'threading',
         'webbrowser',
-        # tools/*.py (rangers_api, relogin, rewards, device_session, account_file, ratelimit,
-        # gacha, pull_roster, stage_forge, new_account) are loose .py files copied beside the
-        # exe and imported at runtime via sys.path (see botLineRanger.py's TOOLSDIR / this
-        # spec's own datas comment) - PyInstaller's static analysis never reads their source,
-        # so it never learns what THEY import either. Verified by building: without this
-        # block, `BotLineRanger.exe --engine` dies with "ModuleNotFoundError: No module named
-        # 'concurrent'" the moment engine.flows imports relogin, which is always (every mode -
-        # flows.py imports rangers_api/relogin/rewards/device_session at module level, not
-        # lazily). Everything below is a stdlib or third-party import collected straight from
-        # tools/*.py's own `import` lines, so the frozen runtime carries it even though no
-        # bundled module visibly asks for it.
+        # ..\tools\*.py: the reverse-engineered API layer, obfuscated by build.bat's
+        # `pyarmor gen` step into dist_pyarmor\ (flat, alongside the bot/ targets - see that
+        # step's own comment) instead of shipping as plain, readable .py beside the exe the
+        # way it used to. sys.path.insert(..., "tools") in botLineRanger.py's TOOLSDIR /
+        # engine/*.py / engine_main.py / main.py still runs (harmless no-op once frozen: no
+        # such directory exists beside the exe any more, and Python's path-based finder
+        # just skips a sys.path entry that does not exist) but is no longer what makes these
+        # imports resolve - pathex=['.', 'dist_pyarmor'] above is. They are listed here
+        # explicitly because nothing PyInstaller's own Analysis can already see resolves
+        # them on its own: engine/*.py imports them by bare name (`import rangers_api`,
+        # `from device_session import decrypt_lfac`, ...), which Analysis reads from
+        # plaintext bot/engine/*.py (pathex '.' comes first) but - before this build's fix -
+        # could never find on ANY search path, so it always fell through to the loose-file
+        # copy at runtime rather than ever landing in a.pure. Explicit hiddenimports makes
+        # that resolution happen regardless of search-path order or timing.
+        #
+        # Deliberately NOT listed (and not passed to pyarmor gen either): device_snapshot,
+        # export_account, extract_battles, gifts, newbie_quest, ratelimit_probe, sevendays,
+        # summarize. grep across bot/ and every module below turns up no import of any of
+        # them - they are CLI-only tools a human runs by hand, not code this build ships.
+        'account_file',
+        'device_session',
+        'gacha',
+        'new_account',
+        'pull_roster',
+        'rangers_api',
+        'ratelimit',
+        'relogin',
+        'rewards',
+        'stage_forge',
+        'tutorial',
+        # Everything below is a stdlib or third-party import collected straight from the 11
+        # modules above's own `import` lines, so the frozen runtime carries it even though
+        # no bundled module visibly asks for it (same reasoning as those 11 themselves).
+        # Verified by building: without this block, `BotLineRanger.exe --engine` dies with
+        # "ModuleNotFoundError: No module named 'concurrent'" the moment engine.flows
+        # imports relogin, which is always (every mode - flows.py imports
+        # rangers_api/relogin/rewards/device_session at module level, not lazily).
         'concurrent',
         'concurrent.futures',
         'argparse',
