@@ -71,8 +71,16 @@ def request(path: str, send, pinned_prefix: str | None = None) -> tuple[int, obj
 
 def headers(app_version: str) -> dict       # {"App-Version": ..., "User-Agent": ...}
 def current() -> tuple[str, str]            # (prefix, app_version) ปัจจุบัน สำหรับ log/GUI
+def describe() -> str                       # บรรทัดตอนเริ่มในข้อ 6
 def on_switch(callback) -> None             # callback(msg: str) ทุกครั้งที่สลับค่า
+def configure(path) -> ClientVersion        # engine_main เรียกตอนเริ่ม
+def set_oracle(fn) -> None                  # rangers_api ลงทะเบียนตัวยิง oracle ตอน import
 ```
+
+ทั้งหมดข้างบนเรียกผ่านอินสแตนซ์ `ClientVersion(path, oracle=None, learn=True)` ตัวหลักของโมดูล
+เทสต์สร้างอินสแตนซ์ของตัวเองได้ และ `conftest.py` ที่รากโปรเจกต์ให้ทุกเทสต์ได้อินสแตนซ์ `learn=False`
+ใน tmp_path พร้อม oracle ที่ล้มทันทีถ้าถูกเรียก — เทสต์เดิมที่มีตัวปลอมตอบ 401/404 จะได้ไม่เจอการยิงซ้ำ
+หรือหลุดไปยิงเซิร์ฟเวอร์จริง
 
 สถานะภายใน (ต่อโปรเซส ป้องกันด้วย lock เดียว):
 
@@ -95,8 +103,9 @@ def on_switch(callback) -> None             # callback(msg: str) ทุกคร
 
 ### 3.2 ไฟล์ที่จำค่า
 
-`src/api_version.json` ข้าง `config.ini` (engine_main ตั้ง `LGRGS_VERSION_FILE` ให้ชี้ที่นี่ ก่อน import
-tools) เครื่องมือ CLI ที่ไม่ได้ตั้ง env ใช้ `ratelimit.rl_dir()/api_version.json`
+`src/api_version.json` ข้าง `config.ini` — engine_main เรียก `client_version.configure(<root>/src/api_version.json)`
+ตอนเริ่ม (อินสแตนซ์หลักสร้างแบบ lazy จึงไม่สำคัญว่า tools ถูก import ไปก่อนแล้ว) เครื่องมือ CLI ใช้
+env `LGRGS_VERSION_FILE` ถ้าตั้งไว้ ไม่งั้น `ratelimit.rl_dir()/api_version.json`
 
 ```json
 {
@@ -109,8 +118,11 @@ tools) เครื่องมือ CLI ที่ไม่ได้ตั้�
 }
 ```
 
-- อ่านครั้งเดียวตอนใช้ครั้งแรก ไฟล์ไม่มี/เสีย/อ่านไม่ได้ → ใช้ค่าตั้งต้น ห้ามทำให้ engine ล้ม
-- เขียนทุกครั้งที่สลับ ผ่าน `ratelimit.locked_file` แล้ว replace ทั้งไฟล์ `history` เก็บ 20 รายการล่าสุด
+- อ่านครั้งเดียวตอนใช้ครั้งแรก ไฟล์ไม่มี → เขียนค่าตั้งต้นลงไป (ให้คนเปิดดู/แก้ได้) ไฟล์เสีย/อ่านไม่ได้
+  → ใช้ค่าตั้งต้นทีละช่อง ห้ามทำให้ engine ล้ม
+- เขียนทุกครั้งที่สลับ แบบ atomic: เขียนไฟล์ชั่วคราวชื่อไม่ซ้ำต่อโปรเซส/เธรด แล้ว `os.replace` ทับ
+  (ลองซ้ำเมื่อ Windows ตอบ PermissionError) เขียนไม่ได้ → พิมพ์ลง stderr แล้วทำงานต่อด้วยค่าในแรม
+  `history` เก็บ 20 รายการล่าสุด
 - `known_good` = ทุกเวอร์ชันที่เคยได้ 200 ที่ไหนก็ตาม ใช้เป็นผู้สมัครอันดับแรกตอนสำรวจ
 
 ### 3.3 จุดที่ต้องต่อ — ทุกจุดที่ยิง rangers-api
