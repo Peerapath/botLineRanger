@@ -26,7 +26,14 @@ INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthread
 
 
 def load_config(path, rangers_path=None):
-    parser = configparser.ConfigParser()
+    # strict=False on every parser here, deliberately. These are files the user edits by
+    # hand, and a repeated key is the normal way that goes wrong - bot/src/configRangers.ini
+    # has u1206e-moon twice at line 137 right now. A strict parser answers that with
+    # DuplicateOptionError, which would take the whole engine down at startup before a
+    # single account was touched, over a duplicated ranger name. The bot this replaces hit
+    # exactly that and carried a comment saying so; losing it here reintroduced the bug.
+    # strict=False keeps the last value, which is what a user retyping a line means.
+    parser = configparser.ConfigParser(strict=False)
     parser.read(path, encoding="utf-8")
     cfg = dict(parser["settings"]) if parser.has_section("settings") else {}
     for key in BOOLS:
@@ -41,7 +48,7 @@ def load_config(path, rangers_path=None):
     # รายชื่อ ranger เป้าหมาย - เคยเป็น global RANGERSCONFIG ใน botLineRanger ตอนนี้เดินทาง
     # ไปกับ cfg เพื่อให้ flows ไม่ต้องอ่านอะไรจากระดับโมดูล
     if rangers_path and os.path.isfile(rangers_path):
-        rparser = configparser.ConfigParser()
+        rparser = configparser.ConfigParser(strict=False)
         rparser.read(rangers_path, encoding="utf-8")
         # ค่าเป็น "ชื่อที่แสดง" ไม่ใช่ธงเปิด/ปิด - configRangers.ini เก็บ
         # unitCode -> ชื่อภาษาไทย และ pull_roster.unit_names เอาชื่อนั้นไปตั้งชื่อไฟล์ที่ export
