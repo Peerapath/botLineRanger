@@ -13,6 +13,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "tools"))
 
+import client_version       # noqa: E402
 import rangers_api          # noqa: E402
 import relogin             # noqa: E402
 import rewards             # noqa: E402
@@ -416,6 +417,11 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
             # needs to say so instead of dropping it silently.
             _release_unclaimed_account()
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
+        except client_version.VersionUnavailable:
+            # ไม่มีเวอร์ชัน/prefix ไหนที่เซิร์ฟเวอร์รับ - ลองซ้ำก็ได้คำตอบเดิม และถ้ากลืนไว้ที่นี่
+            # บัญชีจะไหลไป "login failed" ทีละใบจนหมดคิว ปล่อยขึ้นไปให้ pool หยุด engine ทั้งตัว
+            _release_unclaimed_account()
+            raise
         except PermanentFailure as err:
             # The server already gave its real answer about this account (see
             # PermanentFailure above) - a second and third attempt would only spend more
@@ -496,6 +502,8 @@ def run_level3(s: AccountSession, cfg: dict) -> Outcome:
             dest = "backup" if any(targets.get(code.lower()) for code in s.gacha_units) else "output"
             _release_unclaimed_account()
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
+        except client_version.VersionUnavailable:
+            raise           # ให้ pool หยุด engine - ดูคอมเมนต์เดียวกันใน run_login
         except PermanentFailure as err:
             # เหมือน run_login: เซิร์ฟเวอร์ตอบจริงแล้วว่าบัญชีนี้ตาย (401 ยืนยันสองรอบใน _relogin) -
             # retry ซ้ำมีแต่จะเปลืองโควตา auth ร่วมเพื่อฟังคำตอบเดิม (constraint 10: แยก "รอคิว"
@@ -554,6 +562,8 @@ def run_genid(s: AccountSession, cfg: dict) -> Outcome:
             targets = cfg.get("_rangers_config") or {}
             dest = "backup" if any(targets.get(code.lower()) for code in s.gacha_units) else "output"
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
+        except client_version.VersionUnavailable:
+            raise           # ให้ pool หยุด engine - ดูคอมเมนต์เดียวกันใน run_login
         except PermanentFailure as err:
             return Outcome(dest="login failed", status="FAIL", error=str(err))
         except LevelGateFailure as err:
@@ -591,6 +601,8 @@ def run_stage(s: AccountSession, cfg: dict) -> Outcome:
             # ไม่มี _claim_rewards ตรงนี้จึงตรงกับของจริง ไม่ใช่ตกหล่น (ดู task-8-report.md)
             _account_info(s)
             return Outcome(dest="output", name=_export_name(s), status="OK", error=s.error)
+        except client_version.VersionUnavailable:
+            raise           # ให้ pool หยุด engine - ดูคอมเมนต์เดียวกันใน run_login
         except PermanentFailure as err:
             return Outcome(dest="login failed", status="FAIL", error=str(err))
         except Exception as err:

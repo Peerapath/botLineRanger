@@ -21,6 +21,7 @@ from engine.report import Reporter            # noqa: E402
 import ratelimit    # noqa: E402
 import rangers_api  # noqa: E402
 import relogin      # noqa: E402
+import client_version  # noqa: E402
 
 BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby")
 INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthreads",
@@ -209,6 +210,13 @@ class _LazyCcPool:
         return self._real().mark_proven()
 
 
+def setup_client_version(root: str, reporter) -> None:
+    """เวอร์ชัน/prefix ที่ค้นเจอจำลง src/api_version.json ข้าง config.ini และทุกการสลับขึ้น log ของ GUI"""
+    client_version.configure(os.path.join(root, "src", "api_version.json"))
+    client_version.on_switch(reporter.note)
+    reporter.note(client_version.describe())
+
+
 def main(argv):
     # stdout เป็นช่องรายงาน JSONL ข้อความไทยต้องไม่ตายที่ cp1252
     try:
@@ -235,6 +243,7 @@ def main(argv):
     cfg["_execute_dir"] = os.path.join(root, "execute")     # GenID เขียนไฟล์ใหม่ลงที่เดียวกับ WorkQueue
 
     reporter = Reporter()
+    setup_client_version(root, reporter)
 
     queue = WorkQueue(root, os.path.join(root, "src", "log", "run.jsonl"))
     # Must run exactly once, here, before any worker thread ever calls queue.claim() -

@@ -13,6 +13,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "tools"))
+import client_version  # noqa: E402
 import rangers_api   # noqa: E402
 
 from . import flows as flows_mod   # noqa: E402
@@ -97,6 +98,7 @@ class EnginePool:
         # see _run_one. Counted separately from done/fail so neither of those can ever
         # claim a destination folder holds a file that is still sitting in execute/.
         self._stuck = 0
+        self._version_stopped = False
 
     def request_stop(self) -> None:
         """หยุดรับงานใหม่ บัญชีที่ค้างอยู่ทำต่อจนจบ
@@ -107,6 +109,23 @@ class EnginePool:
             if self._stop_at is None:
                 self._stop_at = time.time()
         self._stop.set()
+
+    def _stop_for_version(self, session, err) -> None:
+        """ไม่มี App-Version หรือ URL prefix ไหนที่เซิร์ฟเวอร์รับเลย (client_version สำรวจแล้ว)
+
+        ทุกบัญชีหลังจากนี้จะล้มแบบเดียวกัน ถ้าปล่อยให้เป็น FAIL ธรรมดา Login จะย้ายไฟล์ input
+        ทั้งหมดไป login failed/ และ GenID จะเผาโควตา mint ทิ้งทุกรอบ จึงหยุดรับงาน ไม่ย้ายไฟล์
+        (ค้างใน execute/ แล้ว queue.recover() คืนเข้า input/ ตอนรันถัดไป) และบอกผู้ใช้ครั้งเดียว
+        """
+        with self._lock:
+            first = not self._version_stopped
+            self._version_stopped = True
+            if session.src:
+                self._stuck += 1
+        if first:
+            self.reporter.note("stopping: %s - accounts in progress stay in execute/ and go back "
+                               "to input/ on the next run" % err)
+        self.request_stop()
 
     def _worker(self, lane) -> None:
         # Bind ONCE, for this thread's entire life: lane is fixed the moment
@@ -148,6 +167,9 @@ class EnginePool:
                 # (this run never retries a claimed file) and quietly shrink the pool by one
                 # thread, indistinguishable from a lane dying for an unrelated reason.
                 raise ValueError("flow returned an unknown destination %r" % (out.dest,))
+        except client_version.VersionUnavailable as err:
+            self._stop_for_version(session, err)
+            return
         except (Exception, SystemExit) as err:
             # SystemExit ต้องอยู่ตรงนี้ด้วย ไม่ใช่แค่ Exception: ไฟล์ใน tools/ ที่เกิดมาเป็น CLI
             # ยัง raise SystemExit แทนคำว่า "คำขอนี้ไม่ผ่าน" อยู่หลายที่ที่ทุกโหมดเดินไปถึง -
