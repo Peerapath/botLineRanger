@@ -148,7 +148,18 @@ class EnginePool:
                 # (this run never retries a claimed file) and quietly shrink the pool by one
                 # thread, indistinguishable from a lane dying for an unrelated reason.
                 raise ValueError("flow returned an unknown destination %r" % (out.dest,))
-        except Exception as err:
+        except (Exception, SystemExit) as err:
+            # SystemExit ต้องอยู่ตรงนี้ด้วย ไม่ใช่แค่ Exception: ไฟล์ใน tools/ ที่เกิดมาเป็น CLI
+            # ยัง raise SystemExit แทนคำว่า "คำขอนี้ไม่ผ่าน" อยู่หลายที่ที่ทุกโหมดเดินไปถึง -
+            # new_account 367/381, gacha 118/269, rewards 75, gifts 35, sevendays 40,
+            # export_account 40, pull_roster 152/283 - และ SystemExit สืบจาก BaseException
+            # จึงลอด `except Exception` ไปได้ ที่ร้ายคือ threading.excepthook จงใจข้าม
+            # SystemExit ทิ้ง เธรดจึงตายแบบ *ไม่พิมพ์อะไรเลย* ไม่มี traceback ไม่มีแถวรายงาน
+            # แล้ว run() เห็นว่าไม่เหลือเธรดที่ยังมีชีวิตก็เลิกลูป = engine จบแบบ "สำเร็จ"
+            # ทั้งที่ไม่ได้บัญชีสักใบ (วัดจริง 2026-09-24: 16 เธรด quota ปิด -> 16 เธรดตาย
+            # เงียบ 0 บัญชี exit code 0 เอาต์พุตทั้งรันมี 22 บรรทัด)
+            #
+            # จงใจไม่ดัก BaseException: Ctrl-C ต้องยังทะลุขึ้นไปได้ตามเดิม
             out = Outcome(dest="login failed", status="FAIL", error=str(err)[:200])
 
         # C2 (final review): a flow can replace session.src with a file IT produced (GenID

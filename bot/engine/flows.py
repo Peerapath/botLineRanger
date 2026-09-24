@@ -289,7 +289,20 @@ def _create_account(s: AccountSession, cfg: dict) -> None:
     # every test that predates this fix (monkeypatch.setattr(flows, "EXECUTE_DIR", ...),
     # see test_flows_modes.py) keep behaving exactly as before.
     execute_dir = cfg.get("_execute_dir", EXECUTE_DIR)
-    acct = new_account.make_account(write_xml_dir=execute_dir, skip_tut=True)
+    try:
+        acct = new_account.make_account(write_xml_dir=execute_dir, skip_tut=True)
+    except SystemExit as err:
+        # new_account.py ยัง raise SystemExit สำหรับ "คำขอนี้ไม่ผ่าน" อยู่ (บรรทัด 367 auth,
+        # 381 refresh) เพราะมันเกิดมาเป็น CLI ที่ SystemExit คือทางออกของ error - แต่
+        # SystemExit สืบจาก BaseException ไม่ใช่ Exception ลูป retry ข้างล่างที่ดัก
+        # `except Exception` จึงไม่เคยเห็นมัน แล้วมันทะลุออกไปตายที่ _run_one ต่อ
+        # (threading ทิ้ง SystemExit เงียบ ๆ - เธรดตายโดยไม่พิมพ์อะไรเลย)
+        #
+        # เคสจริงคือ HTTP 429 ของ auth ซึ่งเป็น transient ที่สุด: นาทีถัดไปโควตาก็คืนมาแล้ว
+        # แปลงเป็น RuntimeError ที่นี่ เพื่อให้ run_genid ใช้งบ MAX_ATTEMPTS ที่มีอยู่จริง
+        # แทนที่จะยอมแพ้ตั้งแต่ครั้งแรก ใช้ถ้อยคำเดียวกับ tools/relogin.py:183 ที่ห่อ
+        # เส้นทางเดียวกันนี้ให้โหมด Login ไว้แล้ว เพื่อให้ grep ครั้งเดียวเจอทั้งสองทาง
+        raise RuntimeError("guest mint failed: %s" % str(err).strip()[:200]) from err
     if acct.get("status") != "ready" or not acct.get("lf_ac"):
         raise RuntimeError("signup incomplete (status=%s)" % acct.get("status"))
     s.src = new_account.write_account_xml(acct, execute_dir)

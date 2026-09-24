@@ -99,6 +99,29 @@ UA_SDK = "android;12;V417IR;GOOGLEPLAY;en"
 UA_GAME = "LGRGS/12.3.0 (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)"
 APP_VERSION = "LGRGS/12.3.0;android/12"
 
+# /signup/platform ONLY - every other call still sends APP_VERSION above.
+#
+# Measured 2026-09-24: the signup endpoint now answers HTTP 401 for App-Version 12.3.0,
+# which made GenID produce zero accounts (auth 200 -> refresh 200 -> authorize 200 ->
+# signup 401 -> login 401 -> "pending-login", every single time). The URL prefix is NOT
+# what it keys on: /v12.3/signup/platform with this 12.2.0 header returns 200, and
+# /v12.2/signup/platform with the 12.3.0 header returns 401. Full matrix, one fresh
+# pending guest per cell so a success could not contaminate the next:
+#     URL 12.3 + hdr 12.3.0 -> 401      URL 12.3 + hdr 12.2.0 -> 200
+#     URL 12.2 + hdr 12.3.0 -> 401      URL 12.2 + hdr 12.2.0 -> 200 (x2)
+# Sweeping the header alone separates "unknown version" from "rejected version": 11.9.0,
+# 12.0.0, 12.1.0, 12.2.9 and 13.0.0 all return HTTP 400 errorCode 119801 (the server does
+# not know that build), while 12.2.0 returns 200 and 12.3.0/12.4.0 return 401. So the
+# server knows 12.3.0 and refuses it here specifically - consistent with this project's
+# standing X-LINEGAME-APPSECRET theory (see the lgrgs-business-api-401-appsecret memory):
+# 12.2.0 predates that requirement, 12.3+ is expected to carry a header we cannot forge
+# off-device. It is NOT a maintenance window: /v12.3/login answers 200 with the ordinary
+# 12.3.0 header throughout, and so does every later call in the flow.
+#
+# The account this produces is a normal fresh guest - isNew=true, level 1, ruby 20, the
+# same shape this function's docstring recorded on 2026-09-14.
+SIGNUP_APP_VERSION = "LGRGS/12.2.0;android/12"
+
 # Terms the server currently requires. If these fall out of date the auth step
 # returns the up-to-date list in its error body - copy it back in here.
 AGREEMENTS = [
@@ -445,7 +468,7 @@ def signup_platform(cc: str, udid: str, user_type: str = "LINE") -> dict | None:
     cookie = "cc=%s; udid=%s;, LF_AC=; udid=%s;" % (cc, udid, udid)
     ts_ms = str(int(time.time() * 1000))
     headers = {
-        "App-Version": APP_VERSION,
+        "App-Version": SIGNUP_APP_VERSION,   # 12.3.0 is refused here - see the constant
         "userType": user_type,
         "Nation-Code": NATION,
         "Accept-Language": LANG,
