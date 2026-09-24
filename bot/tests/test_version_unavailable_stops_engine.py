@@ -97,6 +97,71 @@ def test_the_pool_stops_and_leaves_the_file_in_execute(tmp_path):
     assert len(rec.notes) == 1 and "no URL prefix answers" in rec.notes[0]
 
 
+def test_run_level3_releases_claim_before_letting_it_through(monkeypatch, tmp_path):
+    """Finding (Task 5 review): run_level3's VersionUnavailable clause used to be a bare
+    `raise` - unlike run_login's, which calls _release_unclaimed_account() first. That
+    leaks the claim run_level3 takes on s.rsn (see AccountClaimRegistry's own docstring
+    for the real two-files-one-account case this guards): a second input file for the
+    same account would then see claim() return False and silently skip rewards/gacha.
+    """
+    def fake_relogin(s):
+        s.cookie = "LF_AC=x"
+        s.rsn = "ID1"
+
+    def fake_fetch_home(s):
+        s.home = {}
+        s.level = 1        # below leveltarget, so run_level3 calls _level_up next
+
+    def fake_level_up(s, cfg):
+        raise client_version.VersionUnavailable("no App-Version the server knows")
+
+    monkeypatch.setattr(flows, "_relogin", fake_relogin)
+    monkeypatch.setattr(flows, "_fetch_home", fake_fetch_home)
+    monkeypatch.setattr(flows, "_level_up", fake_level_up)
+    (tmp_path / "execute").mkdir()
+    src = tmp_path / "execute" / "a.xml"
+    src.write_text("<map/>", encoding="utf-8")
+    registry = flows.AccountClaimRegistry()
+    session = AccountSession(src=str(src), lane=Lane())
+    cfg = {"_account_claims": registry, "leveltarget": 3}
+
+    with pytest.raises(client_version.VersionUnavailable):
+        flows.run("ranger_api_Level3", session, cfg)
+
+    # The claim run_level3 took on "ID1" must have been given back - not left dangling
+    # for a duplicate input file of the same account to find already held.
+    assert registry.claim("ID1") is True
+
+
+def test_run_login_releases_claim_before_letting_it_through(monkeypatch, tmp_path):
+    """Guard: run_login's release-before-raise (the one run_level3 above was missing)
+    keeps working."""
+    def fake_relogin(s):
+        s.cookie = "LF_AC=x"
+        s.rsn = "ID1"
+
+    def fake_fetch_home(s):
+        s.home = {}
+
+    def fake_claim_rewards(s, cfg):
+        raise client_version.VersionUnavailable("no App-Version the server knows")
+
+    monkeypatch.setattr(flows, "_relogin", fake_relogin)
+    monkeypatch.setattr(flows, "_fetch_home", fake_fetch_home)
+    monkeypatch.setattr(flows, "_claim_rewards", fake_claim_rewards)
+    (tmp_path / "execute").mkdir()
+    src = tmp_path / "execute" / "a.xml"
+    src.write_text("<map/>", encoding="utf-8")
+    registry = flows.AccountClaimRegistry()
+    session = AccountSession(src=str(src), lane=Lane())
+    cfg = {"_account_claims": registry}
+
+    with pytest.raises(client_version.VersionUnavailable):
+        flows.run("ranger_api_Login", session, cfg)
+
+    assert registry.claim("ID1") is True
+
+
 def test_setup_client_version_uses_src_api_version_json_and_announces_it(tmp_path, monkeypatch):
     monkeypatch.setattr(client_version, "_DEFAULT", None)
     rec = Recorder()

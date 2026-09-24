@@ -503,6 +503,9 @@ def run_level3(s: AccountSession, cfg: dict) -> Outcome:
             _release_unclaimed_account()
             return Outcome(dest=dest, name=_export_name(s), status="OK", error=s.error)
         except client_version.VersionUnavailable:
+            # เหมือน run_login: ปล่อยจองคืนก่อน ไม่งั้นไฟล์ซ้ำของบัญชีนี้ (ถ้ามี) จะเจอ claim()
+            # คืน False แล้วข้ามรางวัล/กาชาไปเงียบๆ ทั้งที่ session นี้ไม่เคยได้ใช้จองเลย
+            _release_unclaimed_account()
             raise           # ให้ pool หยุด engine - ดูคอมเมนต์เดียวกันใน run_login
         except PermanentFailure as err:
             # เหมือน run_login: เซิร์ฟเวอร์ตอบจริงแล้วว่าบัญชีนี้ตาย (401 ยืนยันสองรอบใน _relogin) -
