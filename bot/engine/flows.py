@@ -106,6 +106,18 @@ class AccountClaimRegistry:
 
 
 # --- ขั้นตอนย่อย (เทสต์ replace ตัวพวกนี้ทีละตัว) ---
+# ทุกขั้นเรียก s.mark() เป็นบรรทัดแรก: pool อ่าน step/detail ไปโชว์ในตารางบัญชีที่กำลังทำของ GUI
+
+def _backoff(s: AccountSession, attempt: int, err: str) -> None:
+    """รอก่อนลองรอบถัดไป - บอก GUI ว่ากำลังรออยู่เพราะอะไร ไม่งั้นแถวค้างที่ขั้นที่พังเฉย ๆ"""
+    s.mark("retry", err[:70])
+    seconds = RETRY_BACKOFF_SECONDS[attempt - 1]
+    nap = getattr(s.lane, "nap", None)     # ProxyLane.nap ตื่นทันทีที่กด Stop (lane ปลอมในเทสต์ไม่มี)
+    if nap is not None:
+        nap(seconds)
+    else:
+        time.sleep(seconds)
+
 
 def _relogin(s: AccountSession) -> None:
     """ขอ LF_AC สดจากไฟล์ผ่าน /v12.3/login - ย้ายมาจาก getLFACHeadless()
@@ -130,6 +142,7 @@ def _relogin(s: AccountSession) -> None:
     Nothing in tasks 1-9's briefs currently does that wiring; the caller doing so is what
     actually keeps the quota safe, this is only the hook that makes it possible.
     """
+    s.mark("relogin")
     acct = relogin.read_account(s.src)
     guest_cookie = decrypt_lfac(acct["udid"], acct["enc"])
     pool = getattr(s.lane, "cc_pool", None)
@@ -171,6 +184,7 @@ def _fetch_home(s: AccountSession) -> None:
     เดิมก้อนนี้ถูกดึงสี่ครั้ง: check_session, survey_attendance_package, currentLevel
     และ getRubyAndTicket
     """
+    s.mark("home")
     status, data = rangers_api.call(s.cookie, "/home")
     if status != 200 or not isinstance(data, dict) or "result" not in data:
         raise RuntimeError("home rejected (HTTP %s)" % status)
@@ -181,6 +195,7 @@ def _fetch_home(s: AccountSession) -> None:
 
 
 def _claim_rewards(s: AccountSession, cfg: dict) -> None:
+    s.mark("rewards")
     rewards.claim_all(s.cookie, confirm=True,
                       passes=int(cfg.get("rewardpasses") or 3), home=s.home)
 
@@ -192,6 +207,7 @@ def _gacha(s: AccountSession, cfg: dict) -> None:
     ลง gacha_units ซึ่งเป็น list ไม่งั้น len(s.gacha_units) จะได้ 2 เสมอไม่ว่าสุ่มได้กี่ตัว
     """
     import gacha as gacha_mod
+    s.mark("gacha")
     s.gacha_units, s.gacha_status = gacha_mod.draw_with_ticket(
         s.cookie, s.rsn,
         group=cfg.get("gacharangergroup"),
@@ -223,6 +239,7 @@ def _account_info(s: AccountSession) -> None:
     import gacha as gacha_mod
     import pull_roster
 
+    s.mark("info")
     ruby = (s.home or {}).get("rubyBalance") or {}
     s.ruby = str(ruby.get("total", "NA"))
     premium, _event = gacha_mod.ticket_counts(s.cookie, s.rsn)
@@ -264,7 +281,9 @@ def _level_up(s: AccountSession, cfg: dict) -> str:
     """
     import stage_forge
     target = int(cfg.get("leveltarget") or 3)
-    level, _plays, reason = stage_forge.level_up(s.cookie, s.rsn, target)
+    s.mark("level", "Lv%s -> %s" % (s.level, target))
+    # progress ต้องส่งเสมอ: ค่าปริยายของ level_up คือ print ซึ่งลง stdout = ช่อง JSONL (ดู _live)
+    level, _plays, reason = stage_forge.level_up(s.cookie, s.rsn, target, progress=_live(s))
     s.level = int(level or s.level)
     return reason
 
@@ -289,6 +308,7 @@ def _create_account(s: AccountSession, cfg: dict) -> None:
     """
     import new_account
     s.reset_token()
+    s.mark("mint")
     s.gacha_status, s.gacha_units = "-", []
     # Finding 2 (Task 9, review round 1): this used to read only the module-level EXECUTE_DIR
     # above, never cfg["_execute_dir"] that engine_main.py actually sets - harmless only
@@ -338,7 +358,9 @@ def _force_stage(s: AccountSession, cfg: dict) -> str:
     """
     import stage_forge
     last = int(cfg.get("stageend") or 150)
+    s.mark("stage", "-> st%03d" % last)
     failures: list[str] = []
+    live = _live(s, last)
     reason = "done"
     for _round in range(STAGE_PUSH_ROUNDS):
         player = stage_forge.player_info(s.cookie)
@@ -350,7 +372,7 @@ def _force_stage(s: AccountSession, cfg: dict) -> str:
         # rangers_api (ช่องว่าง 350 ms ต่อบัญชี + ถังต่อ IP) ค่า 3 วิของ CLI เคยกินเวลาครึ่งหนึ่งของแต่ละด่าน
         _cleared, reason = stage_forge.clear_range(s.cookie, s.rsn, first, last,
                                                    delay=float(cfg.get("stagedelay") or 0),
-                                                   progress=_failure_log(failures))
+                                                   progress=_failure_log(failures, live))
         if reason != "failed":
             break
         # "failed" = เซฟ/enter พังซ้ำจน clear_range ยอมแพ้ที่ด่านนั้น ส่วนใหญ่เป็นอาการชั่วคราวของ
@@ -365,23 +387,37 @@ def _force_stage(s: AccountSession, cfg: dict) -> str:
     return reason
 
 
-def _failure_log(sink: list):
-    """progress ของ clear_range ที่ไม่ print (ดู _quiet) แต่เก็บบรรทัดที่บอกว่าทำไมหยุดไว้ใน sink
+def _failure_log(sink: list, live=None):
+    """progress ของ clear_range ที่ไม่ print (ดู _live) แต่เก็บบรรทัดที่บอกว่าทำไมหยุดไว้ใน sink
     ให้แถวของบัญชีใน GUI บอกได้ว่าติดที่ด่านไหนเพราะอะไร แทนที่จะเห็นแค่ "stage stop=failed"
+    live (ถ้ามี) ได้ทุกบรรทัด - คือ log สดของแถวบัญชีที่กำลังดันด่าน
     """
     def progress(msg, *_args, **_kwargs):
         if "FAILED" in msg or "out of hearts" in msg:
             sink.append(msg)
+        if live is not None:
+            live(msg)
     return progress
 
 
-def _quiet(*_args, **_kwargs) -> None:
-    """progress ของ tools/ ที่ต้องไม่ลง stdout
+def _live(s: AccountSession, last: int | None = None):
+    """progress ของ tools/ ที่ไม่ print แต่เขียนบรรทัดล่าสุดแบบย่อลง s.detail ให้ GUI โชว์เป็น log สด
 
-    stdout ของ engine คือช่อง JSONL ที่ GUI อ่าน และ print() เขียนข้อความกับ "\\n" แยกกันสองครั้ง
-    ถ้าแถวของ Reporter จากอีกเธรดแทรกลงระหว่างนั้น บรรทัดนั้นจะ parse ไม่ออก แล้วบัญชีนั้นหายจาก
-    ยอดของ GUI ไปเงียบ ๆ ส่วนข้อความ progress เองก็ไม่มีใครเห็นอยู่แล้ว (GUI ข้ามบรรทัดที่ไม่ใช่ JSON)
+    ห้ามลง stdout: stdout ของ engine คือช่อง JSONL ที่ GUI อ่าน และ print() เขียนข้อความกับ "\\n"
+    แยกกันสองครั้ง ถ้าแถวของ Reporter จากอีกเธรดแทรกลงระหว่างนั้น บรรทัดนั้นจะ parse ไม่ออก แล้ว
+    บัญชีนั้นหายจากยอดของ GUI ไปเงียบ ๆ ข้อความจึงเดินทางผ่าน s.detail -> แถว "active" ของ pool แทน
+
+    ตัด JSON ท้ายบรรทัด FAILED ทิ้ง (ยาวเกินช่องในตาราง) และถ้ารู้ด่านเป้าหมาย (last) บรรทัด
+    "st045 cleared  level=12 ..." จะย่อเหลือ "st045/150 Lv12"
     """
+    def progress(msg, *_args, **_kwargs):
+        text = " ".join(str(msg).split(" {")[0].split())
+        if last is not None and " cleared" in text:
+            head = text.split()[0]
+            level = text.split("level=")[1].split()[0] if "level=" in text else ""
+            text = "%s/%s Lv%s" % (head, last, level) if level else "%s/%s" % (head, last)
+        s.detail = text[:70]
+    return progress
 
 
 def _skip_tutorial(s: AccountSession) -> tuple[int, int]:
@@ -400,7 +436,9 @@ def _skip_tutorial(s: AccountSession) -> tuple[int, int]:
     done = s.cache.get("tutorial_steps") or {}
     pending = [step for step in tutorial.STEPS if not done.get(step)]
     passed = 0
-    for step in pending:
+    s.mark("tutorial")
+    for i, step in enumerate(pending, 1):
+        s.detail = "%d/%d %s" % (i, len(pending), step)
         ok, status, _data = tutorial.confirm(s.cookie, step)
         if status == 401:
             # โทเค็นตาย ยิงที่เหลืออีกหกสิบกว่าขั้นก็ได้ 401 เหมือนกันหมด โยนออกไปให้ retry relogin ใหม่
@@ -419,12 +457,13 @@ def _newbie_quest(s: AccountSession) -> str:
     คืนข้อความสรุปสั้น ๆ เช่น "quest 18/29 blocked@idx18 exp_booster" ไว้ต่อท้ายแถวของบัญชีใน GUI
     """
     import newbie_quest
+    s.mark("quest")
     pdq, status = newbie_quest.get_quest(s.cookie)
     if status == 401:
         raise RuntimeError("dailyquest rejected (HTTP 401)")
     if not pdq.get("contents"):
         return "quest -"       # บัญชีนี้ไม่มีเควส NEWBI (ยังไม่ปลด หรือหมดอายุไปแล้ว)
-    outcome, claimed = newbie_quest.walk(s.cookie, confirm=True, progress=_quiet)
+    outcome, claimed = newbie_quest.walk(s.cookie, confirm=True, progress=_live(s))
     if outcome == "auth":
         raise RuntimeError("dailyquest rejected mid-walk (HTTP 401)")
     if claimed:
@@ -528,7 +567,7 @@ def run_login(s: AccountSession, cfg: dict) -> Outcome:
         except Exception as err:   # everything else is "รอคิว" - wait, then retry
             last = str(err)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                _backoff(s, attempt, last)
     _release_unclaimed_account()
     return Outcome(dest="login failed", status="FAIL", error=last)
 
@@ -612,7 +651,7 @@ def run_level3(s: AccountSession, cfg: dict) -> Outcome:
         except Exception as err:   # อย่างอื่นทั้งหมดคือ "รอคิว" - รอแล้วลองใหม่
             last = str(err)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                _backoff(s, attempt, last)
     _release_unclaimed_account()
     return Outcome(dest="login failed", status="FAIL", error=last)
 
@@ -672,11 +711,11 @@ def run_genid(s: AccountSession, cfg: dict) -> Outcome:
                 # from the generic FAIL below exactly as before this fix (only the number
                 # of attempts tried before answering has changed - see LevelGateFailure).
                 return Outcome(dest="login failed", status=err.status, error=last)
-            time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+            _backoff(s, attempt, last)
         except Exception as err:
             last = str(err)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                _backoff(s, attempt, last)
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 
@@ -713,7 +752,7 @@ def run_stage(s: AccountSession, cfg: dict) -> Outcome:
         except Exception as err:
             last = str(err)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                _backoff(s, attempt, last)
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 
@@ -771,7 +810,7 @@ def run_quest(s: AccountSession, cfg: dict) -> Outcome:
         except Exception as err:
             last = str(err)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                _backoff(s, attempt, last)
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 

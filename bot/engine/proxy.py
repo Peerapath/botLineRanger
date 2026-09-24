@@ -18,13 +18,50 @@ import ratelimit  # noqa: E402
 LANE_DEATH = 3
 
 
+class EngineStopped(BaseException):
+    """ผู้ใช้กด Stop - ทุก request ถัดไปของทุกเธรดโยนตัวนี้ ให้ไอดีที่ค้างอยู่วางมือทันที
+
+    BaseException ไม่ใช่ Exception โดยตั้งใจ: flows มี `except Exception` ที่ retry แล้วสุดท้าย
+    ตอบ FAIL -> ไฟล์จะไปลง "login failed" ทั้งที่ไอดีไม่ได้เสีย แค่ถูกสั่งหยุด ตัวนี้ต้องทะลุขึ้นไป
+    ถึง EnginePool ซึ่งคืนไฟล์เข้า input/ ให้ทำต่อรอบหน้า
+    """
+
+
+class _GaugedQuota:
+    """โควตา mint ของ lane ที่นับเธรดที่ยืนรอเข้า gauge เดียวกับถัง req/s
+
+    ให้ autoscaler เห็นว่าโหมด GenID ชนเพดาน 2 mint/นาที/IP อยู่ ไม่ใช่เธรดน้อยเกิน
+    """
+
+    def __init__(self, quota, lane) -> None:
+        self._quota = quota
+        self._lane = lane
+
+    def acquire(self) -> None:
+        self._lane._check_stop()
+        self._lane._wait_begin()
+        try:
+            self._quota.acquire()
+        finally:
+            self._lane._wait_end()
+        self._lane._check_stop()   # รอโควตาได้ถึงนาที - ห้าม mint ต่อถ้าระหว่างนั้นถูกสั่งหยุด
+
+    def __getattr__(self, name):
+        return getattr(self._quota, name)
+
+
 class ProxyLane:
     def __init__(self, name: str, parts, rps: float, threads: int,
                  clock=None, sleep=None) -> None:
         self.name = name
         self.parts = parts
+        self.rps = float(rps)
+        # เป้าจำนวนเธรดของ lane นี้ - โหมดตั้งเองคงที่ โหมด auto ให้ engine.autoscale ขยับ
         self.threads = threads
+        self.running = 0          # เธรด worker ที่ยังอยู่บน lane นี้จริงตอนนี้ (pool นับ)
         self.alive = True
+        self.stopping = False     # stop() ตั้ง (EnginePool.request_stop) - request ถัดไปโยน EngineStopped
+        self._stop_evt = threading.Event()
         kw = {}
         if clock is not None:
             kw["clock"] = clock
@@ -40,12 +77,79 @@ class ProxyLane:
         # 100 accounts/minute, not 2 for the whole fleet). Consumed by
         # tools/new_account.py's _do() via rangers_api.current_lane().auth_quota.
         limit, window = ratelimit.parse_quota_spec(ratelimit.AUTH_QUOTA)
-        self.auth_quota = ratelimit.InMemoryQuota(limit, window, **kw)
         self._lock = threading.Lock()
+        self.auth_quota = _GaugedQuota(ratelimit.InMemoryQuota(limit, window, **kw), self)
         self._fails = 0
+        # ตัวนับให้ autoscaler: เธรดที่ยืนรอถัง/โควตาอยู่ตอนนี้, request ที่ได้โทเคนแล้ว (สะสม),
+        # คำตอบ 429/503 ที่เซิร์ฟเวอร์ตีกลับ (สะสม)
+        self._waiting = 0
+        self._sent = 0
+        self._limited = 0
+
+    def _wait_begin(self) -> None:
+        with self._lock:
+            self._waiting += 1
+
+    def _wait_end(self) -> None:
+        with self._lock:
+            self._waiting -= 1
+
+    def stop(self) -> None:
+        self.stopping = True
+        self._stop_evt.set()
+
+    def _check_stop(self) -> None:
+        if self.stopping:
+            raise EngineStopped()
+
+    def nap(self, seconds: float) -> None:
+        """time.sleep ที่ตื่นทันทีเมื่อกด Stop แล้วโยน EngineStopped - ให้ flows ใช้รอ retry
+        (5-15 วิ) ไอดีที่กำลังรออยู่จะได้คืน input/ ทันที ไม่ต้องรอหลับจนครบ"""
+        self._check_stop()
+        self._stop_evt.wait(seconds)
+        self._check_stop()
 
     def acquire(self) -> None:
-        self.bucket.acquire()
+        """ทุก request ของทุกโหมดผ่านตรงนี้ (rangers_api และ new_account) จึงเป็นจุดเดียวที่
+        ตัดไอดีที่ค้างอยู่ได้ทันทีเมื่อกด Stop - เช็คทั้งก่อนและหลังรอถัง"""
+        self._check_stop()
+        self._wait_begin()
+        try:
+            self.bucket.acquire()
+        finally:
+            self._wait_end()
+        self._check_stop()
+        with self._lock:
+            self._sent += 1
+
+    def note_limited(self) -> None:
+        """เซิร์ฟเวอร์ตอบ 429/503 (nginx ต่อ IP) - สัญญาณให้ autoscaler ถอยเธรด"""
+        with self._lock:
+            self._limited += 1
+
+    def counters(self) -> tuple[int, int, int]:
+        """(เธรดที่รอถัง/โควตาอยู่ตอนนี้, request สะสม, 429/503 สะสม)"""
+        with self._lock:
+            return self._waiting, self._sent, self._limited
+
+    def enter(self) -> None:
+        with self._lock:
+            self.running += 1
+
+    def leave(self) -> None:
+        with self._lock:
+            self.running -= 1
+
+    def retire_one(self) -> bool:
+        """เธรดเกินเป้า -> คืน True และหักตัวเองออกจาก running ทันที (ในล็อก)
+
+        หักในล็อกเดียวกับที่เช็ค ไม่งั้นเธรดสิบตัวที่เช็คพร้อมกันตอนเกินเป้าหนึ่งตัวจะออกไปทั้งสิบ
+        """
+        with self._lock:
+            if self.running > self.threads:
+                self.running -= 1
+                return True
+            return False
 
     def note_ok(self) -> None:
         with self._lock:

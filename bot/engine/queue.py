@@ -321,6 +321,23 @@ class WorkQueue:
     def fail(self, src: str, reason: str) -> str:
         return self._close(src, "login failed", "", t="fail", why=str(reason)[:200])
 
+    def release(self, src: str) -> str:
+        """คืนไฟล์ที่หยิบไปแล้วแต่ยังทำไม่จบ (ผู้ใช้กด Stop กลางไอดี) กลับเข้า input/ โฟลเดอร์ย่อยเดิม
+
+        งานเดียวกับที่ recover() ทำตอนเริ่มรอบหน้า แต่ทำทันทีตอนหยุด ตัวนับ input/execute ใน GUI
+        จึงถูกต้องตั้งแต่กด Stop ไม่ใช่ค้าง execute: N จนกว่าจะกด Start อีกครั้ง บรรทัด "release"
+        ใน journal ปิด claim ของไฟล์นี้ (_open_claims นับทุกแถวที่ไม่ใช่ claim เป็นการปิด)
+        """
+        execute = os.path.join(self.root, "execute")
+        rel = os.path.relpath(src, execute)
+        dst = os.path.join(self.root, "input", rel)
+        with self._lock:
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            if not _replace_with_retry(src, dst):
+                raise FileNotFoundError("cannot release %r: it is no longer in execute/" % rel)
+            self._write(t="release", f=rel)
+        return dst
+
     def remaining(self) -> int:
         with self._lock:
             if not self._scanned:

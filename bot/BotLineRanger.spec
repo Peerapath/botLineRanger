@@ -42,6 +42,7 @@ a = Analysis(
         'tkinter',
         'tkinter.filedialog',
         'tkinter.messagebox',
+        'tkinter.ttk',          # main.py: ตารางบัญชีที่กำลังทำ (ttk.Treeview) ในแผงซ้าย
         'customtkinter',
         'PIL',
         'PIL.Image',

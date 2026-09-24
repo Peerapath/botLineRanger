@@ -6,6 +6,7 @@ LASTGACHASTATUS) ซึ่งแปลว่าสองบัญชีในโ
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 
@@ -25,6 +26,15 @@ class AccountSession:
     error: str = ""
     attempts: int = 0
     cache: dict = field(default_factory=dict)   # ที่เก็บของที่ยิงครั้งเดียวต่อบัญชี เช่น gacha/info
+    # ความคืบหน้าสดที่ GUI โชว์ในตารางบัญชีที่กำลังทำ: pool อ่านสองช่องนี้จากอีกเธรดทุกวินาที
+    # (อ่าน str อย่างเดียว ไม่ต้องล็อก) step เป็นคีย์สั้น ๆ ภาษาอังกฤษ GUI แปลเป็นไทยเอง
+    step: str = ""
+    detail: str = ""
+    started: float = field(default_factory=time.time)
+
+    def mark(self, step: str, detail: str = "") -> None:
+        self.step = step
+        self.detail = detail
 
     def reset_token(self) -> None:
         """บังคับให้ relogin ใหม่ในความพยายามรอบถัดไป

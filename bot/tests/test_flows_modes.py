@@ -746,8 +746,8 @@ def _pdq(claimed, total=29, current=None, current_type="exp_booster"):
     return {"contents": contents}
 
 
-def test_newbie_quest_walks_quietly_claims_the_milestone_and_summarises(monkeypatch):
-    """progress=print ของ walk จะลง stdout ซึ่งเป็นช่อง JSONL ของ GUI - ต้องส่ง _quiet เข้าไปเสมอ"""
+def test_newbie_quest_walks_quietly_claims_the_milestone_and_summarises(monkeypatch, capsys):
+    """progress=print ของ walk จะลง stdout ซึ่งเป็นช่อง JSONL ของ GUI - ต้องส่งตัวที่เขียนลง s.detail แทนเสมอ"""
     import newbie_quest
 
     seen = {}
@@ -763,7 +763,10 @@ def test_newbie_quest_walks_quietly_claims_the_milestone_and_summarises(monkeypa
     monkeypatch.setattr(newbie_quest, "claim_special", lambda cookie: seen.setdefault("special", True))
     s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
     assert flows._newbie_quest(s) == "quest 18/29 blocked@idx18 exp_booster"
-    assert seen["progress"] is flows._quiet
+    assert seen["progress"] is not print
+    seen["progress"]("idx4 treasure          0/1  (next action: open)")
+    assert s.detail == "idx4 treasure 0/1 (next action: open)"
+    assert capsys.readouterr().out == ""
     assert seen["confirm"] is True
     assert seen["special"] is True
 

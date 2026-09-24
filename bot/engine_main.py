@@ -23,7 +23,7 @@ import rangers_api  # noqa: E402
 import relogin      # noqa: E402
 import client_version  # noqa: E402
 
-BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby", "newbiequest")
+BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby", "newbiequest", "autothreads")
 INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthreads",
         "gachacycles", "threadcount")
 FLOATS = ("stagedelay",)
@@ -236,6 +236,9 @@ def main(argv):
     root = os.getcwd()
     cfg = load_config(os.path.join(root, "src", "config.ini"),
                       os.path.join(root, "src", "configRangers.ini"), mode)
+    # จำนวนเธรดปรับเองเป็นค่าปริยาย (GUI ไม่มีช่องตั้งเลขแล้ว) - ใส่ autothreads = False ใน config.ini
+    # เพื่อกลับไปใช้ threadcount คงที่แบบเดิม
+    cfg.setdefault("autothreads", True)
 
     # สองค่าที่ flows อ่านจาก cfg แต่ cfg เองสร้างเองไม่ได้ - ถ้าไม่ใส่ตรงนี้
     # flows จะทำงานต่อได้เงียบ ๆ โดยปิดความสามารถไปทีละอย่าง โดยเทสต์ยังเขียวหมด
@@ -277,7 +280,7 @@ def main(argv):
 
     def watch():
         while not os.path.exists(stop_flag):
-            time.sleep(1.0)
+            time.sleep(0.2)     # ปุ่ม Stop ต้องรู้สึกทันที - เช็คไฟล์เดียวห้าครั้งต่อวินาทีไม่มีต้นทุน
         pool.request_stop()
 
     threading.Thread(target=watch, daemon=True, name="stop-flag-watch").start()
@@ -289,5 +292,22 @@ def main(argv):
     return 0
 
 
+def run_and_exit(argv) -> None:
+    """main() แล้วออกจากโปรเซสทันที - ใช้กับทั้ง `python engine_main.py` และ exe `--engine`
+
+    os._exit ไม่ใช่ sys.exit: หลังกด Stop เธรด worker ที่หลับอยู่ (รอหัวใจเกิดใหม่ถึง 10 นาที,
+    รอโควตา mint, รอ retry) ยังไม่ตื่น การปิด interpreter แบบปกติต้องผ่าน finalization ที่ค้างได้
+    ถ้าเธรดพวกนั้นถือล็อกของ stdout อยู่ - ปุ่ม Stop ต้องทำให้โปรเซสหายจริง ยอดสุดท้ายกับ journal
+    ถูกเขียนและปิดไปแล้วใน main() เหลือแค่ flush stdout/stderr ให้ GUI ได้บรรทัดสุดท้ายครบ
+    """
+    code = main(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code or 0)
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    run_and_exit(sys.argv)

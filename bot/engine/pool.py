@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import collections
 import os
 import sys
 import threading
@@ -16,8 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 import client_version  # noqa: E402
 import rangers_api   # noqa: E402
 
+from . import autoscale           # noqa: E402
 from . import flows as flows_mod   # noqa: E402
-from .proxy import ProxyPool       # noqa: E402
+from .proxy import EngineStopped, ProxyPool   # noqa: E402
 from .queue import DESTS           # noqa: E402
 from .session import AccountSession, Outcome   # noqa: E402
 
@@ -34,8 +36,14 @@ from .session import AccountSession, Outcome   # noqa: E402
 # that waits on wall-clock time" the brief called out as this task's risk.
 STAT_EVERY = 2.0       # วินาที - ผูกกับเวลา ไม่ใช่จำนวนบัญชี คิวที่เดินช้าก็ยังมีสัญญาณชีพ
 POLL_EVERY = 0.05      # seconds between supervisor wake-ups (thread/lane health checks)
-DRAIN_LIMIT = 60.0     # ให้เวลาบัญชีที่ค้างอยู่จบก่อนเลิก
+# หลังกด Stop: รอเธรดวางมือได้นานสุดเท่านี้ แล้วเลิกรอ - เธรดที่ยังหลับอยู่ (รอหัวใจ, รอ retry,
+# รอโควตา mint) เป็น daemon ตายไปพร้อมโปรเซส ไฟล์ของมันค้าง execute/ แล้ว recover() คืน input/ ตอนเริ่มรอบหน้า
+# เดิม 60 วิและปล่อยให้ไอดีที่ค้างทำจนจบ - Stage/Quest ใช้ ~9 นาทีต่อไอดี กด Stop แล้วบอทยังวิ่งต่ออีกนาน
+DRAIN_LIMIT = 3.0
 LANE_RETRY = 300.0     # วินาที - proxy ที่ล่มชั่วคราวได้กลับมาเอง ไม่ต้องรีสตาร์ททั้ง engine
+ACTIVE_EVERY = 1.0     # วินาที - ตารางบัญชีที่กำลังทำใน GUI อัปเดตถี่เท่านี้
+ACTIVE_MAX = 500       # แถวต่อหนึ่งรายงาน - กันบรรทัด JSONL ยาวเกินเหตุตอนเธรดเยอะมาก
+RPM_WINDOW = 60.0      # วินาที - "บัญชี/นาที" ใน stat คิดจากช่วงล่าสุดเท่านี้ ไม่ใช่เฉลี่ยทั้งรัน
 
 # Named here (not just a literal string inline in engine_main.py) so anything that needs to
 # know the flag's filename - engine_main.py's watcher thread today, a GUI later - imports
@@ -73,8 +81,18 @@ class EnginePool:
         # own overflow already uses below) - not a second, independently-set per-lane
         # number. threadsperproxy stays the direct per-lane override for any caller (tests,
         # a future non-GUI caller) that never sets threadcount.
+        #
+        # autothreads (engine_main ตั้งเป็น True เป็นค่าปริยาย GUI ไม่มีช่องตั้งเลขแล้ว): ทั้งสองคีย์ข้างบน
+        # ถูกข้าม เริ่มที่ autoscale.start_for(mode) ต่อ lane (GenID 2, Login 32) แล้วให้ AutoScaler
+        # หาเลขที่ได้บัญชี/นาทีสูงสุดเอง
+        # ค่าปริยายของคลาสนี้ยังเป็นเลขคงที่ เทสต์และผู้เรียกอื่นที่ส่ง threadsperproxy มาได้ผลเดิมทุกอย่าง
         lane_count = len(proxies) or 1     # ProxyPool falls back to one "direct" lane too
-        if "threadcount" in cfg:
+        max_threads = int(cfg.get("maxthreads") or 4096)
+        self._auto = bool(cfg.get("autothreads", False))
+        self._lane_max = max(1, min(autoscale.LANE_MAX, max_threads // lane_count))
+        if self._auto:
+            threads_per = min(autoscale.start_for(mode), self._lane_max)
+        elif "threadcount" in cfg:
             threads_per = max(1, int(cfg["threadcount"]) // lane_count)
         else:
             threads_per = int(cfg.get("threadsperproxy") or 96)
@@ -82,7 +100,7 @@ class EnginePool:
             proxies,
             rps=float(cfg.get("apirps") or 90),
             threads_per=threads_per,
-            max_threads=int(cfg.get("maxthreads") or 4096))
+            max_threads=max_threads)
         if self.pool.capped:
             self.reporter.note(
                 "threads capped: %d requested, %d running (ceiling %s)"
@@ -98,17 +116,30 @@ class EnginePool:
         # see _run_one. Counted separately from done/fail so neither of those can ever
         # claim a destination folder holds a file that is still sitting in execute/.
         self._stuck = 0
+        # ไอดีที่ถูกตัดกลางทางเพราะกด Stop - ไฟล์คืน input/ แล้ว ไม่ใช่ done/fail
+        self._aborted = 0
         self._version_stopped = False
+        # คิว input/ หมดแล้ว (มีเธรดที่ claim() ได้ None) - ห้ามสปอว์นเธรดมาแทนตัวที่ออกไป
+        self._exhausted = False
+        self._seq = 0              # เลขท้ายชื่อเธรด ไม่ซ้ำตลอดรัน
+        # บัญชีที่กำลังทำอยู่ (key -> session) ให้ตารางใน GUI - เขียนจากเธรด worker
+        # อ่านจาก supervisor ทุก ACTIVE_EVERY
+        self._active: dict = {}
+        self._active_seq = 0
 
     def request_stop(self) -> None:
-        """หยุดรับงานใหม่ บัญชีที่ค้างอยู่ทำต่อจนจบ
+        """หยุดทุกอย่าง: ไม่รับงานใหม่ และไอดีที่ค้างอยู่วางมือที่ request ถัดไป (lane โยน EngineStopped)
 
-        ตรงข้ามกับ terminate() ทันที ซึ่งทิ้งทั้งงานครึ่งทางและยอดสุดท้ายของมัน
+        ผู้ใช้กด Stop = ต้องหยุดจริงภายในไม่กี่วินาที ไม่ใช่รอไอดีที่ค้างทำจนจบ ไฟล์ของไอดีที่ถูกตัด
+        คืนเข้า input/ (_abort) ส่วนยอดสุดท้ายยังส่งครบเพราะ engine ออกเองหลัง DRAIN_LIMIT วินาที
+        ไม่ใช่ถูก terminate() กลางทาง
         """
         with self._lock:
             if self._stop_at is None:
                 self._stop_at = time.time()
         self._stop.set()
+        for lane in self.pool.lanes:
+            lane.stop()
 
     def _stop_for_version(self, session, err) -> None:
         """ไม่มี App-Version หรือ URL prefix ไหนที่เซิร์ฟเวอร์รับเลย (client_version สำรวจแล้ว)
@@ -143,22 +174,61 @@ class EnginePool:
         # AND stop dead the moment input/ ran dry, when the mode is meant to run until told
         # to stop.
         self_supplied = self.mode in flows_mod.SELF_SUPPLIED_MODES
-        while not self._stop.is_set():
-            if not lane.alive:
-                # proxy ของเธรดนี้ตาย - ออกไปเลย งานที่ยังไม่ถูก claim ยังอยู่ในคิวให้ lane
-                # อื่นหยิบต่อ ไม่มีอะไรหาย
-                return
-            if self_supplied:
-                src = ""       # _run_one's session starts empty; the flow fills s.src itself
-            else:
-                src = self.queue.claim()
-                if src is None:
+        retired = False
+        try:
+            while not self._stop.is_set():
+                if not lane.alive:
+                    # proxy ของเธรดนี้ตาย - ออกไปเลย งานที่ยังไม่ถูก claim ยังอยู่ในคิวให้ lane
+                    # อื่นหยิบต่อ ไม่มีอะไรหาย
                     return
-            self._run_one(lane, src)
+                if lane.retire_one():
+                    # autoscaler ลดเป้าของ lane - ออกตรงรอยต่อระหว่างบัญชี ไม่ทิ้งงานครึ่งทาง
+                    retired = True
+                    return
+                if self_supplied:
+                    src = ""       # _run_one's session starts empty; the flow fills s.src itself
+                else:
+                    src = self.queue.claim()
+                    if src is None:
+                        self._exhausted = True
+                        return
+                self._run_one(lane, src)
+        finally:
+            if not retired:        # retire_one() หักตัวเองออกจาก running ไปแล้วในล็อก
+                lane.leave()
 
     def _run_one(self, lane, src) -> None:
         started = time.time()
         session = AccountSession(src=src, lane=lane)
+        with self._lock:
+            self._active_seq += 1
+            key = self._active_seq
+            self._active[key] = session
+        try:
+            self._run_session(lane, session, started)
+        finally:
+            with self._lock:
+                self._active.pop(key, None)
+
+    def _abort(self, lane, session, started) -> None:
+        """ไอดีที่ถูกกด Stop กลางทาง: คืนไฟล์เข้า input/ ทำต่อรอบหน้า - ไม่นับเป็น done หรือ fail"""
+        dest = "none"
+        move_err = ""
+        if session.src:
+            try:
+                self.queue.release(session.src)
+                dest = "input"
+            except OSError as err:
+                dest = "execute"          # recover() ตอนเริ่มรอบหน้าคืนให้แทน
+                move_err = str(err)
+        with self._lock:
+            self._aborted += 1
+        self.reporter.account(status="STOP", rsn=session.rsn, lv=session.level,
+                              ms=int((time.time() - started) * 1000), dest=dest,
+                              moved=dest == "input", lane=lane.name, err="stopped",
+                              move_err=move_err[:120])
+
+    def _run_session(self, lane, session, started) -> None:
         try:
             out = self.flow(self.mode, session, self.cfg)
             if out.dest not in DESTS:
@@ -167,6 +237,9 @@ class EnginePool:
                 # (this run never retries a claimed file) and quietly shrink the pool by one
                 # thread, indistinguishable from a lane dying for an unrelated reason.
                 raise ValueError("flow returned an unknown destination %r" % (out.dest,))
+        except EngineStopped:
+            self._abort(lane, session, started)
+            return
         except client_version.VersionUnavailable as err:
             self._stop_for_version(session, err)
             return
@@ -245,12 +318,37 @@ class EnginePool:
                               moved=moved, lane=lane.name, err=(out.error or "")[:120],
                               move_err=move_err[:120])
 
-    def _spawn(self, lane, threads: list, prefix: str = "") -> None:
-        for i in range(lane.threads):
+    def _spawn(self, lane, threads: list, count: int) -> None:
+        for _ in range(count):
+            self._seq += 1
+            lane.enter()       # นับก่อน start: รอบ _fill ถัดไปต้องเห็นเธรดนี้แล้ว ไม่งั้นสปอว์นซ้ำ
             t = threading.Thread(target=self._worker, args=(lane,),
-                                 name="%s-%s%d" % (lane.name, prefix, i), daemon=True)
+                                 name="%s-%d" % (lane.name, self._seq), daemon=True)
             t.start()
             threads.append(t)
+
+    def _fill(self, threads: list) -> None:
+        """เติมเธรดให้ทุก lane ที่ยังมีชีวิตถึงเป้า (lane.threads)
+
+        ครั้งแรกคือการสปอว์นตอนเริ่ม หลังจากนั้นคือเธรดที่ autoscaler เพิ่มเป้า และ lane ที่ฟื้นจาก
+        proxy ล่ม - ไม่เติมเมื่อสั่งหยุดแล้วหรือคิว input/ หมดแล้ว (เธรดใหม่จะ claim() ได้ None ทันที)
+        """
+        if self._stop.is_set() or self._exhausted:
+            return
+        for lane in self.pool.alive_lanes():
+            missing = lane.threads - lane.running
+            if missing > 0:
+                self._spawn(lane, threads, missing)
+
+    def _active_rows(self, now: float) -> list:
+        """แถวของตาราง "บัญชีที่กำลังทำ" ใน GUI เก่าสุดก่อน - อ่าน step/detail ที่ flows เขียนผ่าน s.mark()"""
+        with self._lock:
+            items = sorted(self._active.items())[:ACTIVE_MAX]
+        return [{"k": key,
+                 "id": s.rsn or os.path.splitext(os.path.basename(s.src))[0],
+                 "step": s.step, "detail": s.detail, "try": s.attempts,
+                 "age": round(now - s.started, 1)}
+                for key, s in items]
 
     def run(self) -> dict:
         started = time.time()
@@ -260,13 +358,17 @@ class EnginePool:
         lane_retry = self._lane_retry if self._lane_retry is not None else LANE_RETRY
 
         threads: list[threading.Thread] = []
-        for lane in self.pool.alive_lanes():
-            self._spawn(lane, threads)
+        self._fill(threads)
+        scaler = (autoscale.AutoScaler(self.pool.lanes, lane_max=self._lane_max,
+                                       total_max=int(self.cfg.get("maxthreads") or 4096),
+                                       now=started)
+                  if self._auto else None)
 
         announced = set()
         last_stat = 0.0
+        last_active = 0.0
         last_retry = time.time()
-        revivals = 0
+        done_hist = collections.deque([(started, 0)])
 
         # A do-while, deliberately not "while any(t.is_alive() for t in threads):" - every
         # lane can be dead before this loop ever runs (all proxies bad from the start, or
@@ -289,8 +391,9 @@ class EnginePool:
                 self.request_stop()
                 break
 
-            running = [t for t in threads if t.is_alive()]
-            if not running:
+            # เธรดที่ retire/จบไปแล้วทิ้งออกจาก list - autoscaler สปอว์นใหม่ได้ตลอดรัน list จะโตไม่หยุด
+            threads[:] = [t for t in threads if t.is_alive()]
+            if not threads:
                 # Nothing left to wait for: either the queue drained on its own, or (if
                 # request_stop() was called) every in-flight account already finished.
                 # Sitting out the rest of drain_limit here would only delay the final
@@ -299,33 +402,46 @@ class EnginePool:
 
             if time.time() - last_retry >= lane_retry:
                 last_retry = time.time()
-                revivals += 1
                 for lane in self.pool.lanes:
                     if not lane.alive:
                         lane.revive()
                         announced.discard(lane.name)
                         self.reporter.lane(name=lane.name, state="retry")
-                        self._spawn(lane, threads, prefix="r%d-" % revivals)
 
-            if time.time() - last_stat >= stat_every:
-                last_stat = time.time()
-                # Refreshed, not the running above: the lane-retry step just above may have
-                # spawned more threads this same tick, and a stat line that undercounts
-                # them for one cycle is a needless (if minor) lie to whoever is watching.
-                running_now = [t for t in threads if t.is_alive()]
+            if scaler is not None:
+                scaler.tick(time.time())
+            # เติมหลัง revive และหลัง autoscaler ขยับเป้า - รอบเดียวจบทั้งสองกรณี
+            self._fill(threads)
+
+            now = time.time()
+            if now - last_active >= ACTIVE_EVERY:
+                last_active = now
+                self.reporter.active(rows=self._active_rows(now))
+
+            if now - last_stat >= stat_every:
+                last_stat = now
                 with self._lock:
                     done, fail, stuck = self._done, self._fail, self._stuck
-                elapsed = max(0.001, time.time() - started)
+                elapsed = max(0.001, now - started)
+                done_hist.append((now, done))
+                while len(done_hist) > 2 and now - done_hist[1][0] >= RPM_WINDOW:
+                    done_hist.popleft()
+                t0, d0 = done_hist[0]
                 self.reporter.stat(done=done, fail=fail, stuck=stuck,
                                    left=self.queue.remaining(),
                                    rate=round(done / elapsed, 2),
-                                   threads=len(running_now), lanes=len(alive))
+                                   rpm=round((done - d0) * 60.0 / max(0.001, now - t0), 1),
+                                   threads=sum(x.running for x in self.pool.lanes),
+                                   target=sum(x.threads for x in alive),
+                                   auto=self._auto,
+                                   scale=scaler.summary() if scaler is not None else "",
+                                   lanes=len(alive))
 
             if (self._stop.is_set() and self._stop_at is not None
                     and time.time() - self._stop_at > drain_limit):
                 # Some worker is still running well after the drain window - stop waiting
                 # on it here so a hung account can't block this loop forever. The join
-                # below still gives every thread its own, separate drain_limit.
+                # below shares the same window (anchored on _stop_at), it does not add another.
                 break
 
             self._sleep(poll_every)
@@ -336,17 +452,36 @@ class EnginePool:
         # thread makes join() return the moment it actually finishes, so this only matters
         # when something really is stuck - and then it bounds the whole wait to
         # drain_limit, not drain_limit times the pool size.
-        deadline = time.time() + drain_limit
+        # หลังกด Stop นับจากเวลาที่กด ไม่ใช่เริ่มนับใหม่ตรงนี้ - ลูปข้างบนรอไปแล้ว ไม่งั้น Stop ช้าเป็นสองเท่า
+        start = self._stop_at if self._stop_at is not None else time.time()
+        deadline = max(time.time(), start + drain_limit)
         for t in threads:
             t.join(timeout=max(0.0, deadline - time.time()))
 
+        if self._stop.is_set():
+            # เธรดที่ยังหลับอยู่ (รอหัวใจเกิดใหม่, รอโควตา mint, ค้างใน HTTP) ไม่ได้รอให้ตื่น - โปรเซสจะออก
+            # เลย คืนไฟล์ของมันเข้า input/ แทนมันตรงนี้ ถ้ามันตื่นทันก่อนโปรเซสปิด request ถัดไปของมัน
+            # โยน EngineStopped แล้ว _abort เจอไฟล์ไม่อยู่แล้ว (OSError) ซึ่งจัดการไว้แล้ว
+            with self._lock:
+                stragglers = list(self._active.values())
+            for s in stragglers:
+                if s.src:
+                    try:
+                        self.queue.release(s.src)
+                    except OSError:
+                        pass            # recover() ตอนเริ่มรอบหน้าคืนให้แทน
+
+        self.reporter.active(rows=[])     # ตารางใน GUI ว่าง - ไม่เหลือบัญชีที่กำลังทำ
         with self._lock:
             done, fail, stuck = self._done, self._fail, self._stuck
+            # ตัดกลางทางแล้วคืน input/ + เธรดที่ยังหลับอยู่ตอนเลิกรอ (ไฟล์ค้าง execute/ คืนตอนเริ่มรอบหน้า)
+            stopped = self._aborted + len(self._active)
         elapsed = max(0.001, time.time() - started)
         # "stuck" is a new key (global constraint: existing keys keep their meaning) -
         # done/fail must never count a file that never reached its destination folder,
         # so an account whose final move failed lands here instead of inflating either.
         summary = {"done": done, "fail": fail, "stuck": stuck, "left": self.queue.remaining(),
-                   "seconds": round(elapsed, 1), "rate": round(done / elapsed, 2)}
+                   "seconds": round(elapsed, 1), "rate": round(done / elapsed, 2),
+                   "stopped": stopped}
         self.reporter.stat(**dict(summary, final=True))
         return summary

@@ -33,5 +33,10 @@ class Reporter:
     def lane(self, **kw):
         self._emit("lane", **kw)
 
+    def active(self, **kw):
+        """ภาพรวมบัญชีที่กำลังทำทั้งหมดในบรรทัดเดียว (ทุกวินาที) - ไม่ใช่หนึ่งบรรทัดต่อการขยับขั้น
+        ซึ่งตอนเธรดเป็นร้อยคือหลายร้อยบรรทัดต่อวินาที"""
+        self._emit("active", **kw)
+
     def note(self, msg: str):
         self._emit("note", msg=msg)

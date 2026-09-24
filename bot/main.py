@@ -6,7 +6,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_MAIN_FREE"):
     _os.environ.setdefault(_v, "1")
 
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import subprocess
 from multiprocessing import Process
 import multiprocessing
@@ -315,7 +315,8 @@ class EmulatorManager(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("BotLineRanger")
-        self.geometry("640x360+640+360")
+        # กว้างขึ้นจาก 640x360 ให้ตารางบัญชีที่กำลังทำ (ไอดี/สถานะ/เวลา/log สด) มีที่พอ
+        self.geometry("860x460+480+300")
         self.configure(bg=dark)
         try:
             self.iconbitmap(r"src\image\home\BotLineRanger_128.ico")
@@ -345,6 +346,13 @@ class EmulatorManager(ctk.CTk):
         self._engine_last_stat = {}         # most recent "stat" row, for _updateEngineStats
         self._engine_lanes = {}             # lane name -> latest "lane" row
         self._engine_session_rows = []      # capped history of finished accounts ("acct" rows)
+        self._engine_active = []            # rows ของแถว "active" ล่าสุด = บัญชีที่กำลังทำอยู่
+        # widget ของแผงซ้ายที่ _build_thread_panel สร้างใหม่ทุกครั้งที่สลับโหมด - None ก่อนสร้าง
+        self._threads_box = None            # เลขเธรดที่รันอยู่ (auto)
+        self._scale_label = None            # "auto · กำลังเพิ่ม" ข้างเลขเธรด
+        self._active_tree = None            # ตาราง ttk.Treeview ของบัญชีที่กำลังทำ
+        self.worker_summary_label = None    # ยอดรวมของรัน (สำเร็จ/ล้ม/เหลือ/ไอดีต่อนาที)
+        self._engine_stopping = False       # กด Stop แล้ว รอ engine ปิดตัว - stat ที่ตามมาขึ้นว่า "กำลังหยุด"
         # Set when _read_engine dies from anything other than a bad JSON line (Finding 3 in
         # the round-1 review) - reader death is _drain_engine_rows's only proof the engine
         # process itself is gone, so a reader that crashes while the process is still alive
@@ -356,12 +364,7 @@ class EmulatorManager(ctk.CTk):
         self.config = configparser.ConfigParser()
         self.load_config()
 
-        # จำนวน thread สำหรับโหมด Login (headless) - แต่ละ thread = 1 โปรเซสที่หยิบไฟล์จาก input/ แบ่งกันเอง
-        try:
-            self.thread_count = self.config.getint("settings", "threadcount", fallback=4)
-        except Exception:
-            self.thread_count = 4
-        self.thread_count = max(1, min(self.thread_count, 1024))
+        # จำนวนเธรดไม่มีช่องตั้งแล้ว: engine ปรับเองระหว่างรันให้ได้บัญชี/นาทีสูงสุด (bot/engine/autoscale.py)
         self._worker_seq = 0   # ลำดับ worker ที่สปอว์น ใช้แจก proxy วน (ดู _worker_env)
         self._warned_api_config = False   # เตือน config rate limit ผิดรูปแบบครั้งเดียวต่อรอบ
 
@@ -420,15 +423,16 @@ class EmulatorManager(ctk.CTk):
         middle_frame = ctk.CTkFrame(self, fg_color="#2b2b2b")
         middle_frame.pack(fill="both", expand=True, padx=10, pady=(5, 0))
 
-        # ซ้าย: จำนวน thread (ทุกโหมดเป็น headless แล้ว - ดู render_left_panel/_build_thread_panel)
-        self.left_frame = ctk.CTkScrollableFrame(middle_frame, width=330)
+        # ซ้าย: เธรด auto + ตารางบัญชีที่กำลังทำ (ทุกโหมดเป็น headless แล้ว - ดู _build_thread_panel)
+        # CTkFrame ธรรมดา ไม่ใช่ ScrollableFrame: ตารางมีสกอลล์ของตัวเอง ซ้อนสองชั้นแล้วล้อเมาส์ตีกัน
+        self.left_frame = ctk.CTkFrame(middle_frame, fg_color="transparent")
         self.left_frame.pack(side="left", fill="both",
                              expand=True, padx=(10, 5), pady=10)
 
-        # ขวา: Settings และ PlayMode-specific UI
-        self.right_frame = ctk.CTkScrollableFrame(middle_frame)
-        self.right_frame.pack(side="right", fill="both",
-                         expand=True, padx=(5, 10), pady=10)
+        # ขวา: Settings และ PlayMode-specific UI - กว้างคงที่ ที่เหลือยกให้ตารางฝั่งซ้าย
+        self.right_frame = ctk.CTkScrollableFrame(middle_frame, width=290)
+        self.right_frame.pack(side="right", fill="y",
+                         expand=False, padx=(5, 10), pady=10)
 
         # ----------- SETTINGS (สร้างครั้งเดียว) -----------
         # create initial playmode UI
@@ -1189,10 +1193,9 @@ class EmulatorManager(ctk.CTk):
             return
 
     def stop_bot_for_selected(self):
-        # เหตุผลเดียวกับ start_bot_for_selected ด้านบน
-        if self._isHeadlessThreadMode():
-            self._stop_workers()
-            return
+        # ไม่ขึ้นกับโหมดที่เลือกอยู่ใน dropdown: ผู้ใช้สลับโหมดระหว่างรันได้ และ verify_subscription
+        # (ทุก 30 นาที) กรอง dropdown ใหม่ได้ ถ้าเช็คโหมดก่อน Stop จะกดไม่ติดทั้งที่ engine ยังวิ่งอยู่
+        self._stop_workers()
 
     def open_log_file(self, log_file):
         if not os.path.exists(log_file):
@@ -1351,8 +1354,26 @@ class EmulatorManager(ctk.CTk):
         if self._isHeadlessThreadMode():
             self._build_thread_panel()
 
+    # ขั้น (step) ที่ flows เขียนผ่าน s.mark() -> ข้อความในคอลัมน์ "สถานะ" ของตาราง
+    ACTIVE_STEP_LABELS = {
+        "": "เริ่ม", "relogin": "ล็อกอิน", "home": "โหลดข้อมูล", "rewards": "รับรางวัล",
+        "gacha": "สุ่มกาชา", "info": "อ่านไอดี", "level": "เก็บเลเวล", "mint": "สร้างไอดี",
+        "stage": "ดันด่าน", "tutorial": "ข้ามสอน", "quest": "ทำเควส", "retry": "รอลองใหม่",
+        # ไม่ได้มาจาก flows: _render_active ใส่ให้ทุกแถวเองตั้งแต่กด Stop จนตารางว่าง
+        "stopped": "หยุด",
+    }
+    # สถานะของ autoscaler (bot/engine/autoscale.py) -> ข้อความสั้น ๆ ข้างเลขเธรด
+    SCALE_LABELS = {
+        "grow": "กำลังเพิ่ม", "full": "เต็มเพดาน IP", "plateau": "เพิ่มแล้วไม่เร็วขึ้น",
+        "backoff": "โดน 429 ถอย", "max": "สูงสุดแล้ว",
+    }
+
     def _build_thread_panel(self):
-        # ล้างแผงซ้าย (ทั้ง device rows เดิมและ worker rows) แล้ววาดตัวตั้งจำนวน thread ใหม่
+        """แผงซ้าย: เลขเธรดที่ engine ปรับเอง (auto) + ยอดรวม + ตารางบัญชีที่กำลังทำ
+
+        ไม่มีช่องตั้งจำนวนเธรดแล้ว เลขที่ดีที่สุดต่างกันทุกโหมด (Login ~128 ต่อ IP, GenID ไม่กี่ตัว
+        เพราะโควตา mint) engine จึงหาเองระหว่างรัน - ดู bot/engine/autoscale.py
+        """
         self.check_vars.clear()
         for widget in self.left_frame.winfo_children():
             widget.destroy()
@@ -1361,115 +1382,149 @@ class EmulatorManager(ctk.CTk):
         isStage = self._isStageMode()
         isQuest = self._isQuestMode()
         header = ctk.CTkFrame(self.left_frame, fg_color="#303030")
-        header.pack(fill="x", padx=4, pady=(6, 3))
-        header_text = "⚙ จำนวน Thread (headless)"
+        header.pack(fill="x", padx=4, pady=(0, 4))
+        header_text = "⚙ Thread"
         if isGen:
-            header_text = "🎯 จำนวน Thread สร้างไอดี"
+            header_text = "🎯 Thread สร้างไอดี"
         elif isStage:
-            header_text = "🎯 จำนวน Thread ดันด่าน"
+            header_text = "🎯 Thread ดันด่าน"
         elif isQuest:
-            header_text = "🎯 จำนวน Thread ดันด่าน+เควส"
-        ctk.CTkLabel(header, text=header_text, anchor="w").pack(side="left", padx=6)
+            header_text = "🎯 Thread ดันด่าน+เควส"
+        ctk.CTkLabel(header, text=header_text, anchor="w").pack(side="left", padx=(8, 6), pady=4)
+        self._threads_box = ctk.CTkLabel(header, text="–", width=52, height=26, corner_radius=6,
+                                         fg_color="#1f1f1f", font=("Segoe UI", 15, "bold"))
+        self._threads_box.pack(side="left", padx=4, pady=4)
+        self._scale_label = ctk.CTkLabel(header, text="auto", text_color="gray", anchor="w")
+        self._scale_label.pack(side="left", padx=6, fill="x", expand=True)
 
-        ctrl = ctk.CTkFrame(self.left_frame, fg_color="#303030")
-        ctrl.pack(fill="x", padx=4, pady=3)
-        ctk.CTkButton(ctrl, text="−", width=34, fg_color="#444444", hover_color="#555555",
-                      command=lambda: self._change_thread_count(-1)).pack(side="left", padx=(6, 4), pady=4)
-        # ช่องพิมพ์เลขได้ (สูงสุด 1024) พิมพ์แล้ว Enter/คลิกออก = ปรับค่า ปุ่ม +/− ไว้ขยับทีละหน่วย
-        self.thread_count_entry = ctk.CTkEntry(ctrl, width=64, height=28, justify="center",
-                                               font=("Segoe UI", 16, "bold"))
-        self.thread_count_entry.insert(0, str(self.thread_count))
-        self.thread_count_entry.pack(side="left", padx=4)
-        self.thread_count_entry.bind("<Return>", lambda e: self._apply_thread_count_from_entry())
-        self.thread_count_entry.bind("<FocusOut>", lambda e: self._apply_thread_count_from_entry())
-        ctk.CTkButton(ctrl, text="+", width=34, fg_color="#444444", hover_color="#555555",
-                      command=lambda: self._change_thread_count(1)).pack(side="left", padx=4)
-        ctk.CTkLabel(ctrl, text="thread (สูงสุด 1024)", text_color="gray").pack(side="left", padx=4)
-
-        hint = "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันอัตโนมัติ"
-        if isGen:
-            hint = "แต่ละ thread สร้างบัญชีใหม่เอง (mint + signup) ส่งออกลง output/ ไม่กินไฟล์ input"
-        elif isStage:
-            hint = "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วดันด่านผ่าน API (ไม่เปิดเกม)"
-        elif isQuest:
-            hint = ("แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วข้ามการสอน ดันด่าน และทำเควสมือใหม่ผ่าน API\n"
-                    "ดันด่าน 150 ด่าน ~9 นาทีต่อไอดี (ตั้งดีเลย์ระหว่างด่านได้ในแผงตั้งค่าโหมด)")
-        ctk.CTkLabel(self.left_frame, text=hint,
-                     text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=8, pady=(2, 6))
-
-        # สรุปสถานะ worker เป็นแถวเดียว (อัปเดตเบา ไม่วาดทีละ worker แม้มีเป็นพันตัว = ลื่น)
+        # ยอดรวมทั้งรันเป็นแถวเดียว (สำเร็จ/ล้ม/เหลือ/ไอดีต่อนาที)
         self.worker_summary_label = ctk.CTkLabel(self.left_frame, text="", anchor="w",
-                                                 justify="left", wraplength=300,
-                                                 font=("Segoe UI", 14))
-        self.worker_summary_label.pack(fill="x", padx=8, pady=(4, 6))
-        self._update_worker_summary()
+                                                 justify="left", font=("Segoe UI", 13))
+        self.worker_summary_label.pack(fill="x", padx=8, pady=(0, 4))
 
-    def _set_thread_count(self, n):
-        """ตั้งค่า thread_count (clamp 1..1024) อัปเดตช่องพิมพ์ แล้วเซฟลง config"""
-        self.thread_count = max(1, min(int(n), 1024))
-        if hasattr(self, "thread_count_entry") and self.thread_count_entry.winfo_exists():
-            self.thread_count_entry.delete(0, "end")
-            self.thread_count_entry.insert(0, str(self.thread_count))
+        table = ctk.CTkFrame(self.left_frame, fg_color="#262626")
+        table.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._active_tree = self._make_active_tree(table)
+
+        hint = "หยิบไฟล์จาก input/ แบ่งกันเอง - จำนวนเธรดปรับอัตโนมัติให้ได้ไอดี/นาทีสูงสุด"
+        if isGen:
+            hint = "สร้างบัญชีใหม่เอง (mint + signup) ไม่กินไฟล์ input - เพดานคือโควตา mint 2 ครั้ง/นาที/IP"
+        elif isStage:
+            hint = "หยิบไฟล์จาก input/ แล้วดันด่านผ่าน API (ไม่เปิดเกม) - จำนวนเธรดปรับอัตโนมัติ"
+        elif isQuest:
+            hint = ("หยิบไฟล์จาก input/ ข้ามการสอน ดันด่าน และทำเควสมือใหม่ผ่าน API - "
+                    "ดันด่าน 150 ด่าน ~9 นาทีต่อไอดี")
+        ctk.CTkLabel(self.left_frame, text=hint, text_color="gray", anchor="w", justify="left",
+                     font=("Segoe UI", 11), wraplength=460).pack(fill="x", padx=8)
+
+        # สลับโหมดระหว่างรัน = แผงถูกวาดใหม่ทั้งแผง เติมของเดิมกลับจากค่าล่าสุดที่เก็บไว้
+        running = any(p.poll() is None for p in self.worker_procs.values())
+        if running and self._engine_last_stat:
+            self._updateEngineStats(self._engine_last_stat)
+        else:
+            self._update_worker_summary()
+        self._render_active(self._engine_active if running else [])
+
+    def _make_active_tree(self, parent):
+        """ตาราง ttk.Treeview ธีมมืด - ไม่ใช่แถว CTkLabel ทีละบัญชี: เธรดเป็นร้อยคือ widget เป็นพัน
+        และวาดใหม่ทุกวินาที ส่วน Treeview เป็น widget ตัวเดียวที่อัปเดตค่าในแถวได้ถูก ๆ"""
         try:
-            self.config.setdefault("settings", {})
-            self.config["settings"]["threadcount"] = str(self.thread_count)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                self.config.write(f)
-        except Exception as e:
-            print("save threadcount failed:", e)
-
-    def _change_thread_count(self, delta):
-        self._set_thread_count(self.thread_count + delta)
-
-    def _apply_thread_count_from_entry(self):
-        """อ่านเลขจากช่องพิมพ์ ถ้าไม่ใช่ตัวเลขให้คืนค่าเดิม"""
+            scale = ctk.ScalingTracker.get_widget_scaling(parent)
+        except Exception:
+            scale = 1.0
+        style = ttk.Style(self)
         try:
-            raw = self.thread_count_entry.get().strip()
-            n = int(raw) if raw else self.thread_count
-        except (ValueError, Exception):
-            n = self.thread_count
-        self._set_thread_count(n)
-
-    def _worker_serials(self):
-        return [f"worker-{i+1}" for i in range(self.thread_count)]
-
-    def _safe_worker_cap(self, requested):
-        """จำกัดจำนวนโปรเซสจริงตาม RAM ที่ว่าง (แต่ละ worker ~90MB) กัน OOM แม้ตั้งเลขไว้สูง
-
-        ใช้ available physical RAM * 0.6 หาร 90MB ถ้าอ่าน RAM ไม่ได้ถอยไปเพดานปลอดภัย 64
-        คืน (จำนวนที่จะรันจริง, เพดานที่คำนวณได้) เพื่อเตือนผู้ใช้เมื่อถูกจำกัด
-        """
-        PER_MB = 55   # worker headless (subprocess bot_worker.py) ~45MB + เผื่อโตตอนรัน
-        cap = 64
-        try:
-            import ctypes
-
-            class _MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
-                            ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
-                            ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
-                            ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
-                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
-            ms = _MS()
-            ms.dwLength = ctypes.sizeof(ms)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-                cap = max(1, int(ms.ullAvailPhys / 1048576 * 0.6 / PER_MB))
+            style.theme_use("clam")   # ธีม native ของ Windows ไม่ยอมให้เปลี่ยนสีพื้นหลังของ Treeview
         except Exception:
             pass
-        return min(requested, cap), cap
+        style.configure("Active.Treeview", background="#262626", fieldbackground="#262626",
+                        foreground="#DCE4EE", borderwidth=0, rowheight=int(24 * scale),
+                        font=("Segoe UI", 10))
+        style.configure("Active.Treeview.Heading", background="#303030", foreground="#9aa4ad",
+                        relief="flat", borderwidth=0, font=("Segoe UI", 10))
+        style.map("Active.Treeview", background=[("selected", "#1F538D")],
+                  foreground=[("selected", "#FFFFFF")])
+        style.map("Active.Treeview.Heading", background=[("active", "#383838")])
+        style.layout("Active.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+
+        columns = (("id", "ไอดี", 110, False), ("step", "สถานะ", 100, False),
+                   ("age", "เวลา", 64, False), ("detail", "log สด", 200, True))
+        tree = ttk.Treeview(parent, columns=[c[0] for c in columns], show="headings",
+                            style="Active.Treeview", selectmode="browse")
+        for key, title, width, stretch in columns:
+            tree.heading(key, text=title, anchor="w")
+            tree.column(key, width=int(width * scale), minwidth=int(40 * scale),
+                        stretch=stretch, anchor="w")
+        tree.tag_configure("retry", foreground="#E0A030")
+        tree.tag_configure("stopped", foreground="#E06C6C")
+        bar = ctk.CTkScrollbar(parent, command=tree.yview)
+        tree.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y", padx=(0, 2), pady=2)
+        tree.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
+        return tree
+
+    @staticmethod
+    def _alive(widget):
+        try:
+            return widget is not None and bool(widget.winfo_exists())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _format_age(seconds):
+        seconds = int(seconds or 0)
+        if seconds < 60:
+            return "%ds" % seconds
+        if seconds < 3600:
+            return "%dm%02ds" % divmod(seconds, 60)
+        return "%dh%02dm" % (seconds // 3600, seconds % 3600 // 60)
+
+    def _render_active(self, rows):
+        """อัปเดตตารางตามแถว "active" ล่าสุดของ engine: ใส่บัญชีใหม่ต่อท้าย แก้ค่าในแถวเดิม
+        ลบบัญชีที่จบแล้ว - ไม่ล้างทั้งตาราง ไม่งั้นตำแหน่งสกอลล์กับแถวที่เลือกไว้กระโดดทุกวินาที"""
+        tree = self._active_tree
+        if not self._alive(tree):
+            return
+        keep = set()
+        for row in rows:
+            iid = str(row.get("k", ""))
+            keep.add(iid)
+            # กด Stop แล้ว ทุกแถวขึ้น "หยุด" ทันที - แถว active ที่ engine ยังส่งมาระหว่างปิดตัว (~3 วิ)
+            # ยังมีขั้นเดิมอยู่ ถ้าโชว์ตามนั้นจะดูเหมือนบอทยังดันด่าน/ล็อกอินต่อทั้งที่สั่งหยุดแล้ว
+            step = "stopped" if self._engine_stopping else row.get("step", "")
+            status = self.ACTIVE_STEP_LABELS.get(step, step)
+            tries = int(row.get("try") or 0)
+            if tries > 1 and step != "stopped":
+                status = "%s #%d" % (status, tries)
+            values = (row.get("id") or "(ใหม่)", status, self._format_age(row.get("age")),
+                      row.get("detail", ""))
+            if step == "stopped":
+                tags = ("stopped",)
+            elif step == "retry" or tries > 1:
+                tags = ("retry",)
+            else:
+                tags = ()
+            if tree.exists(iid):
+                tree.item(iid, values=values, tags=tags)
+            else:
+                tree.insert("", "end", iid=iid, values=values, tags=tags)
+        for iid in tree.get_children(""):
+            if iid not in keep:
+                tree.delete(iid)
 
     def _update_worker_summary(self):
-        """อัปเดตสรุปสถานะ worker แบบเบา (นับตัวที่ยังรัน) - ถูกกว่าวาดทีละแถว"""
-        if not hasattr(self, "worker_summary_label") or not self.worker_summary_label.winfo_exists():
+        """ข้อความตั้งต้นของแผงก่อนมียอดจาก engine (ยังไม่กด Start หรือเพิ่งกดยังไม่มี stat แรก)"""
+        if not self._alive(self.worker_summary_label):
             return
-        total = len(self.worker_procs)
-        alive = sum(1 for p in self.worker_procs.values() if p.poll() is None)
-        if total:
-            self.worker_summary_label.configure(
-                text=f"▶ กำลังรัน {alive}/{total} thread",
-                text_color=whiteblue if alive else "gray")
+        alive = any(p.poll() is None for p in self.worker_procs.values())
+        if alive:
+            self.worker_summary_label.configure(text="▶ กำลังเริ่ม…", text_color=whiteblue)
         else:
             self.worker_summary_label.configure(text="กด ▶ Start เพื่อเริ่ม", text_color="gray")
+        if self._alive(self._threads_box):
+            self._threads_box.configure(text="–")
+        if self._alive(self._scale_label):
+            self._scale_label.configure(text="auto")
 
     def _worker_env(self):
         """env ให้ worker คุม rate limit ร่วมกันทั้งเครื่อง (ดู tools/ratelimit.py):
@@ -1631,6 +1686,9 @@ class EmulatorManager(ctk.CTk):
             self._appendSessionRow(row)
         elif kind == "lane":
             self._updateLane(row)
+        elif kind == "active":
+            self._engine_active = row.get("rows") or []
+            self._render_active(self._engine_active)
         elif kind == "note":
             self.log(row.get("msg", ""))
 
@@ -1718,16 +1776,47 @@ class EmulatorManager(ctk.CTk):
         from within _drain_engine_rows's once-a-second batch, never per JSONL line -
         see that method's docstring for why redrawing per line is the mistake to avoid."""
         self._engine_last_stat = row
-        if not hasattr(self, "worker_summary_label") or not self.worker_summary_label.winfo_exists():
+        final = bool(row.get("final"))
+        if self._alive(self._threads_box):
+            # แถว final ไม่มี threads (เธรดจบหมดแล้ว) - ห้าม KeyError ตรงนี้
+            self._threads_box.configure(text="–" if final else str(row.get("threads", "–")))
+        if self._alive(self._scale_label):
+            if final:
+                scale = "auto"
+            elif self._engine_stopping:
+                scale = "กำลังหยุด"
+            elif row.get("auto") is False:
+                scale = "คงที่ (config.ini)"
+            else:
+                scale = "auto"
+                state = self.SCALE_LABELS.get(row.get("scale") or "")
+                if state:
+                    scale += " · " + state
+                target, threads = row.get("target"), row.get("threads")
+                if target is not None and threads is not None and target != threads:
+                    scale += " (เป้า %s)" % target
+            self._scale_label.configure(text=scale)
+        if not self._alive(self.worker_summary_label):
             return
-        text = ("engine: done %(done)s / fail %(fail)s / stuck %(stuck)s / left %(left)s "
-                "- %(rate)s acc/s - %(threads)s thread / %(lanes)s lane" % {
-                    "done": row.get("done", 0), "fail": row.get("fail", 0),
-                    "stuck": row.get("stuck", 0), "left": row.get("left", 0),
-                    "rate": row.get("rate", 0), "threads": row.get("threads", "-"),
-                    "lanes": row.get("lanes", "-")})
-        if row.get("final"):
-            text = "engine finished - " + text
+        parts = ["สำเร็จ %s" % format(row.get("done", 0), ","),
+                 "ล้ม %s" % format(row.get("fail", 0), ",")]
+        if row.get("stuck"):
+            parts.append("ค้าง execute %s" % row["stuck"])
+        parts.append("เหลือ %s" % format(row.get("left", 0), ","))
+        if row.get("stopped"):
+            parts.append("หยุดกลางทาง %s (คืน input/)" % row["stopped"])
+        if final:
+            # final ไม่มี rpm (ช่วง 60 วิล่าสุด) - ใช้ค่าเฉลี่ยทั้งรันแทน
+            parts.append("เฉลี่ย %.1f ไอดี/นาที" % (float(row.get("rate") or 0) * 60))
+            head = "⏹ หยุดแล้ว · " if self._engine_stopping else "✔ จบแล้ว · "
+            text = head + " · ".join(parts)
+        elif self._engine_stopping:
+            text = "⏹ กำลังหยุด… · " + " · ".join(parts)
+        else:
+            parts.append("%s ไอดี/นาที" % row.get("rpm", round(float(row.get("rate") or 0) * 60, 1)))
+            if (row.get("lanes") or 1) > 1:
+                parts.append("proxy %s" % row["lanes"])
+            text = " · ".join(parts)
         self.worker_summary_label.configure(text=text, text_color=whiteblue)
 
     def _appendSessionRow(self, row):
@@ -1790,6 +1879,11 @@ class EmulatorManager(ctk.CTk):
                 "Check bot/src/log/engine.err for details." % e)
             return
         self.worker_procs["engine"] = proc
+        # ยอดและตารางของรันก่อนห้ามค้างบนจอของรันใหม่
+        self._engine_last_stat = {}
+        self._engine_active = []
+        self._engine_stopping = False
+        self._render_active([])
         self._engine_reader_thread = threading.Thread(
             target=self._read_engine, args=(proc,), daemon=True, name="engine-reader")
         self._engine_reader_thread.start()
@@ -1797,8 +1891,11 @@ class EmulatorManager(ctk.CTk):
         if getattr(self, "_worker_monitor_job", None) is None:
             self._worker_monitor_job = self.after(1000, self._drain_engine_rows)
 
-    def _drain_worker_procs(self, silent=True, grace_seconds=90):
-        """Ask every still-alive engine process to wind down, then fall back to a hard
+    # กด Stop แล้ว engine วางมือเองภายใน ~3 วิ (bot/engine/pool.py DRAIN_LIMIT) - เลยนี้ถือว่าค้าง บังคับปิด
+    STOP_GRACE_SECONDS = 10
+
+    def _drain_worker_procs(self, silent=True, grace_seconds=None):
+        """Ask every still-alive engine process to stop, then fall back to a hard
         terminate() only if it ignores that for too long (Finding 1 in the round-1
         review). This is the one place stop.flag gets written and the grace-then-force
         sequence gets spawned - both the Stop button (_stop_workers) and every
@@ -1808,18 +1905,20 @@ class EmulatorManager(ctk.CTk):
 
         Non-blocking by design: the wait + fallback terminate() always run on a background
         daemon thread, never on the caller's thread - for the Stop button that is the Tk
-        main thread, and proc.wait(timeout=90) called there would freeze the whole window
-        for up to a minute and a half. _drain_engine_rows - already running on its own
+        main thread, and proc.wait(timeout=...) called there would freeze the whole window
+        for the whole grace period. _drain_engine_rows - already running on its own
         self.after(1000, ...) timer for as long as an engine is alive - notices proc.poll()
         go non-None by itself once the engine actually exits (drained or forced) and does
         the worker_procs/label cleanup; this method never touches self.worker_procs itself.
         """
+        if grace_seconds is None:
+            grace_seconds = self.STOP_GRACE_SECONDS
         procs = [p for p in self.worker_procs.values() if p.poll() is None]
         if not procs:
             return
 
-        # ขอให้ engine หยุดรับงานใหม่แล้วปล่อยให้บัญชีที่ค้างอยู่จบ - terminate() ทันที
-        # ทิ้งทั้งงานครึ่งทางและยอดสุดท้ายของมัน (เคยขาดไป 1,427 ใบในรอบ mint จริง)
+        # ขอให้ engine หยุดเอง (ไอดีที่ค้างวางมือที่ request ถัดไป ไฟล์คืน input/) แทน terminate()
+        # ทันที ซึ่งทิ้งยอดสุดท้ายของมัน (เคยขาดไป 1,427 ใบในรอบ mint จริง) - terminate() เป็นแค่ทางสำรอง
         flag = os.path.join(self._app_root(), "src", "log", "stop.flag")
         flag_written = False
         try:
@@ -1840,15 +1939,15 @@ class EmulatorManager(ctk.CTk):
         # The grace window + fallback terminate() run on a throwaway thread, not here: for
         # the Stop button this method runs directly on the click handler, on the GUI
         # thread, and proc.wait(timeout=...) right here would freeze the whole window for
-        # up to a minute and a half. _drain_engine_rows notices proc.poll() go non-None by
+        # the whole grace period. _drain_engine_rows notices proc.poll() go non-None by
         # itself once the engine actually exits (drained or forced) and does the
         # worker_procs/label cleanup; this thread's only job is the wait and, if it comes
         # to that, the forced terminate().
         def _grace_then_force(proc):
             try:
-                proc.wait(timeout=grace_seconds)   # ให้เวลาระบายงานที่ค้าง
+                proc.wait(timeout=grace_seconds)   # ให้เวลา engine ปิดตัวเองพร้อมยอดสุดท้าย
             except subprocess.TimeoutExpired:
-                proc.terminate()                    # ไม่ยอมจบใน 90 วิถึงค่อยบังคับ
+                proc.terminate()                    # ไม่ยอมจบในเวลาที่ให้ถึงค่อยบังคับ
 
         for proc in procs:
             threading.Thread(target=_grace_then_force, args=(proc,), daemon=True,
@@ -1857,8 +1956,8 @@ class EmulatorManager(ctk.CTk):
         if silent:
             return
         if flag_written:
-            self.log("stop requested - waiting for in-flight accounts to finish (up to %ds)"
-                      % grace_seconds)
+            self.log("stop requested - in-flight accounts go back to input/, the engine exits "
+                      "within a few seconds (forced after %ds)" % grace_seconds)
         else:
             self.log("stop NOT requested gracefully - stop flag failed to write; this run "
                       "will be forced to stop after %ds if it has not exited by itself"
@@ -1889,7 +1988,18 @@ class EmulatorManager(ctk.CTk):
             if not silent:
                 print("No running workers to stop.")
             return
+        self._engine_stopping = True
+        self._show_stopping()
         self._drain_worker_procs(silent=silent)
+
+    def _show_stopping(self):
+        """บอกทันทีที่กด Stop - ไม่ต้องรอ stat รอบถัดไปของ engine"""
+        if self._alive(self.worker_summary_label):
+            self.worker_summary_label.configure(
+                text="⏹ กำลังหยุด… ไอดีที่ค้างอยู่คืนเข้า input/", text_color="#E0A030")
+        if self._alive(self._scale_label):
+            self._scale_label.configure(text="กำลังหยุด")
+        self._render_active(self._engine_active)     # สถานะทุกแถวเป็น "หยุด" ทันที ไม่รอแถว active ถัดไป
 
     def check_for_update(self):
         """Kickoff เช็คเวอร์ชันใน background thread (non-blocking)"""
@@ -2494,8 +2604,8 @@ if __name__ == "__main__":
     # โหมด engine (เฉพาะ frozen exe ที่รันสคริปต์ .py ไม่ได้) - รันคิวจนหมดแล้วออก ไม่เปิด GUI
     # dev รันผ่าน engine_main.py โดยตรง จึงไม่เข้าเงื่อนไขนี้
     if len(sys.argv) > 1 and sys.argv[1] == "--engine":
-        from engine_main import main as engine_main
-        sys.exit(engine_main(["engine"] + sys.argv[2:]))
+        from engine_main import run_and_exit   # os._exit หลังจบ - ดู docstring ของมัน
+        run_and_exit(["engine"] + sys.argv[2:])
 
     # ===== Runtime Protection Checks =====
     if _HAS_PROTECTION:

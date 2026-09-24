@@ -115,8 +115,8 @@ def test_a_permanently_failing_final_move_is_not_counted_or_reported_as_done(tmp
     assert all(r["moved"] is False and r["dest"] == "execute" for r in acct_rows)
 
 
-def test_a_stop_request_lets_running_accounts_finish(tmp_path):
-    """ฆ่าทันทีคือการทิ้งงานที่ทำไปแล้วครึ่งทาง พร้อมยอดสุดท้ายของมัน"""
+def test_a_stop_request_keeps_every_file_accounted_for(tmp_path):
+    """ไอดีที่จบก่อนกด Stop ต้องอยู่ใน output/ ครบตามยอด ไม่มีอะไรค้าง execute/"""
     import threading
     q = build(tmp_path, 200)
     buf = io.StringIO()
@@ -300,3 +300,264 @@ def test_a_flow_returning_an_unrecognized_destination_fails_that_file_but_not_th
                flow=lambda m, s, c: Outcome(dest="nowhere")).run()
     assert len(os.listdir(tmp_path / "login failed")) == 5
     assert os.listdir(tmp_path / "execute") == []
+
+
+# --- จำนวนเธรดอัตโนมัติ (autothreads) + ตารางบัญชีที่กำลังทำ (แถว "active") ---
+
+def test_auto_threads_grow_past_the_starting_count_and_every_file_still_runs_once(tmp_path, monkeypatch):
+    """ทุกบัญชียิง request จำนวนเท่ากัน -> เธรดเพิ่ม req/s เพิ่มตาม autoscaler ต้องเพิ่มเธรดจริง
+    (ไม่ใช่แค่ขยับเลขเป้า) และการสปอว์นกลางรันต้องไม่ทำให้ไฟล์ไหนถูกทำซ้ำหรือตกหล่น"""
+    import threading
+    import time
+
+    import engine.autoscale as autoscale_mod
+    monkeypatch.setattr(autoscale_mod, "WINDOW", 0.05)
+    monkeypatch.setitem(autoscale_mod.START_BY_MODE, "ranger_api_Login", 2)
+    q = build(tmp_path, 300)
+    buf = io.StringIO()
+    lock = threading.Lock()
+    seen, live, peak = [], [0], [0]
+
+    def flow(mode, s, cfg):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+            seen.append(os.path.basename(s.src))
+        for _ in range(4):
+            s.lane.acquire()
+            time.sleep(0.005)
+        with lock:
+            live[0] -= 1
+        return Outcome(dest="output")
+
+    summary = EnginePool("ranger_api_Login", {"autothreads": True, "apirps": 100000}, q, [],
+                         Reporter(buf), flow=flow).run()
+    assert peak[0] > 2
+    assert sorted(seen) == sorted(set(seen)) and len(seen) == 300
+    assert summary["done"] == len(os.listdir(tmp_path / "output")) == 300
+
+
+def test_threads_over_a_lowered_target_retire_between_accounts_without_dropping_work(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    import engine.autoscale as autoscale_mod
+    monkeypatch.setattr(autoscale_mod, "WINDOW", 1000.0)   # เทสต์นี้ขยับเป้าเอง
+    monkeypatch.setitem(autoscale_mod.START_BY_MODE, "ranger_api_Login", 8)
+    q = build(tmp_path, 120)
+    buf = io.StringIO()
+    lock = threading.Lock()
+    live, late_peak, count = [0], [0], [0]
+
+    def flow(mode, s, cfg):
+        with lock:
+            count[0] += 1
+            n = count[0]
+            if n == 1:
+                pool.pool.lanes[0].threads = 2
+            live[0] += 1
+            if n > 60:
+                late_peak[0] = max(late_peak[0], live[0])
+        time.sleep(0.01)
+        with lock:
+            live[0] -= 1
+        return Outcome(dest="output")
+
+    pool = EnginePool("ranger_api_Login", {"autothreads": True, "apirps": 100000}, q, [],
+                      Reporter(buf), flow=flow)
+    summary = pool.run()
+    assert summary["done"] == len(os.listdir(tmp_path / "output")) == 120
+    assert os.listdir(tmp_path / "execute") == []
+    assert late_peak[0] <= 2
+
+
+def test_workers_that_leave_because_input_ran_dry_are_not_replaced(tmp_path):
+    q = build(tmp_path, 5)
+    buf = io.StringIO()
+    pool = EnginePool("ranger_api_Login", {"threadsperproxy": 8}, q, [], Reporter(buf),
+                      flow=lambda m, s, c: Outcome(dest="output"))
+    pool.run()
+    assert pool._seq == 8          # สปอว์นแค่ชุดแรก ไม่วนสปอว์นแทนเธรดที่ claim() ได้ None
+    assert pool.pool.lanes[0].running == 0
+
+
+def test_active_rows_show_each_in_flight_account_and_end_empty(tmp_path, monkeypatch):
+    import time
+
+    import engine.pool as pool_mod
+    monkeypatch.setattr(pool_mod, "ACTIVE_EVERY", 0.01)
+    q = build(tmp_path, 2)
+    buf = io.StringIO()
+
+    def flow(mode, s, cfg):
+        s.mark("stage", "st012/150 Lv9")
+        s.attempts = 2
+        time.sleep(0.3)
+        return Outcome(dest="output")
+
+    EnginePool("ranger_api_Login", {"threadsperproxy": 2}, q, [], Reporter(buf), flow=flow,
+               stat_every=0.01).run()
+    got = rows(buf)
+    active = [r for r in got if r["t"] == "active"]
+    live = [row for r in active for row in r["rows"]]
+    assert {row["id"] for row in live} == {"000", "001"}      # ชื่อไฟล์ไม่มีนามสกุล ก่อนรู้ rsn
+    assert any(row["step"] == "stage" and row["detail"] == "st012/150 Lv9" and row["try"] == 2
+               for row in live)
+    assert active[-1]["rows"] == []
+    stat = [r for r in got if r["t"] == "stat" and not r.get("final")]
+    assert stat and {"rpm", "target", "auto", "scale", "threads"} <= set(stat[-1])
+
+
+def test_auto_threads_start_where_each_mode_is_expected_to_need_them(tmp_path):
+    """GenID ติดโควตา mint ตั้งแต่เธรดแรก -> เริ่ม 2, Login/Level3 อิ่มที่ ~128 ต่อ IP -> เริ่ม 32
+    โหมดอื่น (Stage/Quest) เริ่มที่ค่ากลาง autoscale.START - ทุกโหมดคิดต่อ lane"""
+    import engine.autoscale as autoscale_mod
+
+    q = build(tmp_path, 1)
+    buf = io.StringIO()
+    auto = {"autothreads": True}
+
+    def lanes(mode, proxies=()):
+        pool = EnginePool(mode, auto, q, list(proxies), Reporter(buf),
+                          flow=lambda m, s, c: Outcome(dest="output"))
+        return [lane.threads for lane in pool.pool.lanes]
+
+    assert lanes("ranger_api_GenID") == [2]
+    assert lanes("ranger_api_Login") == [32]
+    assert lanes("ranger_api_Level3") == [32]
+    assert lanes("ranger_api_Stage") == [autoscale_mod.START]
+    assert lanes("ranger_api_Login", ["1.1.1.1:8000", "2.2.2.2:8000"]) == [32, 32]
+
+
+
+# --- ปุ่ม Stop: ทุกอย่างต้องหยุดภายในไม่กี่วินาที ไม่ใช่รอไอดีที่ค้างทำจนจบ ---
+
+def test_stop_cuts_in_flight_accounts_at_their_next_request_and_returns_them_to_input(tmp_path):
+    """Stage/Quest ใช้ ~9 นาทีต่อไอดี - แบบเดิมกด Stop แล้วบอทยังดันด่านต่ออีกนาน ตอนนี้ request ถัดไป
+    ของทุกไอดีโยน EngineStopped ไฟล์กลับ input/ (ทำต่อรอบหน้า) และไม่ถูกนับเป็น done หรือ fail"""
+    import threading
+    import time
+
+    q = build(tmp_path, 20)
+    buf = io.StringIO()
+    busy = threading.Barrier(5)
+
+    def endless_flow(mode, s, cfg):
+        busy.wait(timeout=5)             # ทั้ง 4 เธรดเข้ามาทำไอดีแล้ว ก่อนเทสต์กด Stop
+        while True:                      # ดันด่านไม่รู้จบ - มีแต่ Stop ที่หยุดได้
+            s.lane.acquire()
+            time.sleep(0.01)
+
+    pool = EnginePool("ranger_api_Stage", {"threadsperproxy": 4, "apirps": 100000}, q, [],
+                      Reporter(buf), flow=endless_flow)
+    stopper = threading.Thread(target=lambda: (busy.wait(timeout=5), pool.request_stop()))
+    stopper.start()
+    began = time.time()
+    summary = pool.run()
+    stopper.join()
+
+    assert time.time() - began < 3
+    assert summary["done"] == summary["fail"] == 0
+    assert summary["stopped"] == 4
+    assert os.listdir(tmp_path / "execute") == []
+    assert len(os.listdir(tmp_path / "input")) == 20        # 16 ที่ยังไม่ถูกหยิบ + 4 ที่ถูกตัด
+    assert os.listdir(tmp_path / "login failed") == []      # ถูกสั่งหยุด ไม่ใช่ไอดีเสีย
+    stopped_rows = [r for r in rows(buf) if r["t"] == "acct"]
+    assert len(stopped_rows) == 4 and all(r["status"] == "STOP" and r["dest"] == "input"
+                                          for r in stopped_rows)
+
+
+def test_a_retry_loop_in_the_flow_cannot_swallow_the_stop(tmp_path):
+    """flows ดัก `except Exception` แล้ว retry - EngineStopped ต้องทะลุ ไม่งั้นไอดีจะไป login failed"""
+    import threading
+    import time
+
+    q = build(tmp_path, 1)
+    buf = io.StringIO()
+    inside = threading.Event()
+
+    def flow_with_retry(mode, s, cfg):
+        for _ in range(1000):
+            try:
+                inside.set()
+                s.lane.acquire()
+                time.sleep(0.01)
+            except Exception:
+                continue
+        return Outcome(dest="output")
+
+    pool = EnginePool("ranger_api_Login", {"threadsperproxy": 1, "apirps": 100000}, q, [],
+                      Reporter(buf), flow=flow_with_retry)
+    threading.Thread(target=lambda: (inside.wait(5), pool.request_stop())).start()
+    summary = pool.run()
+    assert summary["stopped"] == 1 and summary["fail"] == 0
+    assert os.listdir(tmp_path / "input") == ["000.xml"]
+
+
+def test_the_engine_process_exits_promptly_even_with_a_thread_asleep_for_minutes(tmp_path):
+    """เธรดที่หลับรอหัวใจเกิดใหม่ (stage_forge รอได้ถึง 10 นาที) ห้ามรั้งโปรเซสไว้ - ต้องออกจริง
+    ทั้ง pool.run() ที่เลิกรอหลัง DRAIN_LIMIT และ os._exit ของ engine_main.run_and_exit"""
+    import subprocess
+    import textwrap
+    import time
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = textwrap.dedent("""
+        import os, sys, threading, time
+        sys.path.insert(0, %(bot)r)
+        sys.path.insert(0, os.path.join(os.path.dirname(%(bot)r), "tools"))
+        from engine.pool import EnginePool
+        from engine.queue import WorkQueue
+        from engine.report import Reporter
+        root = %(root)r
+        for sub in ("input", "execute", "output", "backup", "login failed", "log"):
+            os.makedirs(os.path.join(root, sub), exist_ok=True)
+        for i in range(3):
+            open(os.path.join(root, "input", "%%d.xml" %% i), "w").close()
+        q = WorkQueue(root, os.path.join(root, "log", "run.jsonl"))
+
+        def flow(mode, s, cfg):
+            time.sleep(600)          # รอหัวใจ - ไม่มี request ให้ Stop ตัดได้
+
+        pool = EnginePool("ranger_api_Stage", {"threadsperproxy": 3}, q, [], Reporter(), flow=flow)
+        threading.Timer(0.3, pool.request_stop).start()
+        pool.run()
+        q.close()
+        sys.stdout.flush()
+        os._exit(0)
+    """) % {"bot": here, "root": str(tmp_path)}
+    began = time.time()
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert time.time() - began < 10
+    final = [json.loads(x) for x in done.stdout.splitlines() if '"final"' in x]
+    assert final and final[-1]["stopped"] == 3      # หลับอยู่ทั้งสาม - engine คืนไฟล์แทนเธรดที่ไม่ตื่น
+    assert sorted(os.listdir(tmp_path / "input")) == ["0.xml", "1.xml", "2.xml"]
+    assert os.listdir(tmp_path / "execute") == []
+
+
+
+def test_an_account_waiting_to_retry_wakes_up_on_stop_instead_of_sleeping_it_out(tmp_path):
+    """flows._backoff รอ 5-15 วิระหว่าง retry - ต้องใช้ lane.nap ที่ตื่นทันทีเมื่อกด Stop"""
+    import threading
+    import time
+
+    from engine import flows
+
+    q = build(tmp_path, 1)
+    buf = io.StringIO()
+    waiting = threading.Event()
+
+    def flow(mode, s, cfg):
+        waiting.set()
+        flows._backoff(s, 2, "relogin failed (HTTP 500)")     # 15 วิ
+        return Outcome(dest="output")
+
+    pool = EnginePool("ranger_api_Login", {"threadsperproxy": 1}, q, [], Reporter(buf), flow=flow)
+    threading.Thread(target=lambda: (waiting.wait(5), time.sleep(0.1), pool.request_stop())).start()
+    began = time.time()
+    summary = pool.run()
+    assert time.time() - began < 2
+    assert summary["stopped"] == 1
+    assert os.listdir(tmp_path / "input") == ["000.xml"]

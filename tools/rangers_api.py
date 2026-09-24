@@ -208,6 +208,12 @@ def _send_raw(cookie, url, method, data, app_version, extra_headers=None):
         if lane is not None:
             lane.note_ok()     # ตอบกลับมาได้ = proxy ยังดี ล้างสตรีคความพังทิ้ง
         parsed = _decode(raw, enc)
+        if status in RETRY_STATUSES and lane is not None:
+            # 429/503 ของ nginx = IP นี้โดนตีกลับ ให้ autoscaler ของ engine ถอยเธรด (เฉพาะแบบต่อ IP -
+            # 400/errorCode 429 เป็นช่องว่างต่อบัญชี จำนวนเธรดไม่เกี่ยว) lane ปลอมในเทสต์อาจไม่มีเมธอดนี้
+            note_limited = getattr(lane, "note_limited", None)
+            if note_limited is not None:
+                note_limited()
         limited = status in RETRY_STATUSES or ratelimit.is_app_429(status, parsed) is not None
         if limited and attempt < MAX_ATTEMPTS - 1:
             _retry_sleep(attempt, retry_after)

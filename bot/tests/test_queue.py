@@ -412,3 +412,19 @@ def test_a_finished_subfolder_account_is_closed_in_the_journal(tmp_path):
     q2 = WorkQueue(str(tmp_path), str(tmp_path / "log" / "run.jsonl"))
     assert q2._open_claims() == set(), (
         "a completed account must leave no open claim, whatever folder it came from")
+
+
+
+def test_release_puts_a_stopped_account_back_in_its_input_subfolder_and_closes_the_claim(tmp_path):
+    """กด Stop กลางไอดี: ไฟล์ต้องกลับ input/ ที่เดิมทันที และ journal ต้องไม่นับว่ายังค้าง"""
+    for sub in ("input", "execute", "output", "backup", "login failed", "log"):
+        (tmp_path / sub).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "input" / "batch").mkdir()
+    (tmp_path / "input" / "batch" / "a.xml").write_text("<map/>", encoding="utf-8")
+    q = WorkQueue(str(tmp_path), str(tmp_path / "log" / "run.jsonl"))
+    src = q.claim()
+    q.release(src)
+    assert os.listdir(tmp_path / "input" / "batch") == ["a.xml"]
+    assert not os.path.exists(src)
+    assert q._open_claims() == set()
+    q.close()

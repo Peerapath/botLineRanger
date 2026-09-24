@@ -329,3 +329,24 @@ def test_use_lane_drops_the_connection_only_when_the_lane_actually_changes(monke
 
     ra.use_lane(lane_b)                # different lane: old socket is on the wrong proxy now
     assert dropped == [1]
+
+
+def test_an_nginx_429_is_reported_to_the_lane_for_the_autoscaler(monkeypatch):
+    """429/503 ต่อ IP คือสัญญาณให้ engine ถอยเธรด - ส่วน 400/errorCode 429 เป็นช่องว่างต่อบัญชี
+    จำนวนเธรดไม่เกี่ยว ต้องไม่ถูกนับ"""
+    monkeypatch.setattr(ra, "_retry_sleep", lambda *a, **k: None)
+    marks = []
+
+    class Lane:
+        parts = None
+        def acquire(self): pass
+        def note_ok(self): pass
+        def note_fail(self): return False
+        def note_limited(self): marks.append("limited")
+
+    ra.use_lane(Lane())
+    conn = FakeConn([(429, NGINX, {}), (400, APP429, {}), (200, OK, {})])
+    monkeypatch.setattr(ra, "_get_conn", lambda: conn)
+    status, _ = ra._send_raw("LF_AC=t", "/v12.3/home", "GET", None, "12.3.0")
+    assert status == 200
+    assert marks == ["limited"]

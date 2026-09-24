@@ -69,6 +69,11 @@ def _make_fake_gui():
     gui._engine_err = None
     gui._engine_reader_crashed = None
     gui.worker_summary_label = _FakeLabel()
+    gui._threads_box = _FakeLabel()
+    gui._scale_label = _FakeLabel()
+    gui._active_tree = None           # the ttk.Treeview needs a real Tk root - _render_active skips it
+    gui._engine_active = []
+    gui._engine_stopping = False
     gui._logged = []
     gui.log = lambda msg: gui._logged.append(msg)
     return gui
@@ -200,7 +205,8 @@ def test_dispatch_routes_every_row_kind_report_py_actually_emits():
         "t": "stat", "done": 3, "fail": 1, "stuck": 0, "left": 56, "rate": 0.4,
         "threads": 96, "lanes": 1})
     assert gui._engine_last_stat["done"] == 3
-    assert "done 3" in gui.worker_summary_label.texts[-1]
+    assert "สำเร็จ 3" in gui.worker_summary_label.texts[-1]
+    assert gui._threads_box.texts[-1] == "96"
 
     main.EmulatorManager._dispatch_engine_row(gui, {
         "t": "acct", "status": "OK", "rsn": "deadbeef", "lv": 3, "ms": 9800,
@@ -225,8 +231,8 @@ def test_update_engine_stats_tolerates_the_final_rows_missing_keys():
     final_row = {"done": 2, "fail": 0, "stuck": 0, "left": 0, "seconds": 9.8,
                  "rate": 0.2, "final": True}   # no "threads"/"lanes" - see docstring
     main.EmulatorManager._updateEngineStats(gui, final_row)
-    assert "- thread" in gui.worker_summary_label.texts[-1]
-    assert "finished" in gui.worker_summary_label.texts[-1]
+    assert "จบแล้ว" in gui.worker_summary_label.texts[-1]
+    assert gui._threads_box.texts[-1] == "–"
 
 
 def test_append_session_row_caps_history_at_500():
@@ -362,7 +368,7 @@ def test_drain_engine_rows_second_phase_catches_a_row_that_lands_in_the_exact_ga
         "drained, not lost - this is the mechanism behind the 1,427-account story above")
     assert not scheduled, "reader is dead -> must not reschedule even though a late row arrived"
     assert gui.worker_procs.get("engine") is None
-    assert "done 9" in gui.worker_summary_label.texts[-1], (
+    assert "สำเร็จ 9" in gui.worker_summary_label.texts[-1], (
         "the tally has to survive on the LABEL, not just in _engine_last_stat: "
         "_update_worker_summary counts worker_procs, which is emptied one line earlier, so "
         "calling it here repaints the idle placeholder over the final numbers in the same "
@@ -705,3 +711,100 @@ def test_login_quest_is_offered_to_anyone_licensed_for_stage():
     """The license API does not know ranger_api_Quest yet - without the composite rule the
     mode would never appear in the dropdown for a non-whitelisted user."""
     assert main.COMPOSITE_MODE_REQUIREMENTS["ranger_api_Quest"] == ["ranger_api_Stage"]
+
+
+def test_update_engine_stats_shows_live_accounts_per_minute_and_the_autoscaler_state():
+    gui = _make_fake_gui()
+    main.EmulatorManager._updateEngineStats(gui, {
+        "t": "stat", "done": 1200, "fail": 3, "stuck": 0, "left": 2300, "rate": 2.9,
+        "rpm": 181.4, "threads": 96, "target": 144, "auto": True, "scale": "grow", "lanes": 1})
+    text = gui.worker_summary_label.texts[-1]
+    assert "สำเร็จ 1,200" in text and "เหลือ 2,300" in text and "181.4 ไอดี/นาที" in text
+    assert gui._scale_label.texts[-1] == "auto · กำลังเพิ่ม (เป้า 144)"
+
+
+def test_active_rows_are_kept_for_the_table_even_before_the_table_exists():
+    """สลับโหมดระหว่างรันวาดแผงใหม่ทั้งแผง - _build_thread_panel เติมตารางกลับจาก _engine_active"""
+    gui = _make_fake_gui()
+    rows = [{"k": 1, "id": "a0bfb087", "step": "stage", "detail": "st045/150 Lv12", "try": 1, "age": 75.2}]
+    main.EmulatorManager._dispatch_engine_row(gui, {"t": "active", "rows": rows})
+    assert gui._engine_active == rows
+
+
+def test_format_age_reads_like_a_stopwatch():
+    fmt = main.EmulatorManager._format_age
+    assert [fmt(12.5), fmt(75), fmt(3725)] == ["12s", "1m15s", "1h02m"]
+
+
+
+def test_the_stop_button_says_so_at_once_and_the_final_row_says_stopped_not_finished(tmp_path):
+    gui = _make_fake_gui()
+    gui._app_root = lambda: str(tmp_path)
+    gui.worker_procs["engine"] = _FakeProc(exit_code=None)
+    main.EmulatorManager._stop_workers(gui, silent=True)
+    assert "กำลังหยุด" in gui.worker_summary_label.texts[-1]
+    assert os.path.exists(os.path.join(str(tmp_path), "src", "log", "stop.flag"))
+
+    main.EmulatorManager._updateEngineStats(gui, {"done": 7, "fail": 0, "stuck": 0, "left": 40,
+                                                  "rate": 0.5, "stopped": 4, "final": True})
+    text = gui.worker_summary_label.texts[-1]
+    assert text.startswith("⏹ หยุดแล้ว") and "หยุดกลางทาง 4" in text
+
+
+def test_the_stop_grace_is_seconds_not_minutes():
+    assert main.EmulatorManager.STOP_GRACE_SECONDS <= 15
+
+
+def test_stop_works_whatever_mode_the_dropdown_shows_now(tmp_path):
+    """dropdown ถูกกรองใหม่ได้ระหว่างรัน (verify_subscription) - Stop ต้องไม่เช็คโหมดก่อนหยุด"""
+    gui = _make_fake_gui()
+    gui._app_root = lambda: str(tmp_path)
+    gui._isHeadlessThreadMode = lambda: False
+    gui.worker_procs["engine"] = _FakeProc(exit_code=None)
+    main.EmulatorManager.stop_bot_for_selected(gui)
+    assert os.path.exists(os.path.join(str(tmp_path), "src", "log", "stop.flag"))
+
+
+class _FakeTree:
+    """ส่วนของ ttk.Treeview ที่ _render_active ใช้ - ไม่ต้องมี Tk จริง"""
+
+    def __init__(self):
+        self.rows = {}
+
+    def winfo_exists(self):
+        return True
+
+    def exists(self, iid):
+        return iid in self.rows
+
+    def item(self, iid, values=None, tags=()):
+        self.rows[iid] = (values, tags)
+
+    def insert(self, parent, index, iid=None, values=None, tags=()):
+        self.rows[iid] = (values, tags)
+
+    def get_children(self, parent):
+        return list(self.rows)
+
+    def delete(self, iid):
+        del self.rows[iid]
+
+
+def test_pressing_stop_turns_every_row_status_to_stopped_at_once(tmp_path):
+    gui = _make_fake_gui()
+    gui._app_root = lambda: str(tmp_path)
+    gui._active_tree = _FakeTree()
+    rows = [{"k": 1, "id": "a0bfb087", "step": "stage", "detail": "st045/150 Lv12", "try": 1, "age": 75},
+            {"k": 2, "id": "b1c2d3e4", "step": "retry", "detail": "HTTP 500", "try": 2, "age": 9}]
+    main.EmulatorManager._dispatch_engine_row(gui, {"t": "active", "rows": rows})
+    assert [v[1] for v, _ in gui._active_tree.rows.values()] == ["ดันด่าน", "รอลองใหม่ #2"]
+
+    gui.worker_procs["engine"] = _FakeProc(exit_code=None)
+    main.EmulatorManager._stop_workers(gui, silent=True)
+    assert [(v[1], tags) for v, tags in gui._active_tree.rows.values()] == [
+        ("หยุด", ("stopped",)), ("หยุด", ("stopped",))]
+    assert gui._active_tree.rows["1"][0][3] == "st045/150 Lv12"     # log สดเดิมยังอยู่ให้เห็นว่าค้างที่ไหน
+
+    # แถว active ที่ engine ยังส่งมาระหว่างปิดตัวต้องไม่พลิกกลับเป็นขั้นเดิม
+    main.EmulatorManager._dispatch_engine_row(gui, {"t": "active", "rows": rows[:1]})
+    assert list(gui._active_tree.rows) == ["1"] and gui._active_tree.rows["1"][0][1] == "หยุด"

@@ -130,3 +130,62 @@ def test_each_lane_has_its_own_independent_guest_mint_quota(monkeypatch):
     a.auth_quota.acquire()
     b.auth_quota.acquire()      # independent budget - must not wait for a's single slot
     assert waits == []
+
+
+def test_a_lane_counts_the_threads_waiting_on_its_bucket_and_the_tokens_it_gave_out():
+    """ตัวนับที่ autoscaler อ่าน: เธรดที่ยืนรอถังอยู่ต้องถูกนับระหว่างรอ และหายเมื่อได้โทเคน"""
+    clock = _FakeClock()
+    seen_waiting = []
+    lane = None
+
+    def sleep(seconds):
+        seen_waiting.append(lane.counters()[0])
+        clock.advance(seconds)
+
+    lane = ProxyLane("direct", None, rps=10, threads=8, clock=clock, sleep=sleep)
+    for _ in range(lane.bucket.burst + 1):
+        lane.acquire()
+    assert seen_waiting and all(w == 1 for w in seen_waiting)
+    waiting, sent, limited = lane.counters()
+    assert (waiting, sent, limited) == (0, lane.bucket.burst + 1, 0)
+    lane.note_limited()
+    assert lane.counters()[2] == 1
+
+
+def test_waiting_on_the_guest_mint_quota_counts_as_waiting_too(monkeypatch):
+    """GenID ชนโควตา mint ไม่ใช่ถัง req/s - autoscaler ต้องเห็นว่าเธรดยืนรอ ไม่งั้นมันเพิ่มเธรดไม่หยุด"""
+    monkeypatch.setattr(ratelimit, "AUTH_QUOTA", "1/60")
+    clock = _FakeClock()
+    seen_waiting = []
+    lane = None
+
+    def sleep(seconds):
+        seen_waiting.append(lane.counters()[0])
+        clock.advance(seconds)
+
+    lane = ProxyLane("direct", None, rps=1000, threads=8, clock=clock, sleep=sleep)
+    lane.auth_quota.acquire()
+    lane.auth_quota.acquire()      # ช่องเดียวต่อ 60 วิ -> ต้องรอ
+    assert seen_waiting and seen_waiting[0] == 1
+    assert lane.counters()[0] == 0
+
+
+def test_retire_one_lets_exactly_the_surplus_threads_go():
+    lane = ProxyLane("direct", None, rps=1000, threads=3)
+    for _ in range(5):
+        lane.enter()
+    assert [lane.retire_one() for _ in range(4)] == [True, True, False, False]
+    assert lane.running == 3
+
+
+
+def test_a_stopping_lane_refuses_every_further_request_and_mint():
+    from engine.proxy import EngineStopped
+    lane = ProxyLane("direct", None, rps=1000, threads=8)
+    lane.acquire()
+    lane.stop()
+    with pytest.raises(EngineStopped):
+        lane.acquire()
+    with pytest.raises(EngineStopped):
+        lane.auth_quota.acquire()
+    assert not issubclass(EngineStopped, Exception)   # `except Exception` ใน flows ต้องจับไม่ได้
