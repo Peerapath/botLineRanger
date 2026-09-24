@@ -392,3 +392,23 @@ def test_finish_numbers_a_colliding_export_name_instead_of_overwriting_it(tmp_pa
     assert os.path.isfile(out_b)
     assert sorted(os.listdir(tmp_path / "output")) == [
         "brown_Rb10_Tk2_ID1_Lv3.xml", "brown_Rb10_Tk2_ID1_Lv3_2.xml"]
+
+
+def test_a_finished_subfolder_account_is_closed_in_the_journal(tmp_path):
+    r"""claim() logs the path relative to input/, so a subfolder account's key is
+    "<sub>\x.xml". _close() logged the bare basename, so the two lines never paired up and
+    the account stayed in _open_claims() forever. Every one of the user's accounts lives in
+    a subfolder, so the open set grew and never emptied - defeating the one question the
+    journal exists to answer.
+    """
+    q = build(tmp_path, [])
+    (tmp_path / "input" / "sub").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "input" / "sub" / "a.xml").write_text("<map/>", encoding="utf-8")
+
+    src = q.claim()
+    q.finish(src, "output", "")
+    q.close()
+
+    q2 = WorkQueue(str(tmp_path), str(tmp_path / "log" / "run.jsonl"))
+    assert q2._open_claims() == set(), (
+        "a completed account must leave no open claim, whatever folder it came from")

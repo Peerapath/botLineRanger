@@ -256,6 +256,13 @@ class WorkQueue:
         rel_dir = os.path.relpath(os.path.dirname(src), execute_dir)
         sub_dir = "" if rel_dir in (".", "") else rel_dir
         out_dir = os.path.join(self.root, dest, sub_dir) if sub_dir else os.path.join(self.root, dest)
+        # The journal key has to be the same string claim() wrote, or the two lines never
+        # pair up. claim() logs the path relative to input/, which for a subfolder account
+        # is "<sub>\x.xml" - logging the bare basename here left every one of those claims
+        # open forever in _open_claims(), and every one of the user's accounts lives in a
+        # subfolder. recover() only reads that set for an informational flag today, so
+        # nothing broke, but the journal's one job is answering "what is still in flight".
+        journal_key = os.path.join(sub_dir, name) if sub_dir else name
 
         # I3 (final review): this rename used to run OUTSIDE self._lock while claim()'s own
         # rename (input/ -> execute/, above) runs INSIDE it - two directions of
@@ -305,7 +312,7 @@ class WorkQueue:
                 raise FileNotFoundError(
                     "cannot move %r into %r/: source vanished before the move completed"
                     % (name, dest))
-            self._write(f=name, dest=dest, **extra)
+            self._write(f=journal_key, dest=dest, **extra)
         return out
 
     def finish(self, src: str, dest: str, new_name: str = "") -> str:
