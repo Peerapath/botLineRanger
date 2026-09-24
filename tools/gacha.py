@@ -370,6 +370,15 @@ def _ruby_and_tickets(cookie, uid):
     return {"ruby": ruby.get("total", 0), "ticket": premium, "eventTicket": event}
 
 
+# 1b (Round 2, 2026-09-24): the only two gacha_mode values this function implements.
+# "giveItAll" means unlimited (spend until tickets/ruby run out) on purpose; everything
+# else - including a typo, or bot/src/config.ini's own ggachamode = LimitOfRuby, which
+# nothing here implements - must be bounded by `cycles` instead of falling through to the
+# same unbounded loop as "giveItAll". An unimplemented mode must fail safe (capped spend),
+# not fail open (drain the account) - see the loop below and its warning print.
+_KNOWN_GACHA_MODES = ("giveItAll", "NumberOfCycles")
+
+
 def draw_with_ticket(cookie, uid, group=None, cycles=1, stop_when_found=True,
                      targets=None, cache=None, gacha_mode="NumberOfCycles", use_ruby=False):
     """สุ่มกาชาด้วยตั๋ว คืนรายชื่อ unitCode ที่ได้
@@ -453,11 +462,20 @@ def draw_with_ticket(cookie, uid, group=None, cycles=1, stop_when_found=True,
         print("No open gacha machine - skip gacha")
         return [], status
     print(f"Gacha target {groupId} ({name}) - ticket {ticketPrice}/pull, ruby {rubyPrice}/pull")
+    if gacha_mode not in _KNOWN_GACHA_MODES:
+        # Say so where the user watching the run can see it - the fallback below is
+        # silent otherwise, and a capped spend that looks identical to a deliberate
+        # "NumberOfCycles" setting is exactly the kind of surprise a log line prevents.
+        print(f"Gacha: unrecognised gacha_mode {gacha_mode!r} - treating as bounded "
+             f"(NumberOfCycles, {cycles} pull(s)) instead of unlimited")
 
     granted_codes = []
     cycles_done = 0
     while True:
-        if gacha_mode == "NumberOfCycles" and cycles_done >= cycles:
+        # 1b: bounded unless the caller explicitly opted into "giveItAll" - an
+        # unrecognised gacha_mode must not reach the unbounded branch below just because
+        # it also isn't the literal string "NumberOfCycles".
+        if gacha_mode != "giveItAll" and cycles_done >= cycles:
             break
 
         # status บอกเหตุผลไว้ให้ log สรุป session เพราะ list ว่างบอกไม่ได้ว่าไม่มีตู้

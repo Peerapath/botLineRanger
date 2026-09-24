@@ -177,6 +177,25 @@ def test_giveitall_mode_ignores_cycles_and_goes_until_resources_run_out(monkeypa
     assert len(codes) == 2
 
 
+def test_an_unrecognised_gacha_mode_is_bounded_by_cycles_not_unlimited(monkeypatch):
+    """1b (Round 2): only "giveItAll" may mean unlimited. Before this fix the loop only
+    ever bounded on the literal string "NumberOfCycles" - any OTHER value, including an
+    unrecognised one (a typo, or bot/src/config.ini's own ggachamode = LimitOfRuby, which
+    nothing in this file implements), fell through to the same unbounded loop as
+    "giveItAll" and only stopped when tickets and ruby both ran out. An unimplemented mode
+    must fail safe (spend capped at `cycles`) not fail open (drain the account) - see
+    gacha.py's own _KNOWN_GACHA_MODES note.
+    """
+    gacha = load("gacha")
+    api = FakeGachaApi(ruby=0, tickets=50, ticket_price=1, granted_codes=["u1-x"] * 50)
+    monkeypatch.setattr(gacha, "call", api)
+    codes, status = gacha.draw_with_ticket(
+        "c", "u", cycles=3, gacha_mode="LimitOfRuby", cache={},
+    )
+    assert api.count("/v12.3/gacha/group/confirm") == 3
+    assert len(codes) == 3
+
+
 def test_no_open_machine_returns_empty_list_with_no_machine_status_and_does_not_roll(monkeypatch):
     gacha = load("gacha")
     api = FakeGachaApi(machine_open=False)

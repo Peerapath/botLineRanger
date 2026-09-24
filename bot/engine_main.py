@@ -33,37 +33,52 @@ INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthread
 # it reads with int(cfg.get(...)) is in INTS (gachamode is a string enum - "giveItAll" /
 # "NumberOfCycles" / "LimitOfRuby" - and needs neither).
 
-# I1 (final review): the engine read stopwhenfound/gachacycles/gachamode/useruby - names
-# neither the GUI nor the user's real config ever writes. The GUI still keeps two
-# independent copies of every gacha setting - Login-family ("r") vs GenID ("g") - because a
-# user commonly wants Login conservative (NumberOfCycles) while GenID drains ruby on every
-# freshly minted account (LimitOfRuby): bot/src/config.ini has only
-# rstopwhenfound/gstopwhenfound, rgachamode/ggachamode, rgachacycles/ggachacycles,
-# ruseruby/guse200ruby ("useruby"'s g-side key is spelled guse200ruby, not guseruby - kept
-# exactly as the user's file has it: global constraint 4 forbids renaming a key that
-# already exists there). The old reader picked the pair by which startBot*_API_headless
-# function was running (af264b0:bot/botLineRanger.py:353-356,368-371); this does the same
-# by mode. Login and Level3 both read the "r" globals in the original
-# (startBotLevel3_API_headless, af264b0:bot/botLineRanger.py:8366, reads RGACHACYCLES, not
-# a level3-specific pair); Stage reads neither - it never gachas at all (flows.run_stage).
-_MODE_KEY_ALIASES = {
-    "stopwhenfound": {"r": "rstopwhenfound", "g": "gstopwhenfound"},
-    "gachamode": {"r": "rgachamode", "g": "ggachamode"},
-    "gachacycles": {"r": "rgachacycles", "g": "ggachacycles"},
-    "useruby": {"r": "ruseruby", "g": "guse200ruby"},
+# Round 2 change 1 (2026-09-24), CORRECTING I1 above: I1's fix branched on mode - GenID
+# resolved the g-prefixed keys, everything else resolved r - on the theory that the old
+# bot split gacha behaviour by mode too. That theory is what is being corrected here, so
+# it was re-verified against af264b0:bot/botLineRanger.py rather than trusted a second
+# time: ALL FIVE call sites of apiGachaWithTicket (lines 6995, 7118, 8052, 8366, and 8527
+# - the last one inside startBotGenID_API_headless, GenID's own original) pass only
+# gacharangergroup=GACHARANGERGROUP and gacha_cycles=RGACHACYCLES, taking
+# apiGachaWithTicket's own defaults (stop_when_found=True, gacha_mode="NumberOfCycles",
+# use_ruby=False - its signature at :6777-6778) for everything else.
+# GSTOPWHENFOUND/GUSE200RUBY/GGACHAMODE/GGACHACYCLES are read NOWHERE in that file:
+# defined at 127-130, loaded from config.ini at 368-371, never referenced by any call
+# site. Routing GenID to the g-prefixed keys was therefore an unannounced behaviour
+# change, and it mattered: this repo's own bot/src/config.ini has ggachamode =
+# LimitOfRuby (a mode tools/gacha.py does not implement - see draw_with_ticket's own
+# _KNOWN_GACHA_MODES fallback) and guse200ruby = True, so GenID would have drawn until
+# tickets AND ruby were both gone, with rgachacycles's conservative "1" silently unused.
+#
+# Nothing regresses by no longer reading the g-prefixed keys: the GUI's GenID gacha tab
+# has never driven them either, in the old bot or this one. bot/main.py's
+# create_playmode_frame builds self.rgacha_cycles - bound to "rgachacycles", the SAME
+# attribute and the SAME config key - under BOTH the Login/Level3 branch (:777-787) and
+# the GenID branch (:833-843); self.ggacha_cycles / self.guse_200ruby / self.ggacha_mode_var
+# / self.gstop_when_found are referenced by save_config's writes (:601-680) but no
+# create_playmode_frame branch ever instantiates them, so every one of those writes
+# silently AttributeErrors and is swallowed (bare `except Exception: pass`). The
+# g-prefixed keys in config.ini can only ever have been set by hand-editing the file.
+_GACHA_KEY_ALIASES = {
+    "stopwhenfound": "rstopwhenfound",
+    "gachamode": "rgachamode",
+    "gachacycles": "rgachacycles",
+    "useruby": "ruseruby",
 }
-_GENID_MODES = ("ranger_api_GenID",)
 
 
 def _resolve_mode_aliases(cfg, mode):
-    """Copy the mode-appropriate r/g-prefixed raw string into cfg's generic key name, so the
-    BOOLS/INTS loop right after this call coerces it exactly like every other setting -
-    one coercion path, not two. A config missing the per-mode split (default_config/
+    """Copy the r-prefixed raw string into cfg's generic key name, so the BOOLS/INTS loop
+    right after this call coerces it exactly like every other setting - one coercion
+    path, not a mode-dependent one. A config missing the per-mode split (default_config/
     config.ini's own shape: only the generic key, no prefix) is untouched here, so its
-    generic value survives as the fallback I1 asks for."""
-    prefix = "g" if mode in _GENID_MODES else "r"
-    for generic, per_mode in _MODE_KEY_ALIASES.items():
-        specific = per_mode[prefix]
+    generic value survives as the fallback I1 asked for and Round 2 change 1 keeps.
+
+    `mode` is accepted, not read: load_config()'s callers (main() below and this file's
+    own tests) already pass it, and every mode now resolves the same keys, so there is
+    nothing left for it to select.
+    """
+    for generic, specific in _GACHA_KEY_ALIASES.items():
         if specific in cfg:
             cfg[generic] = cfg[specific]
 
@@ -79,9 +94,9 @@ def load_config(path, rangers_path=None, mode=None):
     parser = configparser.ConfigParser(strict=False)
     parser.read(path, encoding="utf-8")
     cfg = dict(parser["settings"]) if parser.has_section("settings") else {}
-    # I1: resolve the r/g-prefixed pair for this mode into the generic key BEFORE the
-    # BOOLS/INTS loop below, so the resolved value is coerced through the exact same path
-    # as every other setting instead of a second, parallel one.
+    # I1/Round 2 change 1: resolve the r-prefixed gacha keys into their generic names
+    # BEFORE the BOOLS/INTS loop below, so the resolved value is coerced through the exact
+    # same path as every other setting instead of a second, parallel one.
     _resolve_mode_aliases(cfg, mode)
     for key in BOOLS:
         if key in cfg:

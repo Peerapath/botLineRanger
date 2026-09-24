@@ -76,13 +76,19 @@ def test_useruby_is_coerced_to_a_real_bool_not_left_as_the_string_false(tmp_path
     assert bool(cfg["useruby"]) is False
 
 
-def test_login_mode_reads_the_r_prefixed_gacha_settings(tmp_path):
-    """I1 (final review): the engine read stopwhenfound/gachacycles/gachamode/useruby -
-    names neither the GUI nor the user's real config ever writes. bot/src/config.ini has
-    only the per-mode split: rstopwhenfound/gstopwhenfound, rgachacycles/ggachacycles,
-    rgachamode/ggachamode, ruseruby/guse200ruby (r = Login-family, g = GenID - af264b0:
-    bot/botLineRanger.py:353-356,368-371 is the old reader that did this split). Every
-    gacha setting in the GUI was disconnected from the engine.
+def test_every_mode_reads_the_r_prefixed_gacha_settings_not_g(tmp_path):
+    """Round 2 change 1: I1's fix (below) branched on mode - GenID resolved the
+    g-prefixed keys, Login/Level3 resolved r - on the theory that the old bot split gacha
+    behaviour by mode too. That theory was wrong and is corrected here: verified against
+    af264b0:bot/botLineRanger.py that ALL FIVE call sites of apiGachaWithTicket (lines
+    6995, 7118, 8052, 8366, and 8527 - the last one inside startBotGenID_API_headless,
+    GenID's own original) pass only gacharangergroup and gacha_cycles=RGACHACYCLES, and
+    take apiGachaWithTicket's own defaults (stop_when_found=True,
+    gacha_mode="NumberOfCycles", use_ruby=False - its signature at :6777-6778) for
+    everything else. GSTOPWHENFOUND/GUSE200RUBY/GGACHAMODE/GGACHACYCLES are read NOWHERE
+    in that file: defined at 127-130, loaded from config.ini at 368-371, never referenced
+    by any call site. So every mode - GenID included - must resolve the SAME "r" keys,
+    same as the old bot.
     """
     settings = _write(tmp_path / "config.ini", "\n".join([
         "[settings]",
@@ -96,14 +102,10 @@ def test_login_mode_reads_the_r_prefixed_gacha_settings(tmp_path):
     level3_cfg = engine_main.load_config(settings, mode="ranger_api_Level3")
     genid_cfg = engine_main.load_config(settings, mode="ranger_api_GenID")
 
-    assert (login_cfg["stopwhenfound"], login_cfg["gachamode"], login_cfg["gachacycles"],
-            login_cfg["useruby"]) == (False, "NumberOfCycles", 1, False)
-    # Level3 shares Login's "r" globals in the original (startBotLevel3_API_headless -
-    # af264b0:bot/botLineRanger.py:8366 reads RGACHACYCLES, not a level3-specific pair).
-    assert (level3_cfg["stopwhenfound"], level3_cfg["gachamode"], level3_cfg["gachacycles"],
-            level3_cfg["useruby"]) == (False, "NumberOfCycles", 1, False)
-    assert (genid_cfg["stopwhenfound"], genid_cfg["gachamode"], genid_cfg["gachacycles"],
-            genid_cfg["useruby"]) == (True, "LimitOfRuby", 200, True)
+    r_values = (False, "NumberOfCycles", 1, False)
+    for label, cfg in (("login", login_cfg), ("level3", level3_cfg), ("genid", genid_cfg)):
+        got = (cfg["stopwhenfound"], cfg["gachamode"], cfg["gachacycles"], cfg["useruby"])
+        assert got == r_values, "%s must read the r-prefixed values, got %r" % (label, got)
 
 
 def test_a_config_without_the_per_mode_split_still_works(tmp_path):
