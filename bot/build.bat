@@ -205,12 +205,29 @@ REM ลบ zip เก่า (ถ้ามี)
 if exist "dist\BotLineRanger.zip" del /Q "dist\BotLineRanger.zip"
 if exist "dist\BotLineRanger_%VERSION%.zip" del /Q "dist\BotLineRanger_%VERSION%.zip"
 
-REM สร้าง zip ใหม่
+REM สร้าง zip ใหม่ - bsdtar (System32\tar.exe, มากับ Windows 10 ขึ้นไป) ไม่ใช่ Compress-Archive
+REM
+REM สองเหตุผล วัดมาแล้วบนเครื่องนี้กับ dist ชุดจริง (2,472 ไฟล์ 84 MB):
+REM   bsdtar            1.97 วินาที  ได้ zip 44 MB
+REM   Compress-Archive  รันไม่จบ - powershell.exe แค่เปิดขึ้นมาแล้วออกก็ใช้เวลาเกิน 2 นาที
+REM                     ในวันที่เครื่องมีโปรเซส powershell ค้างอยู่ 19 ตัว
+REM Compress-Archive จ่ายต้นทุนต่อ "ไฟล์" สูง ไม่ใช่ต่อไบต์ และ onedir ทำให้ไฟล์เพิ่มจาก
+REM exe ก้อนเดียวเป็น 2,367 ไฟล์ใน _internal\ ส่วน bsdtar เป็น native ไม่ต้องบูต .NET เลย
+REM
+REM -a เลือกรูปแบบจากนามสกุล .zip (libarchive) ผลลัพธ์เป็น zip จริง ขึ้นต้นด้วย PK
+REM ต้องใช้ path เต็มของ System32 เพราะ Git for Windows ก็มี tar.exe ของตัวเอง (GNU tar)
+REM ซึ่งสร้าง zip ไม่ได้ - มันจะเขียน tar ที่ตั้งชื่อว่า .zip ออกมาแทนโดยไม่เตือน
 echo    - Creating BotLineRanger.zip
-powershell -Command "Compress-Archive -Path 'dist\BotLineRanger\*' -DestinationPath 'dist\BotLineRanger.zip' -Force"
+"%SystemRoot%\System32\tar.exe" -a -c -f "dist\BotLineRanger.zip" -C "dist\BotLineRanger" .
+if %errorlevel% neq 0 (
+    echo ERROR: zip creation failed!
+    pause
+    exit /b 1
+)
 
+REM ไฟล์ที่สองมีเนื้อหาเหมือนตัวแรกทุกไบต์ - copy เอา ไม่ต้องบีบซ้ำ
 echo    - Creating BotLineRanger_%VERSION%.zip
-powershell -Command "Compress-Archive -Path 'dist\BotLineRanger\*' -DestinationPath 'dist\BotLineRanger_%VERSION%.zip' -Force"
+copy /Y "dist\BotLineRanger.zip" "dist\BotLineRanger_%VERSION%.zip" >nul
 
 REM คัดลอกไฟล์ zip ไปยังโฟลเดอร์ Version
 echo    - Copying BotLineRanger_%VERSION%.zip to Version folder
