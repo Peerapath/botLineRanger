@@ -196,7 +196,10 @@ def _send_raw(cookie, url, method, data, app_version, extra_headers=None):
             enc = resp.getheader("Content-Encoding")
             retry_after = resp.getheader("Retry-After")
         except (http.client.HTTPException, OSError):
-            if lane is not None:
+            # ครั้งแรกที่พังคือ keep-alive socket ที่เซิร์ฟเวอร์ปิดทิ้งไปแล้ว - เรื่องปกติ ต่อใหม่ทันทีข้างล่าง
+            # ไม่นับเป็นสัญญาณว่า proxy ตาย: เธรดเป็นร้อยที่ socket ค้างพร้อมกันเคยทำให้ lane "direct"
+            # ถูกตัดสินว่าตายแล้ว engine หยุดทั้งรัน (2026-09-25) นับเฉพาะเมื่อต่อใหม่แล้วยังพัง
+            if lane is not None and attempt >= 1:
                 lane.note_fail()
             _drop_conn()
             if attempt == MAX_ATTEMPTS - 1:

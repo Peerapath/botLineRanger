@@ -170,3 +170,25 @@ def test_claim_giftbox_still_reports_success_when_only_the_bulk_call_failed(monk
     pending = [{"giftSn": 0}, {"giftSn": 1}]
     assert rewards.claim_giftbox("c", pending) is True
     assert api.claimed_individually == [0, 1]
+
+
+def test_inside_the_engine_survey_stays_on_the_callers_thread_and_lane():
+    """lane เป็น thread-local: ถ้า survey แตก thread pool ใน engine เธรดลูกไม่มี lane แล้ว rangers_api
+    ถอยไปใช้ถังแบบไฟล์ล็อกกับ proxy จาก env - ที่ ~160 เธรดทำให้ไฟล์ถังค้าง 10 วิและ lane ตายทั้งรัน
+    (2026-09-25) ใน engine จึงต้องถามทีละแหล่งบนเธรดเดิมที่ผูก lane ไว้"""
+    import threading
+    rewards = load("rewards")
+    import rangers_api
+    lane = object()
+    seen = []
+
+    def collector(cookie):
+        seen.append((threading.get_ident(), rangers_api.current_lane()))
+        return []
+
+    rangers_api.use_lane(lane)
+    try:
+        rewards.survey("c", sources=[("a", collector), ("b", collector), ("c", collector)])
+    finally:
+        rangers_api.use_lane(None)
+    assert seen == [(threading.get_ident(), lane)] * 3

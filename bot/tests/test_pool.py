@@ -169,25 +169,37 @@ def test_a_worker_on_a_dead_lane_stops_taking_work(tmp_path):
     assert len(os.listdir(tmp_path / "output")) == 40      # lane ที่เหลือทำครบ
 
 
-def test_the_engine_stops_when_every_proxy_is_down(tmp_path):
-    """ไม่มี proxy เหลือแล้ววิ่งต่อ = ยิงออก IP ของผู้ใช้เอง ซึ่งคือสิ่งที่เขาตั้ง proxy ไว้เลี่ยง"""
+def test_the_engine_waits_out_an_every_proxy_down_spell_instead_of_quitting(tmp_path, monkeypatch):
+    """ไม่มี proxy เหลือ -> ห้ามยิงออก IP ของผู้ใช้เอง แต่ก็ห้ามหยุดทั้งรัน (ผู้ใช้ต้องการให้รันต่อเนื่อง):
+    รอ ALL_DOWN_RETRY แล้วลอง proxy ทุกตัวใหม่ งานทั้งหมดต้องเสร็จหลัง proxy กลับมา"""
     import engine.pool as pool_mod
-    q = build(tmp_path, 500)
+    monkeypatch.setattr(pool_mod, "ALL_DOWN_RETRY", 0.2)
+    q = build(tmp_path, 50)
     buf = io.StringIO()
     pool = EnginePool("ranger_api_Login", {"threadsperproxy": 2, "apirps": 1000},
                       q, ["1.1.1.1:8000"], Reporter(buf),
                       flow=lambda m, s, c: Outcome(dest="output"))
-    monkey = pool_mod.STAT_EVERY
-    pool_mod.STAT_EVERY = 0.05
-    try:
-        for lane in pool.pool.lanes:
-            for _ in range(3):
-                lane.note_fail()
-        pool.run()
-    finally:
-        pool_mod.STAT_EVERY = monkey
-    assert any(r["t"] == "note" and "every proxy is down" in r["msg"] for r in rows(buf))
-    assert q.remaining() > 0        # คิวยังเหลือ ไม่ได้ถูกกินทิ้ง
+    for lane in pool.pool.lanes:
+        for _ in range(3):
+            lane.note_fail()
+    assert not pool.pool.lanes[0].alive
+    summary = pool.run()
+    got = rows(buf)
+    assert any(r["t"] == "note" and "every proxy is down" in r["msg"] for r in got)
+    assert any(r["t"] == "lane" and r["state"] == "retry" for r in got)
+    assert summary["done"] == len(os.listdir(tmp_path / "output")) == 50
+
+
+def test_the_direct_lane_never_dies_so_a_network_blip_cannot_end_the_run(tmp_path):
+    """ไม่ได้ตั้ง proxy = lane "direct" ตัวเดียว เดิมพังสามครั้งติดกันแล้ว engine หยุดทั้งรัน (2026-09-25)"""
+    q = build(tmp_path, 20)
+    buf = io.StringIO()
+    pool = EnginePool("ranger_api_Login", {"threadsperproxy": 2}, q, [], Reporter(buf),
+                      flow=lambda m, s, c: Outcome(dest="output"))
+    for _ in range(50):
+        pool.pool.lanes[0].note_fail()
+    assert pool.pool.lanes[0].alive
+    assert pool.run()["done"] == 20
 
 
 # --- extra coverage added for this task, beyond the brief's own Step 1 block above ---

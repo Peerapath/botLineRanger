@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))), "tools"))
@@ -16,6 +17,10 @@ import ratelimit  # noqa: E402
 # connect ไม่ติดกี่ครั้งติดกันถึงถือว่า proxy ตาย หนึ่งครั้งคือสายหลุดธรรมดา ซึ่งเกิดได้
 # ตลอดเวลาบนเน็ตที่ปกติดี ถอด lane เพราะเรื่องนั้นคือการตัดกำลังตัวเองฟรี ๆ
 LANE_DEATH = 3
+# และต้องไม่มีคำตอบสำเร็จเลยนานเท่านี้ด้วย: เธรดเป็นร้อยบน lane เดียวพังพร้อมกันสามตัวได้ในเสี้ยววิ
+# จากเน็ตสะดุดครั้งเดียว (วัดจริง 2026-09-25: lane "direct" ตายกลางรันจากเหตุนี้) - proxy ที่ตายจริง
+# ไม่มีคำตอบสำเร็จเลยสักครั้ง จึงยังถูกถอดได้ แค่ช้าลงไม่กี่วินาที
+LANE_DEATH_SECONDS = 20.0
 
 
 class EngineStopped(BaseException):
@@ -52,9 +57,14 @@ class _GaugedQuota:
 
 class ProxyLane:
     def __init__(self, name: str, parts, rps: float, threads: int,
-                 clock=None, sleep=None) -> None:
+                 clock=None, sleep=None, direct: bool = False) -> None:
         self.name = name
         self.parts = parts
+        # lane "direct" (ไม่ได้ตั้ง proxy) ไม่มีวันตาย: ไม่มี IP อื่นให้ย้ายไป การถอดมันออกเท่ากับ
+        # หยุดทั้งรันเพราะเน็ตของผู้ใช้สะดุดครั้งเดียว ให้ retry/backoff ใน rangers_api จัดการแทน
+        self.direct = direct
+        self._clock = clock if clock is not None else time.monotonic
+        self._last_ok = None      # เวลาคำตอบสำเร็จล่าสุด - None = ยังไม่เคยต่อติดเลย
         self.rps = float(rps)
         # เป้าจำนวนเธรดของ lane นี้ - โหมดตั้งเองคงที่ โหมด auto ให้ engine.autoscale ขยับ
         self.threads = threads
@@ -81,7 +91,7 @@ class ProxyLane:
         self.auth_quota = _GaugedQuota(ratelimit.InMemoryQuota(limit, window, **kw), self)
         self._fails = 0
         # ตัวนับให้ autoscaler: เธรดที่ยืนรอถัง/โควตาอยู่ตอนนี้, request ที่ได้โทเคนแล้ว (สะสม),
-        # คำตอบ 429/503 ที่เซิร์ฟเวอร์ตีกลับ (สะสม)
+        # การถูกตีกลับสะสม = 429/503 จากเซิร์ฟเวอร์ + ต่อไม่ติด/หลุดซ้ำ (note_fail)
         self._waiting = 0
         self._sent = 0
         self._limited = 0
@@ -128,7 +138,7 @@ class ProxyLane:
             self._limited += 1
 
     def counters(self) -> tuple[int, int, int]:
-        """(เธรดที่รอถัง/โควตาอยู่ตอนนี้, request สะสม, 429/503 สะสม)"""
+        """(เธรดที่รอถัง/โควตาอยู่ตอนนี้, request สะสม, ถูกตีกลับสะสม: 429/503 + ต่อไม่ติด)"""
         with self._lock:
             return self._waiting, self._sent, self._limited
 
@@ -154,15 +164,23 @@ class ProxyLane:
     def note_ok(self) -> None:
         with self._lock:
             self._fails = 0
+            self._last_ok = self._clock()
 
     def note_fail(self) -> bool:
-        """คืน True เฉพาะครั้งที่ทำให้ lane ตาย ผู้เรียกจะได้รายงานครั้งเดียว ไม่ใช่ทุกครั้ง"""
+        """คืน True เฉพาะครั้งที่ทำให้ lane ตาย ผู้เรียกจะได้รายงานครั้งเดียว ไม่ใช่ทุกครั้ง
+
+        ต่อไม่ติดซ้ำ ๆ ยังเป็นสัญญาณให้ autoscaler ถอยเธรดด้วย (นับรวมกับ 429/503) - เธรดมากไป
+        จนเซิร์ฟเวอร์/เน็ตรับไม่ไหวแสดงออกมาเป็น timeout และสายหลุด ไม่ใช่ 429 เสมอไป
+        """
         with self._lock:
             self._fails += 1
-            if self._fails >= LANE_DEATH and self.alive:
-                self.alive = False
-                return True
-            return False
+            self._limited += 1
+            if self.direct or not self.alive or self._fails < LANE_DEATH:
+                return False
+            if self._last_ok is not None and self._clock() - self._last_ok < LANE_DEATH_SECONDS:
+                return False
+            self.alive = False
+            return True
 
     def revive(self) -> None:
         with self._lock:
@@ -176,7 +194,7 @@ class ProxyPool:
         entries = [p.strip() for p in (proxies or []) if p and p.strip()]
         self.lanes: list[ProxyLane] = []
         if not entries:
-            self.lanes.append(ProxyLane("direct", None, rps, threads_per, clock, sleep))
+            self.lanes.append(ProxyLane("direct", None, rps, threads_per, clock, sleep, direct=True))
         else:
             for entry in entries:
                 # proxy_parts โยน ValueError เมื่อรูปแบบผิด ปล่อยให้ขึ้นไปถึงผู้เรียก:

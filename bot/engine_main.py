@@ -252,7 +252,13 @@ def main(argv):
     # flows.py was imported.
     cfg["_execute_dir"] = os.path.join(root, "execute")     # GenID เขียนไฟล์ใหม่ลงที่เดียวกับ WorkQueue
 
-    reporter = Reporter()
+    # stdout ของโปรเซสนี้เป็นของ Reporter คนเดียว: tools/ หลายตัวยัง print() ความคืบหน้าแบบ CLI
+    # (rewards.claim_all พิมพ์ทุกแหล่งรางวัลทุกไอดี) และ print() เขียนข้อความกับ "\n" แยกกันสองครั้ง
+    # แถว JSONL จากอีกเธรดที่แทรกตรงกลางจะ parse ไม่ออก แล้วไอดีนั้นหายจากยอดของ GUI เงียบ ๆ
+    report_stream = sys.stdout
+    if report_stream is not None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    reporter = Reporter(report_stream)
     setup_client_version(root, reporter)
 
     queue = WorkQueue(root, os.path.join(root, "src", "log", "run.jsonl"))
@@ -301,9 +307,12 @@ def run_and_exit(argv) -> None:
     ถูกเขียนและปิดไปแล้วใน main() เหลือแค่ flush stdout/stderr ให้ GUI ได้บรรทัดสุดท้ายครบ
     """
     code = main(argv)
-    for stream in (sys.stdout, sys.stderr):
+    # main() ย้าย sys.stdout ไป devnull แล้ว - ตัวจริงคือ __stdout__ (Reporter flush ทุกบรรทัดอยู่แล้ว
+    # ตรงนี้กันเหนียว และ exe แบบไม่มีคอนโซลอาจให้ __stdout__ เป็น None)
+    for stream in (sys.__stdout__, sys.stdout, sys.stderr):
         try:
-            stream.flush()
+            if stream is not None:
+                stream.flush()
         except Exception:
             pass
     os._exit(code or 0)

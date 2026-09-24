@@ -41,6 +41,7 @@ POLL_EVERY = 0.05      # seconds between supervisor wake-ups (thread/lane health
 # เดิม 60 วิและปล่อยให้ไอดีที่ค้างทำจนจบ - Stage/Quest ใช้ ~9 นาทีต่อไอดี กด Stop แล้วบอทยังวิ่งต่ออีกนาน
 DRAIN_LIMIT = 3.0
 LANE_RETRY = 300.0     # วินาที - proxy ที่ล่มชั่วคราวได้กลับมาเอง ไม่ต้องรีสตาร์ททั้ง engine
+ALL_DOWN_RETRY = 30.0  # วินาที - proxy ล่มหมดทุกตัว: ลองใหม่เร็วกว่านี้ ไม่ใช่หยุดทั้งรัน
 ACTIVE_EVERY = 1.0     # วินาที - ตารางบัญชีที่กำลังทำใน GUI อัปเดตถี่เท่านี้
 ACTIVE_MAX = 500       # แถวต่อหนึ่งรายงาน - กันบรรทัด JSONL ยาวเกินเหตุตอนเธรดเยอะมาก
 RPM_WINDOW = 60.0      # วินาที - "บัญชี/นาที" ใน stat คิดจากช่วงล่าสุดเท่านี้ ไม่ใช่เฉลี่ยทั้งรัน
@@ -368,6 +369,7 @@ class EnginePool:
         last_stat = 0.0
         last_active = 0.0
         last_retry = time.time()
+        down_since = None          # เวลาที่ proxy ล่มครบทุกตัว (None = ยังมี lane ที่ใช้ได้)
         done_hist = collections.deque([(started, 0)])
 
         # A do-while, deliberately not "while any(t.is_alive() for t in threads):" - every
@@ -384,24 +386,30 @@ class EnginePool:
                                        reason="connect failed 3x in a row")
 
             alive = self.pool.alive_lanes()
-            if not alive:
-                # วิ่งต่อโดยไม่มี proxy เลย = ทุก request ออก IP ของเครื่องผู้ใช้เอง
-                # ซึ่งเป็นสิ่งที่ผู้ใช้ตั้ง proxy ไว้เพื่อหลีกเลี่ยงพอดี หยุดดีกว่า
-                self.reporter.note("every proxy is down - stopping")
-                self.request_stop()
-                break
+            if not alive and down_since is None:
+                # ห้ามถอยไปยิงออก IP ของเครื่องผู้ใช้เอง (สิ่งที่ตั้ง proxy ไว้เลี่ยง) แต่ก็ไม่หยุดทั้งรัน
+                # อีกแล้ว - เดิมหยุดตรงนี้ แล้วไอดีที่ค้างถูกตัดหมด ผู้ใช้ต้องการให้รันต่อเนื่อง proxy
+                # ที่ล่มชั่วคราวกลับมาได้ รอ ALL_DOWN_RETRY แล้วลองทุกตัวใหม่ (lane "direct" ไม่มีวันตาย)
+                down_since = time.time()
+                self.reporter.note("every proxy is down - retrying in %ds" % ALL_DOWN_RETRY)
+            elif alive:
+                down_since = None
 
             # เธรดที่ retire/จบไปแล้วทิ้งออกจาก list - autoscaler สปอว์นใหม่ได้ตลอดรัน list จะโตไม่หยุด
             threads[:] = [t for t in threads if t.is_alive()]
-            if not threads:
+            if not threads and (self._stop.is_set() or self._exhausted):
                 # Nothing left to wait for: either the queue drained on its own, or (if
                 # request_stop() was called) every in-flight account already finished.
                 # Sitting out the rest of drain_limit here would only delay the final
-                # numbers, never change them.
+                # numbers, never change them. No threads for any OTHER reason (every proxy
+                # down, surplus threads retired) is not the end - _fill below respawns.
                 break
 
-            if time.time() - last_retry >= lane_retry:
-                last_retry = time.time()
+            now = time.time()
+            if ((down_since is not None and now - down_since >= ALL_DOWN_RETRY)
+                    or now - last_retry >= lane_retry):
+                last_retry = now
+                down_since = None
                 for lane in self.pool.lanes:
                     if not lane.alive:
                         lane.revive()

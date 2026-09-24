@@ -39,6 +39,7 @@ except Exception:
     pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rangers_api  # noqa: E402
 from rangers_api import call, add_session_args, resolve_cookie  # noqa: E402
 
 MARKET_LOCALE = "TH"
@@ -300,19 +301,33 @@ def survey(cookie, home=None, sources=None):
     popup call alone ~1.5s), in parallel only the slowest one.
     """
     sources = SOURCES if sources is None else sources
-    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
-        pending = []
+
+    def args_for(collect):
+        return (cookie, home) if collect is survey_attendance_package else (cookie,)
+
+    results = []
+    if rangers_api.current_lane() is not None:
+        # ใน engine (เธรดนี้ผูก lane ไว้): ถามทีละแหล่งบนเธรดนี้เอง ห้ามแตก thread pool
+        # lane เป็น thread-local เธรดใน pool จึงไม่มี lane -> rangers_api ถอยไปใช้ถังแบบไฟล์ล็อก
+        # (ของยุคหลายโปรเซส) และ proxy จาก env แทนของ lane ไม่ถูกนับในงบ req/s ของ lane และ
+        # ปุ่ม Stop ตัดไม่ได้ วัดจริง 2026-09-25: ที่ ~160 เธรด survey แตกเธรดเพิ่มอีกเจ็ดเท่าแย่งล็อก
+        # ไฟล์ถังจนค้าง ("bucket file stayed locked for 10.0s") ไอดีเสร็จเหลือ 2-3 ใบ/10 วิ แล้ว lane
+        # ตายทั้งรัน ความขนานในบัญชีเดียวก็ไม่ได้อะไรอยู่แล้ว: เซิร์ฟเวอร์บังคับช่องว่าง ~300 ms ต่อบัญชี
+        # ยิงพร้อมกันเจ็ดตัวได้ HTTP 400 errorCode 429 แล้วต้อง retry - engine ขนานกันที่ระดับบัญชีแทน
         for label, collect in sources:
-            if collect is survey_attendance_package:
-                pending.append((label, pool.submit(collect, cookie, home)))
-            else:
-                pending.append((label, pool.submit(collect, cookie)))
-        results = []
-        for label, future in pending:
             try:
-                results.append((label, future.result(), None))
+                results.append((label, collect(*args_for(collect)), None))
             except Exception as err:        # one dead system must not sink the whole sweep
                 results.append((label, [], err))
+    else:
+        with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+            pending = [(label, pool.submit(collect, *args_for(collect)))
+                       for label, collect in sources]
+            for label, future in pending:
+                try:
+                    results.append((label, future.result(), None))
+                except Exception as err:        # one dead system must not sink the whole sweep
+                    results.append((label, [], err))
 
     jobs = []
     for label, found, err in results:

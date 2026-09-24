@@ -189,3 +189,26 @@ def test_a_stopping_lane_refuses_every_further_request_and_mint():
     with pytest.raises(EngineStopped):
         lane.auth_quota.acquire()
     assert not issubclass(EngineStopped, Exception)   # `except Exception` ใน flows ต้องจับไม่ได้
+
+
+
+def test_a_proxy_that_was_working_is_not_dropped_for_a_brief_burst_of_failures():
+    """เธรดเป็นร้อยพังพร้อมกันสามตัวได้ในเสี้ยววิจากเน็ตสะดุดครั้งเดียว - ต้องไม่มีคำตอบสำเร็จเลย
+    นาน LANE_DEATH_SECONDS ก่อน ถึงจะถอด proxy ที่เคยใช้ได้"""
+    from engine.proxy import LANE_DEATH_SECONDS
+    clock = _FakeClock()
+    lane = ProxyLane("1.1.1.1:8000", None, rps=90, threads=8, clock=clock)
+    lane.note_ok()
+    for _ in range(10):
+        assert lane.note_fail() is False
+    clock.advance(LANE_DEATH_SECONDS)
+    assert lane.note_fail() is True
+    assert not lane.alive
+
+
+def test_connection_failures_count_as_pushback_for_the_autoscaler():
+    lane = ProxyLane("direct", None, rps=90, threads=8, direct=True)
+    lane.note_fail()
+    lane.note_limited()
+    assert lane.counters()[2] == 2
+    assert lane.alive
