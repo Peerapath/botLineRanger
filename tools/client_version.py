@@ -259,6 +259,7 @@ class ClientVersion:
                 else:
                     candidates = sorted((v for v in self.known_good if v != version),
                                         key=_vkey, reverse=True)
+                    forgotten = False
                     for cand in candidates:
                         attempt = send(prefix, cand)
                         kind = classify(attempt[0], attempt[1])
@@ -272,7 +273,10 @@ class ClientVersion:
                             return attempt
                         if kind == "version_unknown":
                             self._forget(cand)
+                            forgotten = True
                     self._not_version.add((route, version))
+                    if forgotten:          # dead versions dropped from known_good, no winner:
+                        self._save()       # persist the drop or the file keeps offering them
                     return result
         finally:
             self._emit(messages)
@@ -285,8 +289,12 @@ class ClientVersion:
         messages = []
         try:
             with self._lock:
+                # The generation counter only proves SOME change happened, not that it was the
+                # value this call depends on - another thread's unrelated switch bumps it too.
+                # Skip the sweep only when this route would now resolve to a different version.
                 if self._generation != generation:
-                    return                           # another thread already moved us on
+                    if self.route_pins.get(route, self.app_version) != version:
+                        return                       # our version problem is already fixed
                 self._check_dead()
                 self._forget(version)
                 if self.route_pins.get(route) == version:
@@ -324,8 +332,11 @@ class ClientVersion:
         messages = []
         try:
             with self._lock:
-                if self._generation != generation:
-                    return self.api_prefix != prefix
+                # Same reasoning as _after_unknown_version: the counter alone does not say the
+                # prefix we depend on moved. Skip only when it demonstrably did; otherwise fall
+                # through and check the current prefix ourselves, still single-flighted by the lock.
+                if self._generation != generation and self.api_prefix != prefix:
+                    return True
                 self._check_dead()
                 if self._ask_oracle(prefix, version) == "known":
                     return False

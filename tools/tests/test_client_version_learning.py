@@ -256,6 +256,49 @@ def test_learning_off_returns_every_refusal_untouched(tmp_path):
     assert server.real == [("/v12.3", "12.1.0")] and server.oracle_calls == []
 
 
+def test_an_unrelated_generation_bump_does_not_stop_a_dead_prefix_from_moving(tmp_path):
+    # A generation bump proves SOME change happened, not that OUR problem (the dead prefix)
+    # was the one that got fixed. If it was something unrelated, the current prefix must still
+    # be checked and swept - a bare counter check would wrongly hand the caller the 404.
+    server = FakeServer(prefixes={"/v12.2", "/v12.5"})
+    c, _, _ = make(tmp_path, server)
+    c._load()
+    c._generation += 1                    # simulate an unrelated change elsewhere
+    assert c._after_route_missing("/v12.3", "12.3.0", generation=0) is True
+    assert c.api_prefix == "/v12.5"
+
+
+def test_an_unrelated_generation_bump_does_not_stop_a_dead_version_from_sweeping(tmp_path):
+    server = FakeServer()
+    c, _, _ = make(tmp_path, server, app_version="12.1.0")
+    c._load()
+    c._generation += 1                    # simulate an unrelated change elsewhere
+    c._after_unknown_version("/home", "12.1.0", generation=0)
+    assert c.app_version == "12.4.0"
+
+
+def test_a_generation_bump_that_really_moved_the_prefix_skips_the_oracle(tmp_path):
+    server = FakeServer(prefixes={"/v12.2", "/v12.5"})
+    c, _, _ = make(tmp_path, server)
+    c._load()
+    c.api_prefix = "/v12.5"               # another thread already switched us
+    c._generation += 1
+    assert c._after_route_missing("/v12.3", "12.3.0", generation=0) is True
+    assert server.oracle_calls == []
+
+
+def test_401_sweep_that_finds_no_winner_still_saves_the_forgotten_candidates(tmp_path):
+    # The sweep forgets 12.4.0 and 12.3.2 in memory (the server 119801s both) before giving up
+    # with the original 401 - if that giveaway is never saved, the file keeps offering them.
+    server = FakeServer(known={"12.3.0", "12.2.0"}, token_ok=False)
+    c, path, _ = make(tmp_path, server)
+    send = server.send_for("/mission/list")
+    assert c.request("/mission/list", send)[0] == 401
+    data = saved(path)
+    assert "12.4.0" not in data["known_good"]
+    assert "12.3.2" not in data["known_good"]
+
+
 def test_candidates():
     assert cv.version_candidates("12.3.0") == [
         "12.3.0", "12.3.1", "12.3.2", "12.3.3", "12.3.4", "12.3.5",
