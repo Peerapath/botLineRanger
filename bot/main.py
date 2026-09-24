@@ -18,7 +18,6 @@ import sys
 import requests
 import webbrowser
 from datetime import datetime
-from ADB import *
 import time
 import threading
 import re
@@ -70,7 +69,6 @@ ALL_PLAY_MODE_OPTIONS = {
     "🎮 Login Lv3": "ranger_api_Level3",
     "🎯 GenID": "ranger_api_GenID",
     "🎯 Stage": "ranger_api_Stage",
-    # "🛠 Auto Setup": "AutoSetup",
 }
 
 # Composite modes ที่ต้องการหลาย mode เป็น prerequisite
@@ -323,8 +321,8 @@ class EmulatorManager(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._closing = False  # ป้องกันการเรียก on_close หลายครั้ง
 
-        self.check_vars = []
-        self.all_selected = False
+        self.check_vars = []   # ไม่มี device row ให้เลือกแล้ว (Task 11) เหลือไว้เพราะ
+                                # _build_thread_panel() ยัง .clear() ตัวนี้ทุกครั้งที่วาดแผงซ้ายใหม่
         self.bot_processes = {}
         self.worker_procs = {}            # holds one subprocess.Popen under key "engine" while
                                            # a headless (Login/Level3/GenID/Stage) run is active
@@ -374,10 +372,6 @@ class EmulatorManager(ctk.CTk):
         top_frame = ctk.CTkFrame(self)
         top_frame.pack(fill="x", padx=10, pady=(5, 0))
 
-        self.btn_select_all = ctk.CTkButton(
-            top_frame, text="✅Select All", width=90, command=self.toggle_select)
-        self.btn_select_all.pack(side="left", padx=4, pady=6)
-
         # play mode options - เริ่มต้นด้วยทุกโหมด จะถูก filter หลังจาก verify subscription
         self.play_mode_options = ALL_PLAY_MODE_OPTIONS.copy()
         self.play_mode_var = ctk.StringVar()
@@ -422,12 +416,10 @@ class EmulatorManager(ctk.CTk):
         middle_frame = ctk.CTkFrame(self, fg_color="#2b2b2b")
         middle_frame.pack(fill="both", expand=True, padx=10, pady=(5, 0))
 
-        # ซ้าย: Emulator list
+        # ซ้าย: จำนวน thread (ทุกโหมดเป็น headless แล้ว - ดู render_left_panel/_build_thread_panel)
         self.left_frame = ctk.CTkScrollableFrame(middle_frame, width=330)
         self.left_frame.pack(side="left", fill="both",
                              expand=True, padx=(10, 5), pady=10)
-
-        ctk.CTkLabel(self.left_frame, text="❌ ไม่พบอุปกรณ์ ADB", text_color="gray").pack(pady=10)
 
         # ขวา: Settings และ PlayMode-specific UI
         self.right_frame = ctk.CTkScrollableFrame(middle_frame)
@@ -439,18 +431,10 @@ class EmulatorManager(ctk.CTk):
         self.update_playmode_settings()
 
         # -------------------------
-        # ล่าง: ADB Controls
+        # ล่าง: Input/Output/Execute/Backup + version
         # -------------------------
         self.bottom_frame = ctk.CTkFrame(self)
         self.bottom_frame.pack(fill="x", padx=10, pady=(5, 5))
-
-        self.btn_start_adb = ctk.CTkButton(self.bottom_frame, text="⭕ Start ADB", width=90,
-                                           text_color="#40bd46", fg_color="#333333", hover_color="#444444", command=self.start_adb)
-        self.btn_start_adb.pack(side="left", padx=5, pady=6)
-
-        self.btn_kill_adb = ctk.CTkButton(self.bottom_frame, text="❌ Kill ADB", width=90, text_color="#dd5555",
-                                          fg_color="#333333", hover_color="#444444", command=self.kill_server_adb)
-        self.btn_kill_adb.pack(side="left", padx=5)
 
         # --- current file (กดเพื่อเปิดโฟลเดอร์) ---
         self.label_input_files = ctk.CTkLabel(self.bottom_frame, text="input: 0",
@@ -943,51 +927,6 @@ class EmulatorManager(ctk.CTk):
     # -----------------------------
     # The rest of the methods are mostly unchanged, minimal cleanups
     # -----------------------------
-    def add_emulator(self, idx, port, status="Stop"):
-        frame = ctk.CTkFrame(self.left_frame, fg_color="#303030")
-        frame.pack(fill="x", padx=4, pady=3)
-        var = ctk.BooleanVar()
-        chk = ctk.CTkCheckBox(frame, text=f"#{idx+1}", variable=var, width=60)
-        chk.pack(side="left", padx=4)
-        self.check_vars.append(var)
-        ctk.CTkLabel(frame, text=port, width=105, anchor="w").pack(side="left", padx=4)
-        status_label = ctk.CTkLabel(frame, text=status, text_color="gray")
-        status_label.pack(side="left", padx=4)
-        self.status_labels[port] = status_label
-
-        options = ["🛠 Auto Setup", "⬇ Import ID", "⬆ Export ID", "📄 Log File", "🖼 Screen"]
-        menu_var = ctk.StringVar(value="⁝")
-
-        def on_menu_select(choice, dev):
-            self.handle_menu_choice(choice, dev)
-            menu_var.set("⁝")
-
-        menu = ctk.CTkOptionMenu(frame, values=options, variable=menu_var, width=0,
-                                 fg_color="#444444", button_color="#444444", button_hover_color="#555555",
-                                 text_color="white", command=lambda choice, dev=port: on_menu_select(choice, dev))
-        menu.pack(side="right", padx=(0, 4))
-
-        btnStartStop = ctk.CTkButton(frame, text="▶", width=30, fg_color="#444444", hover_color="#555555")
-        btnStartStop.pack(side="right", padx=(0, 4))
-        btnStartStop.configure(command=lambda b=btnStartStop, dev=port: self.start_bot(dev, b))
-        self.control_buttons[port] = btnStartStop
-
-        if not hasattr(self, "emulators"):
-            self.emulators = []
-        self.emulators.append(frame)
-
-    def handle_menu_choice(self, choice, dev):
-        log_file = f"src/log/bot_{re.sub(r'[^a-zA-Z0-9._-]', '_', dev)}.log"
-        if choice == "🛠 Auto Setup":
-            self.start_auto_setup(dev, self.control_buttons[dev])
-        elif choice == "⬇ Import ID":
-            self.importID(dev)
-        elif choice == "⬆ Export ID":
-            self.exportID(dev)
-        elif choice == "📄 Log File":
-            self.open_log_file(log_file)
-        elif choice == "🖼 Screen":
-            self.open_screen_file(dev)
 
     def stop_bot_processes(self, force):
         """Stops both process families this GUI can be running.
@@ -1031,14 +970,10 @@ class EmulatorManager(ctk.CTk):
         _stop_sse_listener()
         try:
             # Drain, not force: self.on_close() below is the guaranteed hard-stop backstop
-            # (it always forces - see its own call site), and kill_server_adb() plus the
-            # blocking messagebox.showwarning() further down give the engine real wall-clock
+            # (it always forces - see its own call site), and the blocking
+            # messagebox.showwarning() further down gives the engine real wall-clock
             # time to finish in-flight accounts first, for free, before that backstop runs.
             self.stop_bot_processes(force=False)
-        except Exception:
-            pass
-        try:
-            self.kill_server_adb()
         except Exception:
             pass
         messagebox.showwarning(
@@ -1192,219 +1127,19 @@ class EmulatorManager(ctk.CTk):
         ctk.CTkLabel(self.bottom_frame, text=f"!", text_color="salmon",
                      font=("Segoe UI", 18, "bold"), anchor="e").pack(side="right")
 
-    def importID(self, port):
-        path = filedialog.askopenfilename(initialdir="input", title="เลือกไฟล์ ID", filetypes=[("XML files", "*.xml")])
-        if not path:
-            return
-        filename = os.path.basename(path)
-        gameId = filename.replace("_LINE_COCOS_PREF_KEY.xml", "")
-        try:
-            device = None
-            devices = client.devices()
-            for dev in devices:
-                if dev.serial[-4:] == port[-4:]:
-                    device = dev
-                    break
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Template not found: {path}")
-            device.push(path, "/sdcard/Download/_LINE_COCOS_PREF_KEY.xml")
-            device.shell("su -c 'chmod 666 /sdcard/Download/_LINE_COCOS_PREF_KEY.xml'")
-            device.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
-            device.shell("su -c 'cp /sdcard/Download/_LINE_COCOS_PREF_KEY.xml /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
-            device.shell("rm /sdcard/Download/_LINE_COCOS_PREF_KEY.xml")
-            filename = os.path.join("input", filename)
-            if os.path.isfile(filename):
-                output_dir = "output"
-                os.makedirs(output_dir, exist_ok=True)
-                shutil.move(filename, os.path.join(output_dir, os.path.basename(filename)))
-            messagebox.showinfo("Import สำเร็จ", f"{port} นำเข้า ID: {gameId}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Import ล้มเหลว: {e}")
-
-    def exportID(self, port):
-        device = None
-        devices = client.devices()
-        for dev in devices:
-            if dev.serial[-4:] == port[-4:]:
-                device = dev
-                break
-        if device is None:
-            messagebox.showerror("Error", f"ไม่พบอุปกรณ์ {port}")
-            return
-        setUp(port)
-        default_filename = f"{getGameID()}"
-        path = filedialog.asksaveasfilename(initialdir="output", initialfile=default_filename, title="บันทึกไฟล์ ID", defaultextension=".xml", filetypes=[("XML files", "*.xml")])
-        if not path:
-            return
-        try:
-            device.shell("su -c 'cp /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml /sdcard/_LINE_COCOS_PREF_KEY.xml'")
-            device.pull("/sdcard/_LINE_COCOS_PREF_KEY.xml", path)
-            device.shell("rm /sdcard/_LINE_COCOS_PREF_KEY.xml")
-            messagebox.showinfo("Export สำเร็จ", f"{port} บันทึก ID ไปที่:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Export ล้มเหลว: {e}")
-
-    def start_bot(self, dev, btn):
-        self.save_config()
-
-        # Verify subscription before starting bot
-        if not self.verify_subscription_sync():
-            return
-        
-        status_label = self.status_labels.get(dev)
-        if dev in self.bot_processes and self.bot_processes[dev].is_alive():
-            p = self.bot_processes[dev]
-            p.terminate()
-            p.join(timeout=2)
-            del self.bot_processes[dev]
-            btn.configure(text="▶")
-            if status_label:
-                status_label.configure(text="Stop", text_color="gray")
-        else:
-            if getattr(sys, 'frozen', False):
-                multiprocessing.set_executable(sys.executable)
-            p = Process(target=run_bot, args=(dev, CHOICE))
-            p.start()
-            self.bot_processes[dev] = p
-            self.monitor_bot(dev, p)
-            btn.configure(text="∣∣")
-            if status_label:
-                status_label.configure(text="Running", text_color=whiteblue)
-        time.sleep(0.5)
-
-    def start_auto_setup(self, dev, btn):
-        status_label = self.status_labels.get(dev)
-        if dev in self.bot_processes and self.bot_processes[dev].is_alive():
-            p = self.bot_processes[dev]
-            p.terminate()
-            p.join(timeout=2)
-            del self.bot_processes[dev]
-            btn.configure(text="▶")
-            if status_label:
-                status_label.configure(text="Stop", text_color="gray")
-        else:
-            log_file = f"src/log/bot_{re.sub(r'[^a-zA-Z0-9._-]', '_', dev)}.log"
-            if getattr(sys, 'frozen', False):
-                multiprocessing.set_executable(sys.executable)
-            p = Process(target=run_auto_setup_with_log, args=(dev, log_file))
-            p.start()
-            self.bot_processes[dev] = p
-            self.monitor_bot(dev, p)
-            btn.configure(text="∣∣")
-            if status_label:
-                status_label.configure(text="Running", text_color=whiteblue)
-        time.sleep(0.5)
-
     def start_bot_for_selected(self):
-        # โหมด Login/GenID = headless: สปอว์นตามจำนวน thread ไม่ใช้ device
+        # ทุกโหมดใน ALL_PLAY_MODE_OPTIONS เป็น headless thread mode แล้ว (AutoSetup ตัวเดียว
+        # ที่เคยใช้ device ถูกคอมเมนต์ออกจาก dropdown ไปนานแล้ว) เส้นทางเดิมที่เลือก/สปอว์นทีละ
+        # ADB device ถูกลบไปทั้งชุดใน Task 11 - ไม่มีอะไรเหลือให้ทำถ้าไม่ใช่โหมดนี้
         if self._isHeadlessThreadMode():
             self._start_workers()
             return
 
-        self.save_config()
-        # Verify subscription before starting bot
-        if not self.verify_subscription_sync():
-            return
-
-        readConfigFile()
-        selected_devices = []
-        for i, var in enumerate(self.check_vars):
-            if var.get():
-                if i < len(self.status_labels):
-                    dev = list(self.status_labels.keys())[i]
-                    selected_devices.append(dev)
-        if not selected_devices:
-            print("No emulator selected!")
-            return
-
-        note_file_in_folder(selected_devices)
-
-        def start_with_delay(i):
-            if i >= len(selected_devices):
-                return
-            dev = selected_devices[i]
-            if dev in self.bot_processes:
-                p = self.bot_processes[dev]
-                if p.is_alive():
-                    self.after(1000, lambda: start_with_delay(i+1))
-                    return
-                else:
-                    del self.bot_processes[dev]
-            if getattr(sys, 'frozen', False):
-                multiprocessing.set_executable(sys.executable)
-            p = Process(target=run_bot, args=(dev, CHOICE))
-            p.start()
-            self.bot_processes[dev] = p
-            self.monitor_bot(dev, p)
-            if dev in self.control_buttons:
-                self.control_buttons[dev].configure(text="∣∣")
-            if dev in self.status_labels:
-                self.status_labels[dev].configure(text="Running", text_color=whiteblue)
-            self.after(int(timeInterval), lambda: start_with_delay(i+1))
-
-        start_with_delay(0)
-
-
     def stop_bot_for_selected(self):
-        # โหมด Login/GenID = headless: หยุดทุก worker
+        # เหตุผลเดียวกับ start_bot_for_selected ด้านบน
         if self._isHeadlessThreadMode():
             self._stop_workers()
             return
-
-        stopped = []
-        selected_devices = []
-        for idx, var in enumerate(self.check_vars):
-            if var.get():
-                if idx < len(self.status_labels):
-                    dev = list(self.status_labels.keys())[idx]
-                    selected_devices.append(dev)
-        for dev in selected_devices:
-            if dev in self.bot_processes:
-                p = self.bot_processes[dev]
-                if p.is_alive():
-                    p.terminate()
-                    p.join(timeout=2)
-                    stopped.append(dev)
-                del self.bot_processes[dev]
-                if dev in self.control_buttons:
-                    self.control_buttons[dev].configure(text="▶")
-                if dev in self.status_labels:
-                    self.status_labels[dev].configure(text="Stop", text_color="gray")
-        if not stopped:
-            print("No running bots selected to stop.")
-        else:
-            print("Stopped bots:", stopped)
-        self.after(500, lambda: None)
-
-    def toggle_select(self):
-        if not self.all_selected:
-            for var in self.check_vars:
-                var.set(1)
-            self.btn_select_all.configure(text="❎Unselect All")
-            self.all_selected = True
-        else:
-            for var in self.check_vars:
-                var.set(0)
-            self.btn_select_all.configure(text="✅Select All")
-            self.all_selected = False
-
-    def open_screen_file(self, port):
-        device = None
-        devices = client.devices()
-        for dev in devices:
-            if dev.serial[-4:] == port[-4:]:
-                device = dev
-                break
-        result = device.screencap()
-        port_safe = re.sub(r'[^a-zA-Z0-9._-]', '-', port)
-        filename = rf"src\image\screen\screen-{port_safe}.png"
-        with open(filename, "wb") as f:
-            f.write(result)
-        if os.name == "nt":
-            try:
-                os.startfile(filename)
-            except Exception as e:
-                print(f"Failed to open screen: {e}")
 
     def open_log_file(self, log_file):
         if not os.path.exists(log_file):
@@ -1527,60 +1262,6 @@ class EmulatorManager(ctk.CTk):
         except Exception as e:
             print(f"Failed to open {path}: {e}")
 
-    def start_adb(self):
-        # Drain: this does not close the app or the window - it only switches the left
-        # panel over to an ADB device scan, running in its own background thread right
-        # below. There is no imminent process exit here, so the full 90s grace protection
-        # applies exactly as it would for a manual Stop click.
-        self.stop_bot_processes(force=False)
-        for widget in self.left_frame.winfo_children():
-            widget.destroy()
-        loading_frame = ctk.CTkFrame(self.left_frame, fg_color="#303030")
-        loading_frame.pack(fill="x", padx=4, pady=3)
-        loading_label = ctk.CTkLabel(loading_frame, text="🔍    กำลังค้นหา ADB...", width=200, anchor="w")
-        loading_label.pack(side="left", padx=4)
-
-        def background_scan():
-            try:
-                subprocess.run(r"src\adb\adb kill-server", shell=True, capture_output=True)
-                time.sleep(0.3)
-                devices = setup_emulators()
-            except Exception as e:
-                devices = []
-                print(f"ADB scan error: {e}")
-            self.after(0, lambda: self._update_emulator_ui(devices, loading_frame))
-
-        threading.Thread(target=background_scan, daemon=True).start()
-
-    def _update_emulator_ui(self, devices, loading_frame):
-        for widget in self.left_frame.winfo_children():
-            widget.destroy()
-        if not devices:
-            ctk.CTkLabel(self.left_frame, text="❌ ไม่พบอุปกรณ์ ADB", text_color="gray").pack(pady=10)
-            return
-        for i, dev in enumerate(devices):
-            self.add_emulator(i, dev)
-            if dev in self.bot_processes and self.bot_processes[dev].is_alive():
-                if dev in self.status_labels:
-                    self.status_labels[dev].configure(text="Running", text_color=whiteblue)
-                if dev in self.control_buttons:
-                    self.control_buttons[dev].configure(text="∣∣")
-            else:
-                if dev in self.status_labels:
-                    self.status_labels[dev].configure(text="Stop", text_color="gray")
-                if dev in self.control_buttons:
-                    self.control_buttons[dev].configure(text="▶")
-
-    def kill_server_adb(self):
-        self.check_vars.clear()
-        for widget in self.left_frame.winfo_children():
-            widget.destroy()
-        try:
-            subprocess.check_output(r"src\adb\adb kill-server", shell=True)
-        except Exception as e:
-            print("Kill ADB failed:", e)
-        ctk.CTkLabel(self.left_frame, text="❌ ไม่พบอุปกรณ์ ADB", text_color="gray").pack(pady=10)
-
     # -----------------------------
     # โหมด Login แบบ headless: แผงตั้งจำนวน thread + สปอว์น worker หลายโปรเซส
     # -----------------------------
@@ -1607,11 +1288,12 @@ class EmulatorManager(ctk.CTk):
                                           "ranger_api_Stage")
 
     def render_left_panel(self):
-        """เลือกเนื้อหาแผงซ้ายตามโหมด: Login/GenID/Stage = ตั้งจำนวน thread (ไม่แตะ adb) อื่น ๆ = รายการ device"""
+        """เลือกเนื้อหาแผงซ้ายตามโหมด: ตอนนี้ทุกโหมดใน ALL_PLAY_MODE_OPTIONS เป็น headless
+        thread mode (ตั้งจำนวน thread, ไม่แตะ adb) - AutoSetup ตัวเดียวที่เคยใช้แผง device
+        ถูกคอมเมนต์ออกจาก dropdown ไปนานแล้ว และแผง device (start_adb ฯลฯ) ถูกลบใน Task 11
+        """
         if self._isHeadlessThreadMode():
             self._build_thread_panel()
-        else:
-            self.start_adb()
 
     def _build_thread_panel(self):
         # ล้างแผงซ้าย (ทั้ง device rows เดิมและ worker rows) แล้ววาดตัวตั้งจำนวน thread ใหม่
@@ -2147,17 +1829,6 @@ class EmulatorManager(ctk.CTk):
             return
         self._drain_worker_procs(silent=silent)
 
-    def monitor_bot(self, dev, p):
-        if p.is_alive():
-            self.after(1000, lambda: self.monitor_bot(dev, p))
-        else:
-            if dev in self.bot_processes:
-                del self.bot_processes[dev]
-            if dev in self.control_buttons:
-                self.control_buttons[dev].configure(text="▶")
-            if dev in self.status_labels:
-                self.status_labels[dev].configure(text="Stop", text_color="gray")
-
     def check_for_update(self):
         """Kickoff เช็คเวอร์ชันใน background thread (non-blocking)"""
         threading.Thread(target=self._check_for_update_worker, daemon=True).start()
@@ -2491,11 +2162,10 @@ class EmulatorManager(ctk.CTk):
                 print(f"🔐 Auth error in heartbeat: {data.get('message')}")
                 _session_token = None
                 # Drain: self.on_close() a few lines down always forces (see its own call
-                # site) and is the guaranteed backstop; kill_server_adb() and the blocking
-                # messagebox.showwarning() below give the engine real time to finish
-                # in-flight accounts first, for free, before that backstop runs.
+                # site) and is the guaranteed backstop; the blocking messagebox.showwarning()
+                # below gives the engine real time to finish in-flight accounts first, for
+                # free, before that backstop runs.
                 self.stop_bot_processes(force=False)
-                self.kill_server_adb()
                 self.after(10000, self.on_close)
                 messagebox.showwarning("Auth Error", f"❌ {data.get('message', 'Session expired')}\n\nกรุณาเปิดโปรแกรมใหม่")
                 self.on_close()
@@ -2509,7 +2179,6 @@ class EmulatorManager(ctk.CTk):
                 # Drain: same reasoning as the auth_error/token_expired branch above -
                 # self.on_close() below always forces and is the guaranteed backstop.
                 self.stop_bot_processes(force=False)
-                self.kill_server_adb()
                 self.after(10000, self.on_close)
                 messagebox.showwarning("Verify", f"❌ {data.get('message', 'Unknown error')}")
                 self.on_close()
@@ -2539,7 +2208,6 @@ class EmulatorManager(ctk.CTk):
                 # Drain: same reasoning again - self.on_close() below always forces and is
                 # the guaranteed backstop.
                 self.stop_bot_processes(force=False)
-                self.kill_server_adb()
                 self.after(10000, self.on_close)
                 messagebox.showwarning("Network error", f"❌ ไม่สามารถเชื่อมต่อเซิฟเวอร์ได้\nตรวจสอบอินเตอร์เน็ต และ ลองอีกครั้ง")
                 self.on_close()
@@ -2603,48 +2271,6 @@ def open_gear_book():
     url = "https://rangers.lerico.net/en/equipments-book"
     webbrowser.open(url)
 
-
-def run_bot(device, choice):
-    """target ของ worker process - ไม่เขียน log ไฟล์แล้ว
-
-    กลบ stdout/stderr ทิ้งลง devnull: รันหลายร้อยโปรเซสพร้อมกัน ถ้าปล่อยพ่นเข้า console เดียว
-    จะรกและปนกัน (แบบ error OpenBLAS ที่เห็นก่อนหน้า) ไม่มี console ก็ยังพังตอน print
-    """
-    try:
-        # errors="replace": devnull ใช้ encoding พื้นฐาน (cp1252 บน Windows) พอ print ไทย/emoji
-        # จะโยน UnicodeEncodeError กลาง flow (แม้จะทิ้งลง devnull) แล้ว worker พังเงียบ ๆ
-        devnull = open(os.devnull, "w", encoding="utf-8", errors="replace")
-        sys.stdout = devnull
-        sys.stderr = devnull
-    except Exception:
-        pass
-    try:
-        if choice == "ranger_api_Login":
-            startBotLogin_API_headless(device)   # headless แท้: mint LF_AC เองจากไฟล์ ไม่เปิดเกม/ไม่ต่อ adb
-        elif choice == "ranger_api_GenID":
-            startBotGenID_API_headless(device)   # headless แท้: mint บัญชีใหม่ผ่าน signup ไม่เปิดเกม/ไม่ต่อ adb
-        elif choice == "ranger_api_Stage":
-            startBotStage_API_headless(device)   # headless แท้: relogin จากไฟล์ แล้วดันด่านผ่าน API
-        elif choice == "ranger_api_Level3":
-            startBotLevel3_API_headless(device)  # headless แท้: Login + เล่น st01 ซ้ำจนเลเวล 3
-        elif choice == "AutoSetup":
-            startBotCheckGameInfo_API(device)
-    except Exception:
-        pass
-
-
-
-def run_auto_setup_with_log(device, log_file):
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    f = open(log_file, "w", buffering=1, encoding="utf-8")
-    sys.stdout = f
-    sys.stderr = f
-    try:
-        autoSetUp(device)
-    except Exception as e:
-        print("Error:", e, flush=True)
-    finally:
-        f.close()
 
 def get_device_ID():
     global DEVICE_ID
@@ -2802,61 +2428,6 @@ def ensure_required_folders():
 
 
 
-def note_file_in_folder(selected_devices: list):
-    if not selected_devices:
-        print("No emulator selected!")
-        return
-
-    split_ID_folder = "src\\split-ID"
-    if not os.path.exists(split_ID_folder):
-        os.makedirs(split_ID_folder, exist_ok=True)
-    else:
-        # ลบไฟล์เก่าในโฟลเดอร์ก่อน
-        for old_file in os.listdir(split_ID_folder):
-            old_filepath = os.path.join(split_ID_folder, old_file)
-            if os.path.isfile(old_filepath):
-                os.remove(old_filepath)
-
-    # รวบรวมไฟล์ .xml ทั้งหมดจากโฟลเดอร์ input (รวมโฟลเดอร์ย่อย)
-    xml_files = []
-    for root, dirs, files in os.walk("input"):
-        for file in files:
-            if file.endswith(".xml"):
-                # เก็บ relative path จาก input/ เช่น "subfolder/file.xml"
-                rel_path = os.path.relpath(os.path.join(root, file), "input")
-                xml_files.append(rel_path)
-    
-    # คำนวณการแบ่งไฟล์ให้แต่ละ device
-    num_devices = len(selected_devices)
-    num_files = len(xml_files)
-    
-    if num_devices == 0:
-        print("ไม่มี device ที่เลือก")
-        return
-    
-    # คำนวณจำนวนไฟล์ต่อ device
-    base_count = num_files // num_devices  # จำนวนพื้นฐานต่อ device
-    extra = num_files % num_devices  # จำนวนที่เหลือต้องแจกเพิ่ม
-    
-    # แบ่งไฟล์และเขียนลงในแต่ละ device file
-    start_idx = 0
-    for i, device in enumerate(selected_devices):
-        # device แรกๆ จะได้รับไฟล์เพิ่ม 1 ไฟล์ (ถ้ามีเศษ)
-        count = base_count + (1 if i < extra else 0)
-        device_xml_files = xml_files[start_idx:start_idx + count]
-        start_idx += count
-        
-        # แปลง : เป็น _ สำหรับชื่อไฟล์
-        filename = device.replace(":", "_") + ".txt"
-        filepath = os.path.join(split_ID_folder, filename)
-        
-        # เขียนชื่อไฟล์ .xml ลงในไฟล์ device
-        with open(filepath, "w", encoding="utf-8") as f:
-            for xml_file in device_xml_files:
-                f.write(xml_file + "\n")
-        
-        print(f"{device} = {count} ไฟล์")
-
 if __name__ == "__main__":
     # โหมด engine (เฉพาะ frozen exe ที่รันสคริปต์ .py ไม่ได้) - รันคิวจนหมดแล้วออก ไม่เปิด GUI
     # dev รันผ่าน engine_main.py โดยตรง จึงไม่เข้าเงื่อนไขนี้
@@ -2899,10 +2470,13 @@ if __name__ == "__main__":
         # ===== ตรวจสอบและสร้างโฟลเดอร์ที่จำเป็น =====
         ensure_required_folders()
 
+        # freeze_support()/set_start_method() ยังจำเป็นเพราะ engine subprocess (_spawn_engine)
+        # และ multiprocessing.active_children() (on_close/logout) ยังพึ่ง multiprocessing อยู่
+        # ส่วน set_executable(sys.executable) เดิมมีไว้ให้ Process() ของ bot_processes หา
+        # python ถูกตัวตอน frozen - ลบพร้อมกับ flow นั้นทั้งชุดใน Task 11 (ไม่มี Process() เหลือ
+        # ให้ต้องชี้ path ให้แล้ว)
         multiprocessing.freeze_support()
         multiprocessing.set_start_method("spawn", force=True)
-        if getattr(sys, 'frozen', False):  # ✅ รันจาก exe
-            multiprocessing.set_executable(sys.executable)
 
         app = EmulatorManager()
         app.mainloop()
