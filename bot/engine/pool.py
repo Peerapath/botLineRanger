@@ -76,6 +76,11 @@ class EnginePool:
         self._lock = threading.Lock()
         self._done = 0
         self._fail = 0
+        # Finding 1b (review round 1): accounts whose flow finished but whose file could
+        # not be moved out of execute/ after _replace_with_retry exhausted every attempt -
+        # see _run_one. Counted separately from done/fail so neither of those can ever
+        # claim a destination folder holds a file that is still sitting in execute/.
+        self._stuck = 0
 
     def request_stop(self) -> None:
         """หยุดรับงานใหม่ บัญชีที่ค้างอยู่ทำต่อจนจบ
@@ -121,22 +126,44 @@ class EnginePool:
         except Exception as err:
             out = Outcome(dest="login failed", status="FAIL", error=str(err)[:200])
 
+        moved = True
+        move_err = ""
         try:
             if out.dest == "login failed":
                 self.queue.fail(src, out.error or out.status)
             else:
                 self.queue.finish(src, out.dest, out.name)
         except OSError as err:
+            # Finding 1b (review round 1): this used to be logged and nothing else - the
+            # account was then still counted and reported below as if the move above had
+            # succeeded, while its file stayed in execute/ (queue.py's _close now retries
+            # the move itself; this is what happens once those retries are also exhausted).
+            # moved=False is what stops that: out.status/out.dest are still the flow's own,
+            # genuine verdict (that work really happened), but nothing past this point may
+            # claim the file reached out.dest, because it did not.
+            moved = False
+            move_err = str(err)
             self.reporter.note("could not move %s: %s" % (os.path.basename(src), err))
 
         with self._lock:
-            if out.status == "OK":
+            if not moved:
+                # Neither done nor fail: out.dest was never reached, so counting this
+                # under either would claim a destination folder holds a file that is
+                # still sitting in execute/ - reproduced as the Critical finding this
+                # comment marks (forced _close failure -> summary["done"] counted 3 while
+                # output/ held 0). queue.recover() picks execute/'s stragglers back up as
+                # retry candidates on the next run; `stuck` is how this run surfaces that
+                # it happened instead of the account just quietly missing from every total.
+                self._stuck += 1
+            elif out.status == "OK":
                 self._done += 1
             else:
                 self._fail += 1
         self.reporter.account(status=out.status, rsn=session.rsn, lv=session.level,
-                              ms=int((time.time() - started) * 1000), dest=out.dest,
-                              lane=lane.name, err=(out.error or "")[:120])
+                              ms=int((time.time() - started) * 1000),
+                              dest=(out.dest if moved else "execute"), moved=moved,
+                              lane=lane.name, err=(out.error or "")[:120],
+                              move_err=move_err[:120])
 
     def _spawn(self, lane, threads: list, prefix: str = "") -> None:
         for i in range(lane.threads):
@@ -207,9 +234,10 @@ class EnginePool:
                 # them for one cycle is a needless (if minor) lie to whoever is watching.
                 running_now = [t for t in threads if t.is_alive()]
                 with self._lock:
-                    done, fail = self._done, self._fail
+                    done, fail, stuck = self._done, self._fail, self._stuck
                 elapsed = max(0.001, time.time() - started)
-                self.reporter.stat(done=done, fail=fail, left=self.queue.remaining(),
+                self.reporter.stat(done=done, fail=fail, stuck=stuck,
+                                   left=self.queue.remaining(),
                                    rate=round(done / elapsed, 2),
                                    threads=len(running_now), lanes=len(alive))
 
@@ -233,9 +261,12 @@ class EnginePool:
             t.join(timeout=max(0.0, deadline - time.time()))
 
         with self._lock:
-            done, fail = self._done, self._fail
+            done, fail, stuck = self._done, self._fail, self._stuck
         elapsed = max(0.001, time.time() - started)
-        summary = {"done": done, "fail": fail, "left": self.queue.remaining(),
+        # "stuck" is a new key (global constraint: existing keys keep their meaning) -
+        # done/fail must never count a file that never reached its destination folder,
+        # so an account whose final move failed lands here instead of inflating either.
+        summary = {"done": done, "fail": fail, "stuck": stuck, "left": self.queue.remaining(),
                    "seconds": round(elapsed, 1), "rate": round(done / elapsed, 2)}
         self.reporter.stat(**dict(summary, final=True))
         return summary

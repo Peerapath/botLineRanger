@@ -74,6 +74,47 @@ def test_the_final_stat_line_matches_what_landed_on_disk(tmp_path):
     assert summary["done"] == len(os.listdir(tmp_path / "output")) == 25
 
 
+def test_a_permanently_failing_final_move_is_not_counted_or_reported_as_done(tmp_path, monkeypatch):
+    """Critical finding (review round 1): the test the finding said was missing.
+
+    Reproduction, done by temporarily reverting queue.py's _close to a bare os.replace()
+    and pool.py's _run_one to count done/fail before checking whether the move it just
+    tried actually landed (both exactly as this task received them): with this same setup
+    (3 accounts, every execute/->output/ move forced to fail permanently),
+    summary["done"] came back 3 while output/ held 0 files and all three sat in execute/ -
+    the invariant test_the_final_stat_line_matches_what_landed_on_disk exists to guard,
+    reached by a path that test never drove (a *failing* move). After the fix below, the
+    same setup instead reports summary["done"] == 0 and summary["stuck"] == 3.
+    """
+    import engine.queue as queue_mod
+
+    q = build(tmp_path, 3)
+    buf = io.StringIO()
+    real_replace = os.replace
+
+    def deny_the_final_move(src, dst):
+        # Let claim() (input/ -> execute/) through untouched - only the move this test is
+        # about (execute/ -> a destination folder) must fail, permanently, every attempt.
+        if os.path.basename(os.path.dirname(dst)) == "execute":
+            return real_replace(src, dst)
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(os, "replace", deny_the_final_move)
+    # _replace_with_retry's own sleep between attempts is real time (constraint #13's
+    # retry budget) - zero it so exhausting all 5 attempts, 3 times over, stays fast.
+    monkeypatch.setattr(queue_mod, "_REPLACE_RETRY_DELAY_S", 0.0)
+
+    summary = EnginePool("ranger_api_Login", {"threadsperproxy": 3}, q, [], Reporter(buf),
+                         flow=lambda m, s, c: Outcome(dest="output")).run()
+
+    assert summary["done"] == len(os.listdir(tmp_path / "output")) == 0
+    assert len(os.listdir(tmp_path / "execute")) == 3   # stuck, not lost and not delivered
+    assert summary["stuck"] == 3
+    # The per-account line must not claim the file reached "output" either.
+    acct_rows = [r for r in rows(buf) if r["t"] == "acct"]
+    assert all(r["moved"] is False and r["dest"] == "execute" for r in acct_rows)
+
+
 def test_a_stop_request_lets_running_accounts_finish(tmp_path):
     """ฆ่าทันทีคือการทิ้งงานที่ทำไปแล้วครึ่งทาง พร้อมยอดสุดท้ายของมัน"""
     import threading

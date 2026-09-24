@@ -282,10 +282,17 @@ def _create_account(s: AccountSession, cfg: dict) -> None:
     import new_account
     s.reset_token()
     s.gacha_status, s.gacha_units = "-", []
-    acct = new_account.make_account(write_xml_dir=EXECUTE_DIR, skip_tut=True)
+    # Finding 2 (Task 9, review round 1): this used to read only the module-level EXECUTE_DIR
+    # above, never cfg["_execute_dir"] that engine_main.py actually sets - harmless only
+    # because both are os.getcwd()-based and computed back to back with no chdir between,
+    # in the one process this ran in today. Falls back to the module value so CLI use and
+    # every test that predates this fix (monkeypatch.setattr(flows, "EXECUTE_DIR", ...),
+    # see test_flows_modes.py) keep behaving exactly as before.
+    execute_dir = cfg.get("_execute_dir", EXECUTE_DIR)
+    acct = new_account.make_account(write_xml_dir=execute_dir, skip_tut=True)
     if acct.get("status") != "ready" or not acct.get("lf_ac"):
         raise RuntimeError("signup incomplete (status=%s)" % acct.get("status"))
-    s.src = new_account.write_account_xml(acct, EXECUTE_DIR)
+    s.src = new_account.write_account_xml(acct, execute_dir)
     s.cookie = "LF_AC=" + acct["lf_ac"]
     s.rsn = acct.get("rsn") or acct.get("gameId") or ""
     s.level = 1

@@ -107,6 +107,45 @@ def test_finish_rejects_a_folder_that_is_not_a_destination(tmp_path):
         q.finish(q.claim(), "outptu")
 
 
+def test_finish_retries_a_transient_replace_failure_and_still_succeeds(tmp_path, monkeypatch):
+    """Finding 1a (review round 1): _close() used to be the one move in this file that
+    skipped the retry claim() and recover() already get - a bare os.replace(), so a
+    transient PermissionError here (same Windows handle-still-open case as those two,
+    constraint #13) failed the account's move on the first hiccup instead of retrying."""
+    q = build(tmp_path, ["a.xml"])
+    src = q.claim()
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError("[WinError 32] the process cannot access the file")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    out = q.finish(src, "output")
+    assert os.path.isfile(out)
+    assert calls["n"] == 3
+
+
+def test_finish_raises_instead_of_silently_dropping_a_permanently_failing_move(tmp_path, monkeypatch):
+    """A move that never succeeds (not a transient hiccup) must not be swallowed - the
+    caller (EnginePool._run_one) relies on this exception to know the file never reached
+    its destination, so it can avoid counting and reporting a move that never happened."""
+    q = build(tmp_path, ["a.xml"])
+    src = q.claim()
+
+    def always_denied(src, dst):
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(os, "replace", always_denied)
+    with pytest.raises(OSError):
+        q.finish(src, "output")
+    assert os.path.isfile(src)                        # file never left execute/
+    assert os.listdir(tmp_path / "output") == []
+
+
 def test_fail_moves_into_login_failed_and_records_the_reason(tmp_path):
     q = build(tmp_path, ["a.xml"])
     out = q.fail(q.claim(), "HTTP 401")

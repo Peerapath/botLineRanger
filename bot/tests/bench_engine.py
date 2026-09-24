@@ -3,6 +3,36 @@
 รัน: PYTHONUTF8=1 python bot/tests/bench_engine.py 500 128
 ตัวเลขที่ได้ตอบคำถามว่า "ถ้าเกมเร็วเป็นอนันต์ เราจะระบายคิวได้เร็วแค่ไหน" - รอบที่
 ของจริงช้ากว่านี้มากแปลว่าคอขวดอยู่ที่ปลายทาง ไม่ใช่ที่เรา
+
+What this measures: EnginePool.run() end to end, with the network replaced by a flat
+time.sleep(LATENCY) per account - an upper bound on how fast this process's own
+queue/thread/journal machinery can drain a full queue, with the one part nobody here
+controls (the game server) removed from the picture entirely.
+
+Correction (review round 1, 2026-09-24): the first report measured ~150-165 accounts/s on
+this machine (PYTHONUTF8=1 python bot/tests/bench_engine.py 2000 256 -> 164.8 accounts/s
+one run, 149.8 accounts/s on a repeat - see task-9-report.md's isolation table; flat
+regardless of thread count from 16 threads up) and then judged that ceiling irrelevant in
+production by arguing from "128 concurrent accounts". That argument does not hold: 128 was
+the OLD process-per-worker architecture's RAM ceiling (5.5 GB for 128 OS processes - see
+AccountSession's own docstring), the exact limit this thread-pool rewrite exists to remove,
+so it cannot be used to size the new one.
+
+The number that actually matters is the plan's per-IP target: a 90 req/s per-proxy budget
+divided by ~16 requests/account is 5.6 accounts/s per proxy (see
+.superpowers/sdd/review-534a348..9a4b8d4.diff). Dividing this bench's ~150-165 accounts/s
+ceiling by that 5.6 accounts/s/proxy gives the proxy count at which this process's own
+queue - not the game server, not the network - becomes the binding constraint: roughly 27
+to 29 proxies. That falls inside the 5-to-50 proxies the user intends to run, not past the
+edge of it, so this ceiling is a real planning input, not a curiosity to footnote.
+
+Caveat: this ceiling may be specific to this dev box. task-9-report.md's isolation
+experiments narrowed it to the OS/filesystem layer - raw os.replace() calls with zero
+project code involved reproduce the same order-of-magnitude ceiling - and named Windows
+Defender real-time scanning as the leading suspect, unconfirmed (a read-only
+Get-MpComputerStatus check hung and never returned output). Re-measure this bench on the
+actual deployment host before sizing a 50-proxy plan on the strength of the ~27-29
+crossover computed above.
 """
 import io
 import os

@@ -72,6 +72,13 @@ def main(argv):
     # สองค่าที่ flows อ่านจาก cfg แต่ cfg เองสร้างเองไม่ได้ - ถ้าไม่ใส่ตรงนี้
     # flows จะทำงานต่อได้เงียบ ๆ โดยปิดความสามารถไปทีละอย่าง โดยเทสต์ยังเขียวหมด
     cfg["_account_claims"] = flows.AccountClaimRegistry()   # กันไฟล์สองใบของบัญชีเดียวสุ่มซ้ำ
+    # Finding 2 (Task 9, review round 1): until this fix, flows._create_account never actually read
+    # this key - it used its own module-level EXECUTE_DIR instead - so the comment above
+    # ("two values that flows reads from cfg") was only true of _account_claims. flows now
+    # reads cfg.get("_execute_dir", EXECUTE_DIR), so this line is genuinely load-bearing:
+    # it keeps GenID's freshly minted files landing in the same root/execute that
+    # WorkQueue(root=...) below also uses, not wherever os.getcwd() happened to be when
+    # flows.py was imported.
     cfg["_execute_dir"] = os.path.join(root, "execute")     # GenID เขียนไฟล์ใหม่ลงที่เดียวกับ WorkQueue
 
     reporter = Reporter()

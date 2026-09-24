@@ -185,7 +185,23 @@ class WorkQueue:
         name = os.path.basename(src)
         out_name = (new_name + ".xml") if new_name else name
         out = os.path.join(self.root, dest, out_name)
-        os.replace(src, out)
+        # Finding 1a (review round 1): this is finish()/fail()'s only move, called once per
+        # account - 44,000 times over a full run - and it used to be a bare os.replace(),
+        # the one rename in this file that skipped the retry claim() and recover() already
+        # get. Same Windows transient-handle case as those two (constraint #13): without
+        # the retry, the commonest kind of momentary block (AV scan, indexer, another
+        # thread mid-read) looked identical to a permanent failure.
+        if not _replace_with_retry(src, out):
+            # _replace_with_retry only returns False on FileNotFoundError. claim() and
+            # recover() can shrug that off and move on to the next file in their own loop -
+            # there is no "next file" here: src was this account's alone from claim() to
+            # this call, so it vanishing is not a race to skip quietly, it means the move
+            # already failed. Raise instead of writing a "done"/"fail" journal line for an
+            # `out` path that was never created - EnginePool._run_one already treats any
+            # OSError out of finish()/fail() as a failed move, never a silent success.
+            raise FileNotFoundError(
+                "cannot move %r into %r/: source vanished before the move completed"
+                % (name, dest))
         with self._lock:
             self._write(f=name, dest=dest, **extra)
         return out
