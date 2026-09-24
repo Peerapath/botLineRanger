@@ -1,0 +1,5 @@
+﻿invenId,unitCode,name,level,maxLevel,evolution,locked,talentGrade
+2069172547,u32-brown,brown,1,60,base,False,0
+2069172550,u45-james,james,1,60,base,False,0
+2069172548,u37-moon,moon,1,30,base,False,0
+2069172549,u38-cony,cony,1,40,base,False,0

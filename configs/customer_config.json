@@ -1,0 +1,18 @@
+{
+  "setting": {
+    "phone": {
+      "brand": "Samsung",
+      "code": "a54x",
+      "imei": "863522042771468",
+      "manufacturer": "Samsung",
+      "miit": "SM-A546E",
+      "model": "Galaxy A54",
+      "vdid": "cd2fef93-8bc3-4bf2-a9ce-52c008c1dd10"
+    },
+    "record": {
+      "time": {
+        "first": "0"
+      }
+    }
+  }
+}

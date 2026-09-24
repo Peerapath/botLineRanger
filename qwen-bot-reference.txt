@@ -1,0 +1,325 @@
+REFERENCE: botKaiRubyClearMission.py
+Source file: D:/Programing/ranger/BotKaiByClearMission/botKaiRubyClearMission.py
+Generated: 2026-08-31
+
+====================================================================
+1. force_stop_LINE_Rangers
+====================================================================
+def line (line 1702):
+    def force_stop_LINE_Rangers():
+
+Parameters:
+    (none)
+
+What it does:
+    - Calls force_stop_app("com.linecorp.LGRGS") (line 1703), which runs the
+      adb shell command f"am force-stop {app}" via DEVICE.shell(command)
+      (line 1695-1696) and then wait(1).
+    - force_stop_app wraps the shell call in try/except and logs
+      f"An error occurred: {e}" on failure (line 1699).
+    - After the force-stop, waits 0.5 seconds: wait(0.5) (line 1704).
+
+Literal strings / dependencies:
+    - "com.linecorp.LGRGS"  (package name, line 1703)
+    - f"am force-stop {app}"  (adb shell command, line 1695)
+    - Uses global DEVICE (ppadb AdbClient device object) and wait().
+
+Returns:
+    Nothing (implicit None).
+
+====================================================================
+2. importFileFromInputToExecute
+====================================================================
+def line (line 3039):
+    def importFileFromInputToExecute():
+
+Parameters:
+    (none)
+
+What it does:
+    - Reads the per-device queue file os.path.join("src", "split-ID", f"{DEVICESERIAL}.txt")
+      (line 3043). If the file does not exist, logs
+      f"Not Found split-ID file: {split_id_file}" and returns 0 (line 3046).
+    - Reads all lines of the split-ID file (utf-8). If the file has no lines,
+      falls back to in_current_file(): sets FILENAME to the current file's
+      relative path (or "") and file_path = os.path.join("input", rel_path)
+      (lines 3054-3056).
+    - Otherwise loops over the queued relative paths: for each line it first
+      tries the direct candidate os.path.join("input", target_rel_path)
+      (line 3069); if not a file, falls back to os.walk("input") matching by
+      basename only (lines 3077-3087). Pops the top line whether found or
+      not; logs f"⚠️ Not Found File ID: {target_rel_path} - Skipping..." when
+      a line's file is missing (line 3097).
+    - Rewrites the split-ID file with the remaining lines (lines 3100-3101).
+      If nothing valid remains, logs "No valid files remaining in split-ID"
+      and returns 0 (lines 3103-3105).
+    - Pushes the chosen save file to the device:
+      tmp_path = "/data/local/tmp/_LINE_COCOS_PREF_KEY.xml"
+      DEVICE.push(file_path, tmp_path) (lines 3112-3113)
+    - Then a sequence of su shell commands (lines 3116-3125):
+        DEVICE.shell(f"su -c 'chmod 666 {tmp_path}'")
+        DEVICE.shell("su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+        DEVICE.shell(f"su -c 'cp {tmp_path} /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+        DEVICE.shell(f"su -c 'rm {tmp_path}'")
+    - Finally moves the local file from input/ into execute/ preserving the
+      subfolder: dest_path = os.path.join("execute", FILENAME),
+      os.makedirs(os.path.dirname(dest_path), exist_ok=True),
+      shutil.move(file_path, dest_path) (lines 3127-3130).
+    - Sets global FILENAME to the relative path of the imported save file.
+
+Literal strings / dependencies:
+    - f"{DEVICESERIAL}.txt" inside os.path.join("src", "split-ID", ...) (line 3043)
+    - "input" (directory, lines 3056, 3069, 3079)
+    - "/data/local/tmp/_LINE_COCOS_PREF_KEY.xml" (line 3112)
+    - "su -c 'chmod 666 {tmp_path}'" (line 3116)
+    - "su -c 'rm /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'" (line 3119)
+    - f"su -c 'cp {tmp_path} /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'" (line 3122)
+    - f"su -c 'rm {tmp_path}'" (line 3125)
+    - os.path.join("execute", FILENAME) (line 3128)
+    - Uses globals: FILENAME, DEVICESERIAL, DEVICE; calls in_current_file().
+
+Returns:
+    0 when no split-ID file or no valid files remain (lines 3046, 3105);
+    otherwise implicit None (no explicit return on the success path).
+
+====================================================================
+3. openLineRangers
+====================================================================
+def line (line 3507):
+    def openLineRangers(fast=False, dontShowToday=False, genid=False):
+
+Parameters:
+    fast=False
+    dontShowToday=False
+    genid=False
+
+What it does:
+    - Starts a 5-minute main timeout (maintimeoutopengame = 300, line 3509)
+      and enters a retry loop. Each iteration: force_stop_LINE_Rangers(),
+      wait(1), then launches the game with
+      DEVICE.shell("monkey -p com.linecorp.LGRGS -c android.intent.category.LAUNCHER 1")
+      (line 3522).
+    - Inner wait loop: waitLoading() until the home screen template
+      r"src\image\home\LINE studio.png" appears (then waitVanish + waitLoading),
+      or a loading template r"src\image\home\percent.png" / r"src\image\home\LINE.png"
+      appears, or the per-attempt timeoutopengame (60 s default, from
+      config) elapses / r"src\image\home\not responding Close app.png" is
+      clicked, in which case it force-stops and relaunches (lines 3525-3540).
+    - Clicks r"src\image\home\ok.png" and r"src\image\home\play.png"
+      (lines 3542-3543). If r"src\image\home\API Hooking.png" is found it
+      clicks r"src\image\home\API Hooking ok.png" and retries the whole
+      loop (lines 3545-3548).
+    - Detects login failure via r"src\image\home\login_fail.png" and sets
+      authentication_failed = True (lines 3550-3552).
+    - If r"src\image\home\reload.png" exists (and not genid): clicks it,
+      clicks r"src\image\home\check.png", re-checks login_fail; otherwise
+      if no r"src\image\home\ok.png": waits for r"src\image\home\agree.png",
+      clicks r"src\image\home\checkbox.png" up to 5 times, clicks agree,
+      then ok (language selection) (lines 3554-3575).
+    - If r"src\image\home\sing in with apple.png" exists: optionally clicks
+      it (when r"src\image\home\guest login.png" is absent), then performs
+      guest login: clicks r"src\image\home\guest login.png",
+      r"src\image\home\login.png", waits agree, ticks checkboxes, clicks
+      r"src\image\home\agree.png", ok (lines 3578-3626).
+    - waitLoadingScreen(), increments try_login_count. If
+      try_login_count > 3 or authentication_failed or
+      r"src\image\home\set nickname.png" / r"src\image\home\100% HP Tower.png" /
+      r"src\image\home\1880-1880.png" exists: if REIMPORTFILE != FILENAME it
+      calls reImportFileInExecute() (to restore the previous save); if
+      REIMPORTFILE == FILENAME it calls exportFileFromExecuteToLoginFailed()
+      and returns "set nickname" (lines 3631-3644). Otherwise breaks out of
+      the retry loop.
+    - If not fast: extends the timeout by +60 s (6 minutes total) and loops
+      calling closePopUp(dontShowToday) and tutorialInHomeScreen() until
+      r"src\image\main_stage\go main stage.png" exists (lines 3647-3658).
+    - On any exception: prints "========= Error =========", logs
+      f"Exception in Open Line Rangers:\n{e}", calls captureScreenError(str(e))
+      and prints the traceback (lines 3661-3666).
+
+Literal strings / dependencies:
+    - "monkey -p com.linecorp.LGRGS -c android.intent.category.LAUNCHER 1" (lines 3522, 3539)
+    - "com.linecorp.LGRGS" (package)
+    - Templates: r"src\image\home\LINE studio.png", r"src\image\home\percent.png",
+      r"src\image\home\LINE.png", r"src\image\home\not responding Close app.png",
+      r"src\image\home\ok.png", r"src\image\home\play.png",
+      r"src\image\home\API Hooking.png", r"src\image\home\API Hooking ok.png",
+      r"src\image\home\login_fail.png", r"src\image\home\reload.png",
+      r"src\image\home\check.png", r"src\image\home\agree.png",
+      r"src\image\home\checkbox.png", r"src\image\home\sing in with apple.png",
+      r"src\image\home\guest login.png", r"src\image\home\login.png",
+      r"src\image\home\set nickname.png", r"src\image\home\100% HP Tower.png",
+      r"src\image\home\1880-1880.png", r"src\image\main_stage\go main stage.png"
+    - Uses globals: DEVICE, CHANGEID, FILENAME, REIMPORTFILE, timeoutopengame,
+      cooldowncapturescreen (via waitLoading); calls force_stop_LINE_Rangers(),
+      waitLoading(), waitLoadingScreen(), closePopUp(), tutorialInHomeScreen(),
+      reImportFileInExecute(), exportFileFromExecuteToLoginFailed(),
+      captureScreenError().
+
+Returns:
+    "set nickname" in one path (line 3640); implicit None otherwise
+    (success or exception — the exception path also ends without a return).
+
+====================================================================
+4. playMainStageAtNumber
+====================================================================
+def line (line 1317):
+    def playMainStageAtNumber(number:int, loop=0, closeGame=False):
+
+Parameters:
+    number:int        (no default)
+    loop=0
+    closeGame=False
+
+What it does:
+    - Logs f"Start Main Stage At: {number}", resets STAGENUMBER = 0 and local
+      state (win, foundSkip, levelNumber=1, useItem* flags) (lines 1321-1334).
+    - Ensures the main stage screen: if r"src\image\main_stage\main stage.png"
+      is not found, goTo(r"src\image\go_to\main stage.png") (lines 1337-1339).
+    - Stage selection: if r"src\image\main_stage\stage30.png" is found it
+      triple-clicks its bottom-right corner; else if HIGHERSTAGE == 0 it
+      computes HIGHERSTAGE = findStageHigher(); if HIGHERSTAGE < 150 and
+      number not in [1, 2] it returns "lost" (line 1353). For number == 2 it
+      clicks stage change -> stage 1 -> stage2; otherwise
+      stageLocation = findStageAtNumber(number) and clicks it (lines 1355-1364).
+    - Waits for r"src\image\main_stage\stage.png" (random taps near
+      (480, 90) if the screen is stuck > 10 s, raising
+      "Cust screen > 10 sec"), handles tutorialClickLoop for
+      r"src\image\main_stage\tutorial leonard loop.png", and OCRs the actual
+      stage number: STAGENUMBER = int(numberOCR(Region(x=160, y=8, w=80, h=41),
+      r"src\image\main_stage\numS", 0.85)) (lines 1369-1390).
+    - Toggles auto-play per AUTOMODE ("bot" -> r"src\image\main_stage\auto on.png",
+      "game" -> r"src\image\main_stage\auto.png") and x2 speed
+      (r"src\image\main_stage\x2.png"); if loop != 0 it enables loop mode
+      (r"src\image\special_stage\loop.png"), clicks r"src\image\main_stage\add.png"
+      loop-1 times, clicks (551, 406) and r"src\image\main_stage\skip ok.png"
+      (lines 1392-1406). Unchecks item checkboxes, clicks start/next buttons;
+      if STAGENUMBER >= 30 it may buyFriend() per BUYFRIEND ("everyTime" /
+      "justLost") (lines 1408-1433).
+    - Battle loop (lines 1447-1501): each cycle taps the 5 ranger slots at
+      (275/375/475/575/675, 515), captures the screen, and checks
+      regionExists(Region(149, 33, 73, 31), r"src\image\main_stage\win.png", ...)
+      for a win, or
+      regionExists(Region(480, 327, 199, 74), r"src\image\main_stage\lose cancel.png", ...)
+      for a loss (logs "Win mm:ss" / "Lose mm:ss" and breaks). On stage 30 it
+      taps the borrowed-friend button (345, 380) and uses slotItem1 twice.
+      Taps item slots slotItem1..slotItem5 = (45,50),(115,50),(185,50),(255,50),(295,50).
+      In bot mode it may click r"src\image\main_stage\auto in game.png" after
+      15 s and toggles missile/costs at (150, 510)/(775, 510) every 6 cycles.
+      Raises TimeoutError("PLaying stuck > 180 sec") if the fight runs > 180 s.
+    - If closeGame: return (line 1503-1504).
+    - Post-battle loop: dismisses r"src\image\home\UnKnown error.png" via
+      r"src\image\main_stage\skip ok.png", clicks r"src\image\home\retry.png",
+      then loops until back on r"src\image\main_stage\main stage.png", a
+      tutorial skip (r"src\image\tutorial\skip.png"), a loss screen
+      (r"src\image\main_stage\lose cancel.png" + r"src\image\main_stage\resume for free.png"),
+      or a level-up tutorial (r"src\image\main_stage\level17.png" with level
+      in [17, 18, 20, 40] OCR'd from r"src\image\main_stage\level"), clicking
+      next/start buttons and r"src\image\main_stage\puzzle ok.png" along the
+      way (lines 1508-1568).
+    - If lost: if currentLostCount >= LOSTCOUNT returns "lost" (line 1574),
+      else upgradeCrystal() (line 1576).
+    - Runs stage-specific tutorials on win: tutorialLevel17 (levels 17/18),
+      tutorial2 (stage 2 / foundSkip), tutorial5 (stage 5), tutorial10
+      (stage 10, if r"src\image\home\choose a new ranger.png"), tutorial12
+      (stage 12), tutorial15 (stage 15), tutorial29 (stage 29), retryNextOk
+      (stage 31); goToHome() for level 20 / levels 3-12 (lines 1578-1620).
+    - Finally waitLoading(), updateFileInExecute(), logs
+      f"End Main Stage At Stage:{STAGENUMBER}" and returns "end" (lines 1622-1626).
+    - On any exception: updateFileInExecute(), logs
+      f"Exception in play main stage:\n{e}", captureScreenError(str(e)),
+      prints traceback; implicit None (lines 1627-1633).
+
+Literal strings / dependencies:
+    - r"src\image\main_stage\main stage.png", r"src\image\go_to\main stage.png",
+      r"src\image\main_stage\stage30.png", r"src\image\main_stage\stage change.png",
+      r"src\image\main_stage\stage 1.png", r"src\image\main_stage\stage2.png",
+      r"src\image\main_stage\stage.png", r"src\image\main_stage\tutorial leonard loop.png",
+      r"src\image\main_stage\numS", r"src\image\main_stage\auto on.png",
+      r"src\image\main_stage\auto.png", r"src\image\main_stage\x2.png",
+      r"src\image\special_stage\loop.png", r"src\image\main_stage\add.png",
+      r"src\image\main_stage\skip ok.png", r"src\image\main_stage\item checkbox.png",
+      r"src\image\main_stage\start.png", r"src\image\main_stage\next.png",
+      r"src\image\main_stage\win.png", r"src\image\main_stage\lose cancel.png",
+      r"src\image\main_stage\auto in game.png", r"src\image\home\UnKnown error.png",
+      r"src\image\home\retry.png", r"src\image\tutorial\skip.png",
+      r"src\image\main_stage\resume for free.png",
+      r"src\image\main_stage\tutorial leonard retry ok next.png",
+      r"src\image\main_stage\clear bonus retry.png",
+      r"src\image\main_stage\clear bonus next.png", r"src\image\main_stage\level17.png",
+      r"src\image\main_stage\level", r"src\image\home\skip.png",
+      r"src\image\main_stage\puzzle ok.png", r"src\image\home\close.png",
+      r"src\image\home\back.png", r"src\image\main_stage\tutorial james.png",
+      r"src\image\home\choose a new ranger.png"
+    - Fixed coordinates: (551, 406), (275, 515), (375, 515), (475, 515),
+      (575, 515), (675, 515), (345, 380), (150, 510), (775, 510), (480, 165),
+      and globals slotItem1..slotItem5 = (45, 50), (115, 50), (185, 50),
+      (255, 50), (295, 50)
+    - Uses globals: GAMEID, STAGENUMBER, HIGHERSTAGE, cooldowncapturescreen,
+      AUTOMODE, BUYFRIEND, LOSTCOUNT, AUTOUSEITEM; calls findStageHigher(),
+      findStageAtNumber(), numberOCR(), tutorialClickLoop(), skip(), buyFriend(),
+      upgradeCrystal(), tutorialLevel17/2/5/10/12/15/29(), retryNextOk(),
+      goToHome(), updateFileInExecute(), captureScreenError().
+
+Returns:
+    "lost" (line 1353, when HIGHERSTAGE < 150 and number not in [1, 2];
+    line 1574, when currentLostCount >= LOSTCOUNT);
+    None (line 1504, when closeGame is True; and on exception);
+    "end" (line 1626, normal completion).
+
+====================================================================
+DEVICE / ADB / CONNECT FUNCTIONS CALLED BY THE FOUR
+====================================================================
+setUp(deviceSerial) — line 200:
+    def setUp(deviceSerial):
+    - Creates/uses the module-level adb client:
+        client = AdbClient(host="127.0.0.1", port=5037)   (line 30)
+    - Iterates client.devices() and picks the device whose serial ends with
+      the same last 4 characters: if dev.serial[-4:] == deviceSerial[-4:]
+      (line 213); sets global DEVICE = dev.
+    - DEVICESERIAL = DEVICE.serial.replace(":", "_") (line 216).
+    - Connects uiautomator2: U2DEVICE = u2.connect(DEVICE.serial) (line 224),
+      falling back to U2DEVICE = None on failure.
+    - Loads config from "src\config.ini" (line 231), "src\configRangers.ini"
+      (line 282) and "src\configGears.ini" (line 286).
+
+autoSetUp(deviceSerial) — line 3669:
+    def autoSetUp(deviceSerial):
+    - Calls setUp(deviceSerial) then runs its own open-game loop (not called
+      by the four functions above, but the main device-setup entry point).
+
+force_stop_app(app) — line 1692 (helper used by force_stop_LINE_Rangers):
+    def force_stop_app(app):
+    - command = f"am force-stop {app}"; DEVICE.shell(command); wait(1)
+
+Device / serial / port targeted (literal strings):
+    - ADB server: AdbClient(host="127.0.0.1", port=5037)  (line 30)
+    - Target emulator device serial: "127.0.0.1:16416"
+      (passed to setUp in the __main__ block, lines 6932 and 6935)
+    - Emulator: MuMu (nemu) — nemu_capture is imported (line 19) and
+      usenemu = True (line 97); the comment at line 105 references "MuMu restart".
+    - On setUp failure the __main__ block calls setup_emulators(), imported
+      from a separate module: from ADB import setup_emulators (line 6929).
+
+====================================================================
+__main__ BLOCK
+====================================================================
+Yes — lines 6929-6942 (import at 6929, block at 6930):
+
+    6929: from ADB import setup_emulators
+    6930: if __name__ == "__main__":
+    6931:     try:
+    6932:         setUp("127.0.0.1:16416")
+    6933:     except:
+    6934:         setup_emulators()
+    6935:         setUp("127.0.0.1:16416")
+    6936:
+    6937:     randomGachaGear
+    6938:     read_RB_TK()
+    6939:     openLineRangers
+    6940:
+    6941:     startBotPlayMainStage30_100_150
+    6942:     playMainStageAtNumber(number=1)
+
+Note: lines 6937, 6939 and 6941 reference function objects without calling
+them (no parentheses), so only read_RB_TK() and playMainStageAtNumber(number=1)
+actually execute in the __main__ block.

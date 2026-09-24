@@ -1,0 +1,15 @@
+﻿invenId,unitCode,name,level,maxLevel,evolution,locked,talentGrade
+1941764827,u32-brown,brown,1,60,base,False,0
+1941764829,u37-moon,moon,2,30,base,False,0
+1941764830,u38-cony,cony,2,40,base,False,0
+1941764831,u45-james,james,1,60,base,False,0
+1941767153,u37-moon,moon,1,30,base,False,0
+1941768198,u021e-brown,brown,1,80,evolved,False,0
+1941768199,u395e-moon,moon,1,80,evolved,False,0
+1941768200,u321e-cony,cony,1,80,evolved,False,0
+1941768201,u095e-james,james,1,80,evolved,False,0
+1941768372,u2030e-jessica,jessica,1,80,evolved,False,0
+1941772343,u001s-leonard,leonard,1,20,special,False,0
+1941774429,u1578e-bz,bz,1,120,evolved,False,0
+2054310428,u1625e-na,na,1,120,evolved,False,0
+2054311504,u1073e-brown,brown,1,120,evolved,False,0

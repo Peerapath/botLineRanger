@@ -55,3 +55,10 @@ bot/src/image/
 # One-off captures kept next to the code while reversing an endpoint.
 bot/enter_dump.json
 tools/lfac_probe.txt
+
+# Local Claude Code profile for the qwen gateway - holds a live ANTHROPIC_AUTH_TOKEN.
+.claude-9arm.json
+# Written by the engine at runtime (client_version learns App-Version / prefix) - state, not source.
+bot/src/api_version.json
+# PyArmor crash reports.
+*.bug.log
