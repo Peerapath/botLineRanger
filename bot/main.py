@@ -65,15 +65,19 @@ except ImportError:
 
 # All available play modes (will be filtered based on subscription)
 ALL_PLAY_MODE_OPTIONS = {
+    "🎯 GenID": "ranger_api_GenID",
     "🎮 Login": "ranger_api_Login",
     "🎮 Login Lv3": "ranger_api_Level3",
-    "🎯 GenID": "ranger_api_GenID",
-    "🎯 Stage": "ranger_api_Stage",
+    "🎯 Login Stage": "ranger_api_Stage",
+    "🎯 Login Quest": "ranger_api_Quest",
 }
 
 # Composite modes ที่ต้องการหลาย mode เป็น prerequisite
+# Quest = Stage + ข้ามการสอน + ทำเควสมือใหม่ ใช้สิทธิ์ subscription ตัวเดียวกับ Stage
+# (license API ยังไม่รู้จักโหมดนี้ ตอน verify จะส่ง prerequisite ตัวแรกที่ผู้ใช้มีสิทธิ์ไปแทน)
 COMPOSITE_MODE_REQUIREMENTS = {
     "test": ["test1", "test2"],
+    "ranger_api_Quest": ["ranger_api_Stage"],
 }
 
 
@@ -558,6 +562,19 @@ class EmulatorManager(ctk.CTk):
             except Exception:
                 pass
             try:
+                # เหมือน stageend: ค่าที่ไม่ใช่ตัวเลขไม่เขียนลงไฟล์ (engine_main อ่านเป็น float)
+                stage_delay = float(str(self.stage_delay.get()).strip())
+                self.config["settings"]["stagedelay"] = "%g" % max(0.0, min(stage_delay, 60.0))
+            except Exception:
+                pass
+            try:
+                # winfo_exists(): ช่องนี้มีแค่ในโหมด Stage พอสลับโหมดตัวเก่าถูก destroy แต่ .get()
+                # ยังคืนค่าสุดท้ายได้ - กันไว้ไม่ให้โหมดอื่นเขียนค่าของ Stage ทับ
+                if self.newbie_quest.winfo_exists():
+                    self.config["settings"]["newbiequest"] = str(bool(self.newbie_quest.get()))
+            except Exception:
+                pass
+            try:
                 self.config["settings"]["autouseitem"] = str(self.auto_use_item.get())
             except Exception:
                 pass
@@ -710,6 +727,8 @@ class EmulatorManager(ctk.CTk):
             ctk.CTkLabel(self.mode_specific_frame, text="🎯 สร้างไอดีใหม่เลเวล3").pack(pady=3)
         elif mode_key == "ranger_api_Stage":
             ctk.CTkLabel(self.mode_specific_frame, text="🎯 ดันด่านไอดีจาก input/").pack(pady=3)
+        elif mode_key == "ranger_api_Quest":
+            ctk.CTkLabel(self.mode_specific_frame, text="🎯 ข้ามการสอน + ดันด่าน + ทำเควสมือใหม่").pack(pady=3)
         elif mode_key == "AutoSetup":
             ctk.CTkLabel(self.mode_specific_frame, text="🛠 Auto Setup").pack(pady=3)
         else:
@@ -842,8 +861,9 @@ class EmulatorManager(ctk.CTk):
             self.rgacha_cycles.pack(side="left")
             self.rgacha_cycles.bind("<KeyRelease>", self.debounce_save)
 
-        elif mode_key == "ranger_api_Stage":
+        elif mode_key in ("ranger_api_Stage", "ranger_api_Quest"):
             # ด่านเป้าหมาย: ดันจากด่านที่ไอดีนั้นค้างอยู่ ไปจนถึงเลขนี้ (เซฟลง settings.stageend)
+            # Quest ใช้ช่องเดียวกัน - เควสมือใหม่ต้องดันถึง 150 ก่อนถึงจะไล่ได้ครบ
             btn_stageend_frame = ctk.CTkFrame(self.mode_specific_frame)
             btn_stageend_frame.pack(fill="x", pady=3)
             ctk.CTkLabel(btn_stageend_frame, text="เล่นถึงด่าน").pack(side="left", padx=(0, 5))
@@ -854,9 +874,42 @@ class EmulatorManager(ctk.CTk):
                 self.stage_end.insert(0, "150")
             self.stage_end.pack(side="left")
             self.stage_end.bind("<KeyRelease>", self.debounce_save)
-            ctk.CTkLabel(self.mode_specific_frame,
-                         text="ดันด่านผ่าน API ล้วน (ไม่เปิดเกม) เริ่มจากด่านที่ไอดีนั้นค้างอยู่\n"
-                              "จบแล้วส่งไฟล์ออก output/ พร้อมเลเวลใหม่ในชื่อไฟล์",
+
+            # ดีเลย์ระหว่างด่าน (settings.stagedelay) 0 = เร็วสุด - rate limit มีตัวคุมใน rangers_api อยู่แล้ว
+            # ช่องนี้ไว้ชะลอเองถ้าอยากให้ดูเป็นธรรมชาติขึ้น
+            btn_stagedelay_frame = ctk.CTkFrame(self.mode_specific_frame)
+            btn_stagedelay_frame.pack(fill="x", pady=3)
+            ctk.CTkLabel(btn_stagedelay_frame, text="ดีเลย์ระหว่างด่าน (วินาที)").pack(side="left", padx=(0, 5))
+            self.stage_delay = ctk.CTkEntry(btn_stagedelay_frame, placeholder_text="0", width=50, height=20)
+            self.stage_delay.insert(0, self.config.get("settings", "stagedelay", fallback="0"))
+            self.stage_delay.pack(side="left")
+            self.stage_delay.bind("<KeyRelease>", self.debounce_save)
+
+            if mode_key == "ranger_api_Stage":
+                # ติ๊กแล้ว = ดันด่านเสร็จทำเควสมือใหม่ต่อเลย (ชุดเดียวกับ Login Quest) เซฟลง settings.newbiequest
+                btn_newbiequest_frame = ctk.CTkFrame(self.mode_specific_frame)
+                btn_newbiequest_frame.pack(fill="x", pady=3)
+                self.newbie_quest = ctk.CTkCheckBox(
+                    btn_newbiequest_frame,
+                    text="ทำเควสมือใหม่ต่อ (ข้ามการสอน + SPECIAL QUEST 29 เควส)",
+                    onvalue=True, offvalue=False,
+                    command=self.debounce_save
+                )
+                if self.config.getboolean("settings", "newbiequest", fallback=False):
+                    self.newbie_quest.select()
+                else:
+                    self.newbie_quest.deselect()
+                self.newbie_quest.pack(side="left", padx=(0, 5), pady=3)
+
+            if mode_key == "ranger_api_Quest":
+                note = ("ล๊อกอินไอดีเก่าจาก input/ -> ข้ามการสอนทั้งหมด -> ดันด่านถึงเลขด้านบน\n"
+                        "-> ทำเควสมือใหม่ (SPECIAL QUEST 29 เควส) เท่าที่ API ทำได้ ผ่าน API ล้วน\n"
+                        "เควสที่ต้องกดในเกม (เปิดสมบัติ/ซื้อบูสต์ EXP/กิลด์/เรด/แล็บ/ล็อกอิน 3 วัน) บอทจะหยุดตรงนั้นแล้วส่งไฟล์ออก")
+            else:
+                note = ("ดันด่านผ่าน API ล้วน (ไม่เปิดเกม) เริ่มจากด่านที่ไอดีนั้นค้างอยู่\n"
+                        "จบแล้วส่งไฟล์ออก output/ พร้อมเลเวลใหม่ในชื่อไฟล์\n"
+                        "ติ๊กทำเควสต่อ = ข้ามการสอน + ทำเควสมือใหม่หลังดันด่าน เหมือนโหมด Login Quest")
+            ctk.CTkLabel(self.mode_specific_frame, text=note,
                          text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=5, pady=(2, 3))
 
         elif mode_key == "AutoSetup":
@@ -1277,15 +1330,18 @@ class EmulatorManager(ctk.CTk):
     def _isStageMode(self):
         return self._currentModeKey() == "ranger_api_Stage"
 
+    def _isQuestMode(self):
+        return self._currentModeKey() == "ranger_api_Quest"
+
     def _isHeadlessThreadMode(self):
-        """โหมดที่รันแบบ headless หลาย thread (ไม่ผูก device): Login + GenID + Stage
+        """โหมดที่รันแบบ headless หลาย thread (ไม่ผูก device): Login + GenID + Stage + Quest
 
         ทุกโหมดนี้ไม่แตะ adb/เกม: Login relogin จากไฟล์ input, GenID mint บัญชีใหม่เอง,
-        Stage relogin จากไฟล์ input แล้วดันด่านผ่าน API จึงใช้แผงตั้งจำนวน thread +
+        Stage/Quest relogin จากไฟล์ input แล้วดันด่าน/ทำเควสผ่าน API จึงใช้แผงตั้งจำนวน thread +
         สปอว์น worker ชุดเดียวกัน (ต่างกันแค่ฟังก์ชันที่ worker เรียก)
         """
         return self._currentModeKey() in ("ranger_api_Login", "ranger_api_Level3", "ranger_api_GenID",
-                                          "ranger_api_Stage")
+                                          "ranger_api_Stage", "ranger_api_Quest")
 
     def render_left_panel(self):
         """เลือกเนื้อหาแผงซ้ายตามโหมด: ตอนนี้ทุกโหมดใน ALL_PLAY_MODE_OPTIONS เป็น headless
@@ -1303,6 +1359,7 @@ class EmulatorManager(ctk.CTk):
 
         isGen = self._isGenIDMode()
         isStage = self._isStageMode()
+        isQuest = self._isQuestMode()
         header = ctk.CTkFrame(self.left_frame, fg_color="#303030")
         header.pack(fill="x", padx=4, pady=(6, 3))
         header_text = "⚙ จำนวน Thread (headless)"
@@ -1310,6 +1367,8 @@ class EmulatorManager(ctk.CTk):
             header_text = "🎯 จำนวน Thread สร้างไอดี"
         elif isStage:
             header_text = "🎯 จำนวน Thread ดันด่าน"
+        elif isQuest:
+            header_text = "🎯 จำนวน Thread ดันด่าน+เควส"
         ctk.CTkLabel(header, text=header_text, anchor="w").pack(side="left", padx=6)
 
         ctrl = ctk.CTkFrame(self.left_frame, fg_color="#303030")
@@ -1332,6 +1391,9 @@ class EmulatorManager(ctk.CTk):
             hint = "แต่ละ thread สร้างบัญชีใหม่เอง (mint + signup) ส่งออกลง output/ ไม่กินไฟล์ input"
         elif isStage:
             hint = "แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วดันด่านผ่าน API (ไม่เปิดเกม)"
+        elif isQuest:
+            hint = ("แต่ละ thread หยิบไฟล์จาก input/ แบ่งกันเอง แล้วข้ามการสอน ดันด่าน และทำเควสมือใหม่ผ่าน API\n"
+                    "ดันด่าน 150 ด่านใช้เวลาหลายนาทีต่อไอดี (ตั้งดีเลย์ระหว่างด่านได้ในแผงตั้งค่าโหมด)")
         ctk.CTkLabel(self.left_frame, text=hint,
                      text_color="gray", anchor="w", justify="left", wraplength=300).pack(fill="x", padx=8, pady=(2, 6))
 

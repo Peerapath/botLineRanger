@@ -132,3 +132,19 @@ def test_ranger_targets_stay_strings_not_booleans(tmp_path):
     cfg = engine_main.load_config(settings, rangers)
 
     assert cfg["_rangers_config"]["u1617e-ka"] == "คาฟก้า"
+
+
+def test_the_stage_quest_box_is_a_real_bool_not_the_string_false(tmp_path):
+    """Same trap as useruby: bool("False") is True, so an un-coerced newbiequest = False would
+    turn every plain Stage run into a quest run."""
+    settings = _write(tmp_path / "config.ini", "[settings]\nnewbiequest = False\n")
+    assert engine_main.load_config(settings)["newbiequest"] is False
+
+
+def test_stage_delay_is_a_float_and_a_bad_value_falls_back_to_the_default(tmp_path):
+    good = _write(tmp_path / "a.ini", "[settings]\nstagedelay = 1.5\n")
+    assert engine_main.load_config(good)["stagedelay"] == 1.5
+    negative = _write(tmp_path / "b.ini", "[settings]\nstagedelay = -3\n")
+    assert engine_main.load_config(negative)["stagedelay"] == 0.0
+    bad = _write(tmp_path / "c.ini", "[settings]\nstagedelay = fast\n")
+    assert "stagedelay" not in engine_main.load_config(bad)

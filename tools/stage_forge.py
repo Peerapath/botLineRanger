@@ -30,7 +30,9 @@ level 1 -> 86, no heart ever ran out):
      atw is optional (absent/"0"/"" still win), but a value below the tower HP is rejected (102205).
   3. POST /stage/save/{battleSn}/{stc}?reqId=<unix>, compact + key-sorted JSON, no sooner than pt
      after the enter: a save that claims more play time than really passed gets 400/102205 (battle
-     stays open, no heart spent, the same battleSn can be re-posted later). We wait pt+0.5 s.
+     stays open, no heart spent, the same battleSn can be re-posted later). We count pt from the
+     moment the enter was SENT (the enter round trip itself eats most of it - measured 2026-09-24,
+     saving right after the enter response was accepted 6/6); on a 102205 we re-post after pt+0.5 s.
   A win is battleResult.isCleared == true. A loss is a 200 with that key absent and rewardExp 0 -
   and it still costs a heart.
   The server keeps pt as the stage's firstClearSec/minClearSec, so the default pt=1 leaves a
@@ -226,6 +228,12 @@ def cancel(cookie: str, battle_sn, stc: str):
 
 def clear_stage(cookie: str, stc: str, rsn: str, pt: int = 1) -> tuple[bool, dict]:
     """Enter -> wait pt -> save one stage. Returns (cleared, info)."""
+    # pt counts from the moment we START the enter, not from its response: the server stamps the
+    # battle while handling the enter, and enter itself takes ~0.5-1 s, so by the time the response is
+    # back most of pt has already passed. Measured 2026-09-24: saves posted with NO wait after the enter
+    # response were accepted 6/6 (0 x 102205), and margins 0.0-0.5 s after the response made no
+    # difference either - the old fixed pt+0.5 s after the response was pure dead time per stage.
+    started = time.time()
     status, result, error = enter(cookie, stc)
     if not result.get("battleSn"):
         info = {"stage": stc, "step": "enter", "http": status, "errorCode": error}
@@ -243,12 +251,11 @@ def clear_stage(cookie: str, stc: str, rsn: str, pt: int = 1) -> tuple[bool, dic
     if result.get("isEnterable") is False or (player.get("hearts") and hearts(player) < 1):
         cancel(cookie, result["battleSn"], stc)
         return False, {"stage": stc, "step": "hearts", "http": status, "wait_s": heart_wait(player)}
-    # time from the enter that issued this battleSn - enter's own retries/fallback must not eat the margin
-    entered = time.time()
     body = build_save_body(result, stc, rsn, pt)
     path = "/stage/save/%s/%s" % (result["battleSn"], stc)
+    ready_at = started + pt
     for _ in range(3):
-        wait = entered + pt + 0.5 - time.time()
+        wait = ready_at - time.time()
         if wait > 0:
             time.sleep(wait)
         status, data = call(cookie, "%s?reqId=%d" % (path, int(time.time())), "POST", body)
@@ -256,8 +263,8 @@ def clear_stage(cookie: str, stc: str, rsn: str, pt: int = 1) -> tuple[bool, dic
         if error != ERR_BAD_BATTLE and ratelimit.is_app_429(status, data) is None:
             break
         # 102205 or a per-account rate-limit rejection: the battle is still open and no heart was
-        # spent, so wait the margin again and re-post the same battleSn
-        entered = time.time()
+        # spent, so fall back to the old, safe margin (pt + 0.5 s from now) and re-post the same battleSn
+        ready_at = time.time() + pt + 0.5
     battle = _result(data).get("battleResult") or {}
     after = battle.get("afterRewardPlayer") or {}
     info = {"stage": stc, "step": "save", "http": status,

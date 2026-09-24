@@ -689,3 +689,19 @@ def test_stop_bot_processes_force_false_drains_instead_of_killing(tmp_path):
             "force=False must write the stop flag so the engine actually hears the request")
     finally:
         release.set()
+
+
+# --- play modes: every dropdown entry must reach a real engine flow ----------------------
+
+def test_every_play_mode_the_dropdown_offers_has_an_engine_flow():
+    """A mode the GUI offers but engine/flows.py does not know spawns an engine that dies
+    at flows.run's ValueError on the first account - the user clicks Start and gets a run
+    of nothing but FAIL rows."""
+    from engine import flows
+    assert set(main.ALL_PLAY_MODE_OPTIONS.values()) <= set(flows.MODES)
+
+
+def test_login_quest_is_offered_to_anyone_licensed_for_stage():
+    """The license API does not know ranger_api_Quest yet - without the composite rule the
+    mode would never appear in the dropdown for a non-whitelisted user."""
+    assert main.COMPOSITE_MODE_REQUIREMENTS["ranger_api_Quest"] == ["ranger_api_Stage"]

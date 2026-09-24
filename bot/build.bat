@@ -95,9 +95,9 @@ REM engine (package): tested by hand before writing this line - pyarmor gen DOES
 REM package directory alongside flat scripts (verified with pyarmor 9.2.5), so engine/*.py
 REM gets obfuscated too instead of being left as plain source next to obfuscated callers.
 REM
-REM ..\tools\*.py (12 files): the reverse-engineered API layer - rangers_api, client_version, relogin,
+REM ..\tools\*.py (13 files): the reverse-engineered API layer - rangers_api, client_version, relogin,
 REM rewards, device_session, account_file, ratelimit, gacha, pull_roster, stage_forge,
-REM new_account, tutorial. Used to ship unobfuscated (xcopy'd beside the exe below - now
+REM new_account, tutorial, newbie_quest (Login Quest mode - engine/flows.py _newbie_quest). Used to ship unobfuscated (xcopy'd beside the exe below - now
 REM removed) because they live outside bot/ and PyInstaller could never resolve the bare
 REM `import rangers_api` etc. it found in engine/*.py against them. Tested by hand: pyarmor
 REM gen writes every input flat into --output regardless of its source directory (e.g.
@@ -107,8 +107,8 @@ REM where BotLineRanger.spec's pathex=['.', 'dist_pyarmor'] and hiddenimports ex
 REM top-level module - see that file's own comment on the hiddenimports entries.
 REM
 REM Deliberately NOT here: device_snapshot, export_account, extract_battles, gifts,
-REM newbie_quest, ratelimit_probe, sevendays, summarize. grep confirms nothing in bot/, and
-REM nothing in the 12 modules above, imports any of them - they are CLI-only and must not
+REM ratelimit_probe, sevendays, summarize. grep confirms nothing in bot/, and
+REM nothing in the 13 modules above, imports any of them - they are CLI-only and must not
 REM ship at all, obfuscated or not (extract_battles also imports mitmproxy, not installed
 REM in this build environment, so including it would break this very step).
 pyarmor gen --output dist_pyarmor ^
@@ -116,7 +116,7 @@ pyarmor gen --output dist_pyarmor ^
     ..\tools\account_file.py ..\tools\client_version.py ..\tools\device_session.py ..\tools\gacha.py ^
     ..\tools\new_account.py ..\tools\pull_roster.py ..\tools\rangers_api.py ^
     ..\tools\ratelimit.py ..\tools\relogin.py ..\tools\rewards.py ..\tools\stage_forge.py ^
-    ..\tools\tutorial.py
+    ..\tools\tutorial.py ..\tools\newbie_quest.py
 
 if %errorlevel% neq 0 (
     echo ERROR: PyArmor obfuscation failed!
@@ -195,7 +195,7 @@ if exist "src\image\home" xcopy "src\image\home" "dist\BotLineRanger\src\image\h
 
 REM tools/ is no longer copied here - the API layer (rangers_api/relogin/rewards/
 REM device_session/account_file/ratelimit/gacha/pull_roster/stage_forge/new_account/
-REM tutorial) is now obfuscated by the pyarmor gen step above and bundled into the exe via
+REM tutorial/newbie_quest) is now obfuscated by the pyarmor gen step above and bundled into the exe via
 REM BotLineRanger.spec's hiddenimports, instead of shipping as plain, readable .py beside
 REM it. Do not resurrect this xcopy - that is exactly the source leak this build hardens.
 

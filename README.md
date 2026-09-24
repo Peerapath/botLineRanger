@@ -340,6 +340,30 @@ python tools\stage_forge.py --xml bot\input\40d2cf61.xml --to 80 --confirm
 ช่อง "เล่นถึงด่าน" (เซฟเป็น `settings.stageend`) → ส่งออก `output/` พร้อม Lv ใหม่ในชื่อไฟล์
 (ไอดีที่โดนตีธง 102204 จะถูกย้ายไป `login failed/` แทน) โหมดจะโผล่ใน dropdown ก็ต่อเมื่อ
 license API คืน `ranger_api_Stage` มาใน `allowed_modes` (อีเมล whitelist = เห็นทุกโหมด)
+- ติ๊ก **"ทำเควสมือใหม่ต่อ"** (`settings.newbiequest`) = ดันด่านเสร็จแล้วทำต่อแบบ Login Quest ทุกอย่าง
+  (ข้ามการสอน → ดันด่าน → SPECIAL QUEST)
+- **ดีเลย์ระหว่างด่าน** (`settings.stagedelay`, ใช้ร่วมกับ Login Quest) ค่าเริ่มต้น 0 — rate limit ทั้งสองชั้นมีตัวคุมใน
+  `rangers_api` อยู่แล้ว เดิม engine พัก 3 วิ (+สุ่มถึง 1 วิ) ทุกด่านตามค่า `--delay` ของ CLI
+- `stage_forge.clear_stage` นับ `pt` จากตอนยิง enter แทนตอนได้คำตอบ (เดิมรอ pt+0.5 วิหลังคำตอบ = ~1.5 วิเสียเปล่า
+  ทุกด่าน) — วัดสด 2026-09-24: save ทันทีหลังคำตอบ enter ผ่าน 6/6 ไม่มี 102205 เลย; ถ้าเจอ 102205
+  จะถอยไปรอ pt+0.5 วิแล้วยิง battleSn เดิมซ้ำ (ไม่เสีย heart)
+
+**🎯 Login Quest** (`ranger_api_Quest`, เพิ่ม 2026-09-24) = `run_quest` ใน `bot/engine/flows.py`:
+หยิบไอดีเก่าจาก `input/` → relogin → **ข้ามการสอนทั้งหมด** (`GET /tutorial/confirm/<STEP>` เฉพาะขั้นที่
+`/login` คืนมาใน `tutorialStep` ว่ายังค้าง ไอดีที่ข้ามแล้วไม่เสีย request ซ้ำ; SALLY/YELLOW_STONE ถูกปฏิเสธเสมอ
+= 65/67 ปกติ) → ดันด่านถึงเลขในช่อง "เล่นถึงด่าน" (`settings.stageend` ช่องเดียวกับ Stage ค่าเริ่มต้น 150) →
+ไล่ SPECIAL QUEST (NEWBI 29 เควส ผ่าน `tools/newbie_quest.walk`) → ดึง `/home` ใหม่ (รูบี้จากหลักไมล์เข้าชื่อไฟล์)
+→ ส่งออก `output/` ไม่รับของ/ไม่สุ่มกาชา
+- **ผลทดสอบสด 2026-09-24** (guest ใหม่ยังไม่ข้ามการสอน, 1 thread): ข้ามการสอน + ดัน st01→st150 ครบ
+  (Lv1→88) ใช้เวลารวม ~24 นาทีต่อไอดี (จังหวะเดิม: พัก 3 วิ/ด่าน + รอ 1.5 วิหลัง enter) แต่เควสได้แค่ **4/29** — หยุดที่ idx4 `treasure` (ar01, `stalled`)
+  เพราะดันด่านผ่าน ar01 ไปก่อนเควสนี้จะเป็นเควสปัจจุบัน สมบัติ ar01 จึงต้องเปิดในเกมเอง (แบบเดียวกับ idx21
+  ในรอบก่อน) — การหยุดตรงนั้นไม่นับเป็น error ไอดีส่งออก `output/` ปกติ
+- แถวของแต่ละไอดีใน log ต่อท้ายด้วยสรุป เช่น `err=quest 18/29 blocked@idx18 exp_booster`
+  (ช่อง `err` ของ engine เป็นช่องข้อความเดียวที่มี ไม่ใช่ความผิดพลาด) ถ้าดันด่านไม่ถึงเป้าจะขึ้น `stage stop=hearts` ฯลฯ นำหน้า
+- ไอดีที่โดนตีธง 102204 ระหว่างดันด่านไป `login failed/` และไม่ทำเควสต่อ; retry ไม่ดันด่าน/ข้ามการสอนซ้ำ
+  ยกเว้นโทเค็นตายกลางทาง (ดันต่อจากด่านที่ค้างหลัง relogin)
+- สิทธิ์: ใช้ subscription ตัวเดียวกับ Stage ผ่าน `COMPOSITE_MODE_REQUIREMENTS` (license API ยังไม่รู้จักชื่อนี้)
+- build: `tools/newbie_quest.py` ถูกเพิ่มเข้า pyarmor + `hiddenimports` แล้ว (เดิมเป็น CLI-only ไม่ได้ ship)
 
 **🎮 Login Lv3** (`ranger_api_Level3`, เพิ่ม 2026-09-23) = Login ทุกอย่างเหมือนเดิม แต่หลัง relogin จะเช็คเลเวล:
 ถ้ายังไม่ถึง `settings.leveltarget` (ค่าเริ่มต้น 3) จะเล่น st01 ซ้ำผ่าน API (`stage_forge.level_up`) จนถึง

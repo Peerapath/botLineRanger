@@ -23,9 +23,10 @@ import rangers_api  # noqa: E402
 import relogin      # noqa: E402
 import client_version  # noqa: E402
 
-BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby")
+BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby", "newbiequest")
 INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthreads",
         "gachacycles", "threadcount")
+FLOATS = ("stagedelay",)
 
 # C4 (final review): "useruby" used to be missing from BOOLS. cfg["useruby"] then stayed the
 # raw ini STRING "False" all the way to flows.py's bool(cfg.get("useruby", False)) -  and
@@ -110,6 +111,12 @@ def load_config(path, rangers_path=None, mode=None):
                 cfg[key] = int(cfg[key])
             except ValueError:
                 del cfg[key]        # ค่าเสีย = ใช้ค่าปริยาย ไม่ใช่ล้มทั้ง engine
+    for key in FLOATS:
+        if key in cfg:
+            try:
+                cfg[key] = max(0.0, float(cfg[key]))
+            except ValueError:
+                del cfg[key]        # เหมือน INTS: ค่าเสีย = ใช้ค่าปริยาย
     # รายชื่อ ranger เป้าหมาย - เคยเป็น global RANGERSCONFIG ใน botLineRanger ตอนนี้เดินทาง
     # ไปกับ cfg เพื่อให้ flows ไม่ต้องอ่านอะไรจากระดับโมดูล
     if rangers_path and os.path.isfile(rangers_path):

@@ -107,7 +107,8 @@ def test_genid_does_not_claim_a_file_from_the_queue(tmp_path, monkeypatch):
 def test_every_mode_in_the_gui_has_a_flow():
     """โหมดที่ dropdown เสนอแต่ engine ไม่รู้จัก = ผู้ใช้กดแล้วไม่เกิดอะไรขึ้น"""
     assert set(flows.MODES) == {
-        "ranger_api_Login", "ranger_api_Level3", "ranger_api_GenID", "ranger_api_Stage"}
+        "ranger_api_Login", "ranger_api_Level3", "ranger_api_GenID", "ranger_api_Stage",
+        "ranger_api_Quest"}
 
 
 def test_adding_a_fifth_mode_needs_nothing_but_a_new_entry(tmp_path, monkeypatch):
@@ -572,3 +573,272 @@ def test_genid_ignores_account_claims_even_when_present(tmp_path, monkeypatch):
 
     assert "gacha" in calls
     assert out.status == "OK"
+
+
+# --- Login Quest (ranger_api_Quest): relogin -> skip tutorial -> push stages -> NEWBI quests ---
+
+def quest_stub(monkeypatch, calls, stage="done", quest="quest 18/29 blocked@idx18 exp_booster"):
+    stub(monkeypatch, calls)
+    monkeypatch.setattr(flows, "_skip_tutorial", lambda s: (calls.append("tutorial"), (65, 67))[1])
+    monkeypatch.setattr(flows, "_force_stage", lambda s, cfg: (calls.append("stage"), stage)[1])
+    monkeypatch.setattr(flows, "_newbie_quest", lambda s: (calls.append("quest"), quest)[1])
+
+
+def test_quest_skips_tutorial_then_pushes_stages_then_walks_quests_then_exports(tmp_path, monkeypatch):
+    """ลำดับตามที่ผู้ใช้สั่ง: ข้ามการสอนก่อน ดันด่านถึง 150 แล้วค่อยทำเควส (stage_special ติดเลเวล 20)
+    และ /home ต้องถูกดึงใหม่หลังเควส - ruby ในชื่อไฟล์ต้องรวมหลักไมล์ 50/150/200 ที่เพิ่งเคลม"""
+    calls = []
+    quest_stub(monkeypatch, calls)
+    out = flows.run("ranger_api_Quest", make(tmp_path), CFG)
+    assert calls == ["relogin", "home", "tutorial", "stage", "quest", "home", "info"]
+    assert out.dest == "output"
+    assert out.status == "OK"
+    assert out.error == "quest 18/29 blocked@idx18 exp_booster"
+
+
+def test_quest_does_not_claim_rewards_or_draw_gacha(tmp_path, monkeypatch):
+    """โหมดนี้ไม่ได้ขอให้รับของ/สุ่มกาชา - กาชาหักตั๋วจริง ห้ามติดมาเพราะ cfg ของโหมดอื่นเปิดไว้"""
+    calls = []
+    quest_stub(monkeypatch, calls)
+    flows.run("ranger_api_Quest", make(tmp_path), dict(CFG, gacharanger=True))
+    assert "claim" not in calls
+    assert "gacha" not in calls
+
+
+def test_quest_routes_a_flagged_push_to_login_failed_without_walking_quests(tmp_path, monkeypatch):
+    calls = []
+    quest_stub(monkeypatch, calls, stage="flagged")
+    out = flows.run("ranger_api_Quest", make(tmp_path), CFG)
+    assert out.dest == "login failed"
+    assert out.status == "FLAG"
+    assert "quest" not in calls
+
+
+def test_quest_a_short_stage_push_still_walks_quests_and_says_so(tmp_path, monkeypatch):
+    """heart หมด/ด่านล็อกกลางทางไม่ใช่เหตุให้ทิ้งไอดี แต่แถวของบัญชีต้องบอกว่าดันไม่ถึงเป้า"""
+    calls = []
+    quest_stub(monkeypatch, calls, stage="hearts")
+    out = flows.run("ranger_api_Quest", make(tmp_path), CFG)
+    assert "quest" in calls
+    assert out.dest == "output"
+    assert out.error == "stage stop=hearts; quest 18/29 blocked@idx18 exp_booster"
+
+
+def test_quest_a_retry_does_not_redo_the_tutorial_or_the_stage_push(tmp_path, monkeypatch):
+    """ดันด่านจ่าย heart จริงทุกด่าน - พังตอนทำเควสแล้ว retry ต้องไม่ดันซ้ำ"""
+    calls = []
+    quest_stub(monkeypatch, calls)
+    walks = []
+
+    def flaky_quest(s):
+        walks.append(s.attempts)
+        if len(walks) == 1:
+            raise RuntimeError("network down")
+        return "quest 18/29 blocked@idx18 exp_booster"
+
+    monkeypatch.setattr(flows, "_newbie_quest", flaky_quest)
+    out = flows.run("ranger_api_Quest", make(tmp_path), CFG)
+    assert walks == [1, 2]
+    assert calls.count("relogin") == 2
+    assert calls.count("tutorial") == 1
+    assert calls.count("stage") == 1
+    assert out.status == "OK"
+
+
+def test_quest_a_token_death_mid_push_retries_the_push(tmp_path, monkeypatch):
+    """"auth" = โทเค็นตายกลางทาง การดันยังไม่จบจริง ต้อง relogin แล้วดันต่อ ไม่ใช่ถือว่าจบแล้ว"""
+    calls = []
+    quest_stub(monkeypatch, calls)
+    reasons = iter(["auth", "done"])
+    monkeypatch.setattr(flows, "_force_stage", lambda s, cfg: (calls.append("stage"), next(reasons))[1])
+    out = flows.run("ranger_api_Quest", make(tmp_path), CFG)
+    assert calls.count("stage") == 2
+    assert calls.count("quest") == 1
+    assert out.status == "OK"
+    assert out.error == "quest 18/29 blocked@idx18 exp_booster"
+
+
+def test_quest_a_permanent_failure_from_relogin_is_attempted_exactly_once(tmp_path, monkeypatch):
+    quest_stub(monkeypatch, [])
+    attempts_seen = []
+
+    def boom(s):
+        attempts_seen.append(s.attempts)
+        raise flows.PermanentFailure("relogin rejected (HTTP 401)")
+
+    monkeypatch.setattr(flows, "_relogin", boom)
+    out = flows.run("ranger_api_Quest", make(tmp_path), CFG)
+    assert attempts_seen == [1]
+    assert out.dest == "login failed"
+    assert out.status == "FAIL"
+
+
+def test_skip_tutorial_fires_only_the_steps_login_says_are_pending(monkeypatch):
+    import tutorial
+
+    fired = []
+    monkeypatch.setattr(tutorial, "STEPS", ["START", "TEAM", "SALLY"])
+    monkeypatch.setattr(tutorial, "confirm", lambda cookie, step: (
+        fired.append(step), (step != "SALLY", 200, {}))[1])
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
+    s.cache["tutorial_steps"] = {"START": True, "TEAM": False, "SALLY": False}
+    assert flows._skip_tutorial(s) == (1, 2)
+    assert fired == ["TEAM", "SALLY"]
+
+
+def test_skip_tutorial_fires_every_step_without_a_map_from_login(monkeypatch):
+    import tutorial
+
+    fired = []
+    monkeypatch.setattr(tutorial, "STEPS", ["START", "TEAM"])
+    monkeypatch.setattr(tutorial, "confirm", lambda cookie, step: (fired.append(step), (True, 200, {}))[1])
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
+    assert flows._skip_tutorial(s) == (2, 2)
+    assert fired == ["START", "TEAM"]
+
+
+def test_skip_tutorial_stops_on_a_rejected_token(monkeypatch):
+    import tutorial
+
+    fired = []
+    monkeypatch.setattr(tutorial, "STEPS", ["START", "TEAM", "GACHA"])
+    monkeypatch.setattr(tutorial, "confirm", lambda cookie, step: (fired.append(step), (False, 401, {}))[1])
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
+    with pytest.raises(RuntimeError):
+        flows._skip_tutorial(s)
+    assert fired == ["START"]
+
+
+def test_relogin_keeps_the_tutorial_map_that_login_returns(tmp_path, monkeypatch):
+    import relogin as relogin_mod
+
+    class Pool:
+        def get(self): return "cc"
+        def renew(self, cc): return "cc"
+        def mark_proven(self): pass
+
+    class LaneWithPool(Lane):
+        cc_pool = Pool()
+
+    monkeypatch.setattr(relogin_mod, "read_account", lambda path: {
+        "udid": "u", "enc": "e", "nation": "TH", "language": "en", "text": "<map/>"})
+    monkeypatch.setattr(flows, "decrypt_lfac", lambda udid, enc: "guest")
+    monkeypatch.setattr(relogin_mod, "login", lambda cc, *a, **kw: (
+        200, {"rsn": "R", "level": 1, "tutorialStep": {"START": True}}, "lfac"))
+    monkeypatch.setattr(relogin_mod, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(relogin_mod, "replace_enc", lambda *a, **k: "")
+    s = make(tmp_path)
+    s.lane = LaneWithPool()
+    flows._relogin(s)
+    assert s.cache["tutorial_steps"] == {"START": True}
+
+
+def _pdq(claimed, total=29, current=None, current_type="exp_booster"):
+    contents = [{"index": i, "missionType": "stage_main", "receiveReward": i < claimed,
+                 "currentQuest": i == current} for i in range(total)]
+    if current is not None:
+        contents[current]["missionType"] = current_type
+    return {"contents": contents}
+
+
+def test_newbie_quest_walks_quietly_claims_the_milestone_and_summarises(monkeypatch):
+    """progress=print ของ walk จะลง stdout ซึ่งเป็นช่อง JSONL ของ GUI - ต้องส่ง _quiet เข้าไปเสมอ"""
+    import newbie_quest
+
+    seen = {}
+    reads = iter([(_pdq(0, current=0, current_type="stage_main"), 200),
+                  (_pdq(18, current=18), 200)])
+    monkeypatch.setattr(newbie_quest, "get_quest", lambda cookie: next(reads))
+
+    def fake_walk(cookie, confirm=True, **kw):
+        seen.update(kw, confirm=confirm)
+        return "blocked:exp_booster", list(range(18))
+
+    monkeypatch.setattr(newbie_quest, "walk", fake_walk)
+    monkeypatch.setattr(newbie_quest, "claim_special", lambda cookie: seen.setdefault("special", True))
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
+    assert flows._newbie_quest(s) == "quest 18/29 blocked@idx18 exp_booster"
+    assert seen["progress"] is flows._quiet
+    assert seen["confirm"] is True
+    assert seen["special"] is True
+
+
+def test_newbie_quest_on_an_account_without_the_chain_does_nothing(monkeypatch):
+    import newbie_quest
+
+    monkeypatch.setattr(newbie_quest, "get_quest", lambda cookie: ({}, 200))
+
+    def exploding_walk(*a, **kw):
+        raise AssertionError("no chain - nothing to walk")
+
+    monkeypatch.setattr(newbie_quest, "walk", exploding_walk)
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
+    assert flows._newbie_quest(s) == "quest -"
+
+
+def test_newbie_quest_raises_when_the_token_dies_mid_walk(monkeypatch):
+    """"auth" ต้องกลายเป็น exception ให้ run_quest retry - ไม่ใช่สรุปว่าจบแล้วส่งออก"""
+    import newbie_quest
+
+    monkeypatch.setattr(newbie_quest, "get_quest", lambda cookie: (_pdq(3, current=3), 200))
+    monkeypatch.setattr(newbie_quest, "walk", lambda cookie, **kw: ("auth", [0, 1, 2]))
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t")
+    with pytest.raises(RuntimeError):
+        flows._newbie_quest(s)
+
+
+def test_force_stage_keeps_clear_range_progress_off_stdout(monkeypatch):
+    """stdout ของ engine คือช่อง JSONL - clear_range ต้องไม่ print ทีละด่านลงไปแทรกแถวของ Reporter"""
+    import stage_forge
+
+    seen = {}
+    monkeypatch.setattr(stage_forge, "player_info", lambda cookie: {"rsn": "ID1", "level": 5})
+    monkeypatch.setattr(stage_forge, "start_stage", lambda cookie, player: 3)
+
+    def fake_clear_range(cookie, rsn, first, last, **kw):
+        seen.update(kw)
+        return last, "done"
+
+    monkeypatch.setattr(stage_forge, "clear_range", fake_clear_range)
+    s = AccountSession(src="x", lane=Lane(), cookie="LF_AC=t", rsn="ID1")
+    flows._force_stage(s, dict(CFG, stageend=150))
+    assert seen["progress"] is flows._quiet
+
+
+def _delay_seen(monkeypatch, cfg):
+    import stage_forge
+
+    seen = {}
+    monkeypatch.setattr(stage_forge, "player_info", lambda cookie: {"rsn": "ID1", "level": 5})
+    monkeypatch.setattr(stage_forge, "start_stage", lambda cookie, player: 3)
+    monkeypatch.setattr(stage_forge, "clear_range",
+                        lambda cookie, rsn, first, last, **kw: (seen.update(kw), (last, "done"))[1])
+    flows._force_stage(AccountSession(src="x", lane=Lane(), cookie="LF_AC=t", rsn="ID1"), cfg)
+    return seen["delay"]
+
+
+def test_force_stage_does_not_pause_between_stages_by_default(monkeypatch):
+    """ค่า 3 วิ (+สุ่มถึง 1 วิ) ของ CLI เคยเป็นครึ่งหนึ่งของเวลาต่อด่าน - rate limit มีตัวคุมใน rangers_api แล้ว"""
+    assert _delay_seen(monkeypatch, dict(CFG, stageend=150)) == 0
+
+
+def test_force_stage_uses_the_configured_stage_delay(monkeypatch):
+    assert _delay_seen(monkeypatch, dict(CFG, stageend=150, stagedelay=2.5)) == 2.5
+
+
+def test_stage_with_the_quest_box_ticked_runs_the_quest_flow(tmp_path, monkeypatch):
+    """ติ๊ก "ทำเควสมือใหม่ต่อ" ในโหมด Stage = ข้ามการสอน -> ดันด่าน -> เควส เหมือน Login Quest"""
+    calls = []
+    quest_stub(monkeypatch, calls)
+    out = flows.run("ranger_api_Stage", make(tmp_path), dict(CFG, newbiequest=True))
+    assert calls == ["relogin", "home", "tutorial", "stage", "quest", "home", "info"]
+    assert out.dest == "output"
+    assert out.error == "quest 18/29 blocked@idx18 exp_booster"
+
+
+def test_stage_without_the_quest_box_stays_a_plain_stage_push(tmp_path, monkeypatch):
+    calls = []
+    quest_stub(monkeypatch, calls)
+    out = flows.run("ranger_api_Stage", make(tmp_path), dict(CFG, newbiequest=False))
+    assert calls == ["relogin", "home", "stage", "info"]
+    assert out.dest == "output"

@@ -94,10 +94,11 @@ a = Analysis(
         # that resolution happen regardless of search-path order or timing.
         #
         # Deliberately NOT listed (and not passed to pyarmor gen either): device_snapshot,
-        # export_account, extract_battles, gifts, newbie_quest, ratelimit_probe, sevendays,
+        # export_account, extract_battles, gifts, ratelimit_probe, sevendays,
         # summarize. grep across bot/ and every module below turns up no import of any of
         # them - they are CLI-only tools a human runs by hand, not code this build ships.
         # client_version (2026-09-24): imported by rangers_api, i.e. by every mode.
+        # newbie_quest (2026-09-24): imported by engine/flows.py for ranger_api_Quest.
         'account_file',
         'client_version',
         'device_session',
@@ -110,6 +111,7 @@ a = Analysis(
         'rewards',
         'stage_forge',
         'tutorial',
+        'newbie_quest',
         # Everything below is a stdlib or third-party import collected straight from the 11
         # modules above's own `import` lines, so the frozen runtime carries it even though
         # no bundled module visibly asks for it (same reasoning as those 11 themselves).

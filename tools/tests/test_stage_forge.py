@@ -222,6 +222,50 @@ def test_bad_battle_reject_reposts_same_battle(monkeypatch):
     assert len(server.calls("/stage/enter/")) == 1
 
 
+def _clocked_clear(monkeypatch, enter_takes, saves=None):
+    """clear_stage บนนาฬิกาปลอม: enter กินเวลา enter_takes วิ, sleep เดินนาฬิกาจริงตามที่ขอ"""
+    clock = [1000.0]
+    slept = []
+    server = FakeServer(saves=saves)
+
+    def timed_call(cookie, path, method="GET", body=None, api=None):
+        if path.startswith("/stage/enter/"):
+            clock[0] += enter_takes
+        return server(cookie, path, method, body, api)
+
+    def fake_sleep(seconds):
+        slept.append(round(seconds, 3))
+        clock[0] += seconds
+
+    monkeypatch.setattr(sf, "call", timed_call)
+    monkeypatch.setattr(sf.time, "time", lambda: clock[0])
+    monkeypatch.setattr(sf.time, "sleep", fake_sleep)
+    cleared, _info = sf.clear_stage("LF_AC=x", "st01", "40d2cf61", pt=1)
+    return cleared, slept, server
+
+
+def test_save_counts_pt_from_the_enter_request_not_its_response(monkeypatch):
+    """เดิมรอ pt+0.5 วิหลังได้คำตอบ enter = ~1.5 วิที่เสียเปล่าทุกด่าน ตอนนี้นับ pt จากตอนยิง enter"""
+    cleared, slept, _ = _clocked_clear(monkeypatch, enter_takes=0.4)
+    assert cleared
+    assert slept == [0.6]
+
+
+def test_a_slow_enter_needs_no_wait_before_the_save(monkeypatch):
+    cleared, slept, _ = _clocked_clear(monkeypatch, enter_takes=1.2)
+    assert cleared
+    assert slept == []
+
+
+def test_a_too_early_reject_falls_back_to_the_old_margin(monkeypatch):
+    """102205 = เซฟเร็วไป (ไม่เสีย heart) รอบถัดไปถอยไปใช้ระยะเดิม pt+0.5 วิ แล้วยิง battleSn เดิม"""
+    cleared, slept, server = _clocked_clear(monkeypatch, enter_takes=1.2, saves=[102205, "win"])
+    assert cleared
+    assert slept == [1.5]
+    saves = server.calls("/stage/save/")
+    assert len(saves) == 2 and saves[0] == saves[1]
+
+
 def test_network_error_is_retried(monkeypatch):
     def boom():
         raise TimeoutError("blip")

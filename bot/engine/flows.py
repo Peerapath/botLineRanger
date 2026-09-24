@@ -156,6 +156,10 @@ def _relogin(s: AccountSession) -> None:
     s.cookie = "LF_AC=" + lf_ac
     s.rsn = result.get("rsn") or ""
     s.level = int(result.get("level") or 0)
+    # /login คืนแผนที่ tutorialStep {STEP: ยืนยันแล้วหรือยัง} มาด้วย เก็บไว้ให้ _skip_tutorial
+    # ยิงเฉพาะขั้นที่ยังค้าง ไอดีที่ข้ามไปแล้วจึงไม่ต้องเสีย 67 request ซ้ำทุกรอบ
+    steps = result.get("tutorialStep")
+    s.cache["tutorial_steps"] = steps if isinstance(steps, dict) else None
 
 
 def _fetch_home(s: AccountSession) -> None:
@@ -335,12 +339,80 @@ def _force_stage(s: AccountSession, cfg: dict) -> str:
     last = int(cfg.get("stageend") or 150)
     if first > last:
         return "done"          # ผ่านเป้าไปแล้ว ไม่มีอะไรต้องทำ
-    _cleared, reason = stage_forge.clear_range(s.cookie, s.rsn, first, last)
+    # ดีเลย์ระหว่างด่าน (settings.stagedelay) ค่าเริ่มต้น 0: rate limit ทั้งสองชั้นมีตัวคุมอยู่แล้วใน
+    # rangers_api (ช่องว่าง 350 ms ต่อบัญชี + ถังต่อ IP) ค่า 3 วิของ CLI เคยกินเวลาครึ่งหนึ่งของแต่ละด่าน
+    _cleared, reason = stage_forge.clear_range(s.cookie, s.rsn, first, last,
+                                               delay=float(cfg.get("stagedelay") or 0),
+                                               progress=_quiet)
     try:
         s.level = int(stage_forge.player_info(s.cookie).get("level") or s.level)
     except Exception:
         pass    # อ่านเลเวลใหม่ไม่ได้ ไม่ใช่เหตุให้ทั้ง session พัง (เหมือน apiForceStage เดิม)
     return reason
+
+
+def _quiet(*_args, **_kwargs) -> None:
+    """progress ของ tools/ ที่ต้องไม่ลง stdout
+
+    stdout ของ engine คือช่อง JSONL ที่ GUI อ่าน และ print() เขียนข้อความกับ "\\n" แยกกันสองครั้ง
+    ถ้าแถวของ Reporter จากอีกเธรดแทรกลงระหว่างนั้น บรรทัดนั้นจะ parse ไม่ออก แล้วบัญชีนั้นหายจาก
+    ยอดของ GUI ไปเงียบ ๆ ส่วนข้อความ progress เองก็ไม่มีใครเห็นอยู่แล้ว (GUI ข้ามบรรทัดที่ไม่ใช่ JSON)
+    """
+
+
+def _skip_tutorial(s: AccountSession) -> tuple[int, int]:
+    """ข้ามการสอนทั้งหมดผ่าน GET /tutorial/confirm/<STEP> - ย้ายมาจาก apiSkipTutorial()
+    (branch wip/quest-mode)
+
+    ยิงเฉพาะขั้นที่ /login บอกว่ายังค้าง (s.cache["tutorial_steps"] จาก _relogin) ไม่มีแผนที่ก็ยิง
+    ครบ 67 ขั้น - confirm ซ้ำขั้นที่ทำแล้วได้ true เหมือนเดิม จึงไม่มีผลข้างเคียง
+
+    SALLY กับ YELLOW_STONE ถูกปฏิเสธเสมอ (ต้องมียูนิต/หินจริงจากกาชาสอน) ได้ 65/67 คือปกติ ไม่ใช่
+    ความล้มเหลว ป๊อปอัปสอนปิดครบและบัญชีเล่นด่านได้แล้ว (ดู tools/tutorial.py)
+
+    คืน (ยืนยันผ่าน, จำนวนที่ยิง)
+    """
+    import tutorial
+    done = s.cache.get("tutorial_steps") or {}
+    pending = [step for step in tutorial.STEPS if not done.get(step)]
+    passed = 0
+    for step in pending:
+        ok, status, _data = tutorial.confirm(s.cookie, step)
+        if status == 401:
+            # โทเค็นตาย ยิงที่เหลืออีกหกสิบกว่าขั้นก็ได้ 401 เหมือนกันหมด โยนออกไปให้ retry relogin ใหม่
+            raise RuntimeError("tutorial confirm rejected (HTTP 401)")
+        passed += ok
+    return passed, len(pending)
+
+
+def _newbie_quest(s: AccountSession) -> str:
+    """ไล่ SPECIAL QUEST (playerDailyQuest questType NEWBI 29 เควส) ผ่าน tools/newbie_quest.py
+
+    เควสเรียงตายตัว และมีแค่เควส currentQuest ที่รับความคืบหน้า walker จึงทำ -> เคลม -> เควสถัดไป
+    จนเจอเควสที่ API ทำเองไม่ได้ (exp_booster ต้องกดซื้อในเกม, guild_help, raid, lab, attendant
+    ต้องล็อกอินจริงสามวัน) การหยุดตรงนั้นคือ "จบเท่าที่ทำได้" ไม่ใช่ error - ไอดียังส่งออกตามปกติ
+
+    คืนข้อความสรุปสั้น ๆ เช่น "quest 18/29 blocked@idx18 exp_booster" ไว้ต่อท้ายแถวของบัญชีใน GUI
+    """
+    import newbie_quest
+    pdq, status = newbie_quest.get_quest(s.cookie)
+    if status == 401:
+        raise RuntimeError("dailyquest rejected (HTTP 401)")
+    if not pdq.get("contents"):
+        return "quest -"       # บัญชีนี้ไม่มีเควส NEWBI (ยังไม่ปลด หรือหมดอายุไปแล้ว)
+    outcome, claimed = newbie_quest.walk(s.cookie, confirm=True, progress=_quiet)
+    if outcome == "auth":
+        raise RuntimeError("dailyquest rejected mid-walk (HTTP 401)")
+    if claimed:
+        newbie_quest.claim_special(s.cookie)   # รางวัลหลักไมล์ ถ้ายังไม่ปลดเซิร์ฟเวอร์แค่ตอบ error code
+    pdq, _status = newbie_quest.get_quest(s.cookie)
+    contents = pdq.get("contents") or []
+    summary = "quest %d/%d" % (sum(1 for q in contents if q.get("receiveReward")), len(contents))
+    current = newbie_quest.current_quest(pdq)
+    if current:
+        summary += " %s@idx%s %s" % (outcome.split(":")[0], current.get("index"),
+                                     current.get("missionType"))
+    return summary
 
 
 # --- flow ต่อโหมด ---
@@ -585,6 +657,9 @@ def run_genid(s: AccountSession, cfg: dict) -> Outcome:
 
 
 def run_stage(s: AccountSession, cfg: dict) -> Outcome:
+    if cfg.get("newbiequest"):
+        # ติ๊ก "ทำเควสมือใหม่ต่อ" ในโหมด Stage = ชุดเดียวกับ Login Quest (ข้ามการสอน -> ดันด่าน -> เควส)
+        return run_quest(s, cfg)
     last = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         s.attempts = attempt
@@ -615,11 +690,71 @@ def run_stage(s: AccountSession, cfg: dict) -> Outcome:
     return Outcome(dest="login failed", status="FAIL", error=last)
 
 
+def run_quest(s: AccountSession, cfg: dict) -> Outcome:
+    """Login Quest: relogin ไอดีเก่าจาก input/ -> ข้ามการสอนทั้งหมด -> ดันด่านถึง stageend (150)
+    -> ทำ SPECIAL QUEST 29 เควสเท่าที่ API ทำได้ -> ส่งออก output/
+
+    ลำดับ "ดันด่านก่อน แล้วค่อยทำเควส" ตามที่ผู้ใช้สั่ง (stage_special idx13 ติดล็อกเลเวล 20) - ทดสอบสด
+    2026-09-24: ลำดับนี้ทำให้เควส treasure idx4 (ar01) ค้างที่ 0/1 เพราะเคลียร์ ar01 ไปก่อนเควสนี้เป็น
+    เควสปัจจุบัน walker จึงจบที่ "stalled" ได้ 4/29 ต้องเปิดสมบัติในเกมเองก่อนรันซ้ำ
+
+    ขั้นที่ทำไปแล้วไม่ทำซ้ำตอน retry (ธงอยู่นอกลูปเหมือน gacha_status ของ run_login): การดันด่านจ่าย
+    heart จริงทุกด่าน ส่วนเควสเดินต่อจากเควสปัจจุบันบนเซิร์ฟเวอร์ได้เอง แต่ walk ที่จบไปแล้วไม่มีเหตุให้
+    ยิงซ้ำ ข้อยกเว้นเดียวคือโทเค็นตายกลางทาง ("auth") - ขั้นนั้นยังไม่จบจริง จึงปล่อยให้ retry ทำต่อ
+    """
+    last = ""
+    tutorial_done = stage_done = quest_done = False
+    stage_reason = quest_note = ""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        s.attempts = attempt
+        try:
+            s.reset_token()
+            s.cache["_rangers_config"] = cfg.get("_rangers_config")
+            _relogin(s)
+            _fetch_home(s)
+            if not tutorial_done:
+                _skip_tutorial(s)
+                tutorial_done = True
+            if not stage_done:
+                stage_reason = _force_stage(s, cfg)
+                if stage_reason == "auth":
+                    # start_stage อ่านด่านล่าสุดจาก /stage/last รอบหน้าจึงดันต่อจากจุดที่ค้าง ไม่ซ้ำ
+                    raise RuntimeError("stage push: token rejected (HTTP 401)")
+                stage_done = True
+                if stage_reason == "flagged":
+                    # เหมือน run_stage: ไอดีที่โดนตีธงห้ามปนกับไอดีที่ใช้ได้ใน output/ และห้ามยิงต่อ
+                    return Outcome(dest="login failed", status="FLAG",
+                                   error="stage push flagged by server")
+            if not quest_done:
+                quest_note = _newbie_quest(s)
+                quest_done = True
+            # /home รอบแรกดึงมาก่อนดันด่านและก่อนเคลมเควส ruby/level ในชื่อไฟล์ต้องมาจากหลังจบ
+            # (หลักไมล์รูบี้ 50/150/200 ได้ระหว่าง walk)
+            _fetch_home(s)
+            _account_info(s)
+            notes = [s.error, quest_note]
+            if stage_reason != "done":
+                # ดันไม่ถึงเป้า (heart หมด/ด่านล็อก/เซฟไม่ผ่าน) ไม่ใช่เหตุให้ทิ้งไอดี แต่ต้องบอกให้เห็น
+                notes.insert(1, "stage stop=%s" % stage_reason)
+            return Outcome(dest="output", name=_export_name(s), status="OK",
+                           error="; ".join(n for n in notes if n))
+        except client_version.VersionUnavailable:
+            raise           # ให้ pool หยุด engine - ดูคอมเมนต์เดียวกันใน run_login
+        except PermanentFailure as err:
+            return Outcome(dest="login failed", status="FAIL", error=str(err))
+        except Exception as err:
+            last = str(err)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+    return Outcome(dest="login failed", status="FAIL", error=last)
+
+
 MODES = {
     "ranger_api_Login": run_login,
     "ranger_api_Level3": run_level3,
     "ranger_api_GenID": run_genid,
     "ranger_api_Stage": run_stage,
+    "ranger_api_Quest": run_quest,
 }
 
 # C2 (final review): modes whose flow mints its own account file (_create_account writes
