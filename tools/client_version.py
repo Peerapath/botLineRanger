@@ -74,6 +74,31 @@ def classify(status, parsed) -> str:
     return "other"
 
 
+def _vkey(version: str) -> tuple:
+    return tuple(int(x) for x in version.split("."))
+
+
+def _pkey(prefix: str) -> tuple:
+    return tuple(int(x) for x in prefix[2:].split("."))
+
+
+def version_candidates(current: str) -> list:
+    """Builds worth asking about when `current` stops being known: every patch 0-5 of its
+    minor, the minors either side of it, and the next major. The caller sorts newest first."""
+    major, minor, _patch = _vkey(current)
+    out = ["%d.%d.%d" % (major, minor, p) for p in range(0, 6)]
+    out += ["%d.%d.0" % (major, m) for m in range(max(0, minor - 1), minor + 3)]
+    out.append("%d.0.0" % (major + 1))
+    return out
+
+
+def prefix_candidates(current: str) -> list:
+    major, minor = _pkey(current)
+    out = ["/v%d.%d" % (major, m) for m in range(max(0, minor - 1), minor + 4)]
+    out.append("/v%d.0" % (major + 1))
+    return out
+
+
 class ClientVersion:
     def __init__(self, path: str, oracle=None, learn: bool = True, clock=time.monotonic):
         self.path = path
@@ -172,21 +197,201 @@ class ClientVersion:
                 self._save()
 
     def request(self, path, send, pinned_prefix=None):
-        """Send once with the values this route should use and return what send() returned.
+        """Send with the values this route should use; on a version refusal, find values the
+        server takes, re-send, remember them. Returns the tuple the LAST send() returned.
 
         send(prefix, app_version) must return a tuple whose [0] is the HTTP status and [1] the
         parsed body. Pass `path` WITHOUT its /v12.x prefix - adding it is this module's job.
+        Re-sending is safe for every signal handled here: 119801, a missing route and 401 are
+        all refusals made before the server did anything.
         """
         if _PREFIXED_PATH_RE.match(path):
             raise ValueError("pass the path without its /v12.x prefix: %r" % (path,))
         self._load()
         route = route_of(path)
+        if self.learn:
+            self._check_dead()
         with self._lock:
-            prefix, version, _generation = self._resolve(route, pinned_prefix)
+            prefix, version, generation = self._resolve(route, pinned_prefix)
         result = send(prefix, version)
-        if classify(result[0], result[1]) == "ok":
-            self._mark_ok(route, version)
-        return result
+        hops = 0
+        while True:
+            kind = classify(result[0], result[1])
+            if kind == "ok":
+                self._mark_ok(route, version)
+                return result
+            if not self.learn or hops >= 3:     # 3 = pin dropped -> version swept -> prefix swept
+                return result
+            if kind == "unauthorized":
+                return self._after_401(route, prefix, version, send, result)
+            if kind == "version_unknown":
+                self._after_unknown_version(route, version, generation)
+            elif kind == "route_missing" and pinned_prefix is None:
+                if not self._after_route_missing(prefix, version, generation):
+                    return result
+            else:
+                return result
+            hops += 1
+            with self._lock:
+                prefix, version, generation = self._resolve(route, pinned_prefix)
+            result = send(prefix, version)
+
+    # --- learning -----------------------------------------------------------------------
+    #
+    # Every sweep runs while holding self._lock. That is the single-flight: 128 threads that
+    # all get 119801 at once queue on the lock, and each one that gets in after the first
+    # sees self._generation moved on and simply re-sends with the new values.
+
+    def _after_401(self, route, prefix, version, send, result):
+        """The 401 rule (spec 4.3). A 401 is byte-identical whether the version was refused or
+        the token is dead, so it only counts as a version problem on a route that has never
+        answered 200 with this version in this process. Login mode proves /login and /home on
+        its first good account; after that every dead token costs nothing extra."""
+        messages = []
+        retry_with = None
+        try:
+            with self._lock:
+                if (route, version) in self._proven or (route, version) in self._not_version:
+                    return result
+                current = self.route_pins.get(route, self.app_version)
+                if current != version:
+                    retry_with = current        # another thread already found this route's version
+                else:
+                    candidates = sorted((v for v in self.known_good if v != version),
+                                        key=_vkey, reverse=True)
+                    for cand in candidates:
+                        attempt = send(prefix, cand)
+                        kind = classify(attempt[0], attempt[1])
+                        if kind == "ok":
+                            self._proven.add((route, cand))
+                            messages.append(self._record("route_pin", route, version, cand,
+                                                         "401 on a never-proven route"))
+                            self.route_pins[route] = cand
+                            self._generation += 1
+                            self._save()
+                            return attempt
+                        if kind == "version_unknown":
+                            self._forget(cand)
+                    self._not_version.add((route, version))
+                    return result
+        finally:
+            self._emit(messages)
+        attempt = send(prefix, retry_with)
+        if classify(attempt[0], attempt[1]) == "ok":
+            self._mark_ok(route, retry_with)
+        return attempt
+
+    def _after_unknown_version(self, route, version, generation) -> None:
+        messages = []
+        try:
+            with self._lock:
+                if self._generation != generation:
+                    return                           # another thread already moved us on
+                self._check_dead()
+                self._forget(version)
+                if self.route_pins.get(route) == version:
+                    del self.route_pins[route]
+                    messages.append(self._record("route_pin", route, version, self.app_version,
+                                                 "server no longer knows %s: 119801" % version))
+                    self._generation += 1
+                    self._save()
+                    if self.app_version != version:
+                        return                       # the main version may still do
+                candidates = sorted({v for v in list(self.known_good) + version_candidates(version)
+                                     if v != version}, key=_vkey, reverse=True)
+                for cand in candidates:              # newest first: the first "known" is the newest
+                    answer = self._ask_oracle(self.api_prefix, cand)
+                    if answer == "known":
+                        messages.append(self._record("app_version", None, version, cand,
+                                                     "server no longer knows %s: 119801" % version))
+                        self.app_version = cand
+                        if cand not in self.known_good:
+                            self.known_good.append(cand)
+                        self._generation += 1
+                        self._save()
+                        return
+                    if answer == "unknown":
+                        self._forget(cand)
+                self._save()
+                self._give_up("no App-Version the server knows (tried %d builds around %s)"
+                              % (len(candidates), version))
+        finally:
+            self._emit(messages)
+
+    def _after_route_missing(self, prefix, version, generation) -> bool:
+        """True = the prefix moved, re-send. False = keep the 404 (spec 4.6: move only when the
+        current prefix itself is dead, never because one endpoint went away)."""
+        messages = []
+        try:
+            with self._lock:
+                if self._generation != generation:
+                    return self.api_prefix != prefix
+                self._check_dead()
+                if self._ask_oracle(prefix, version) == "known":
+                    return False
+                candidates = sorted(set(prefix_candidates(prefix)) - {prefix}, key=_pkey, reverse=True)
+                for cand in candidates:
+                    if self._ask_oracle(cand, version) == "known":
+                        messages.append(self._record("api_prefix", None, prefix, cand,
+                                                     "%s no longer answers" % prefix))
+                        self.api_prefix = cand
+                        self._generation += 1
+                        self._save()
+                        return True
+                self._give_up("no URL prefix answers (tried %d around %s)" % (len(candidates), prefix))
+        finally:
+            self._emit(messages)
+
+    def _ask_oracle(self, prefix, version) -> str:
+        """GET {prefix}/home with a fake token. The server checks the version first, so:
+        401 = version known and prefix alive, 119801 = version unknown, 404 = prefix missing.
+        Network errors propagate; 429/5xx raise - neither may ever count as "unknown", or a
+        blip mid-sweep would stop the whole engine."""
+        oracle = self._oracle_fn or _registered_oracle()
+        if oracle is None:
+            raise RuntimeError("client_version: no oracle transport registered")
+        answer = oracle(prefix, version)
+        status, parsed = answer[0], answer[1]
+        kind = classify(status, parsed)
+        if kind == "unauthorized":
+            return "known"
+        if kind == "version_unknown":
+            return "unknown"
+        if kind == "route_missing":
+            return "missing"
+        if status == 429 or ratelimit.is_app_429(status, parsed) is not None or (
+                isinstance(status, int) and status >= 500):
+            raise RuntimeError("version probe inconclusive: HTTP %s" % status)
+        return "other"
+
+    def _forget(self, version) -> None:
+        if version in self.known_good:
+            self.known_good.remove(version)
+
+    def _check_dead(self) -> None:
+        if self._dead_until and self._clock() < self._dead_until:
+            raise VersionUnavailable(self._dead_reason)
+
+    def _give_up(self, reason) -> None:
+        self._dead_until = self._clock() + DEAD_COOLDOWN
+        self._dead_reason = reason
+        raise VersionUnavailable(reason)
+
+    def _record(self, what, route, old, new, why) -> str:
+        self.history.append({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "what": what,
+                             "route": route, "from": old, "to": new, "why": why})
+        del self.history[:-HISTORY_KEEP]
+        label = {"app_version": "App-Version", "api_prefix": "API prefix",
+                 "route_pin": "App-Version %s" % route}[what]
+        return "%s: %s -> %s (%s)" % (label, old, new, why)
+
+    def _emit(self, messages) -> None:
+        for message in messages:
+            for callback in list(self._listeners):
+                try:
+                    callback(message)
+                except Exception:
+                    pass          # a broken listener must not undo a switch that already happened
 
     # --- reporting ----------------------------------------------------------------------
 
