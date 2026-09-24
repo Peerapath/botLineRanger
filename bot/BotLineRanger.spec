@@ -110,16 +110,15 @@ a = Analysis(
         'os',
         'sys',
         'time',
-        # pycryptodome: tools/new_account.py (GenID mode, engine/flows.py:282) does
-        # `from Crypto.Cipher import AES` / `from Crypto.Util.Padding import pad`. Found by
-        # audit, not by this task's own --engine smoke test (GenID's import only runs lazily,
-        # inside that mode's function, and an empty input/ never reaches it) - confirmed
-        # missing by trying `import Crypto` under the Python 3.11 build environment directly
-        # (ModuleNotFoundError), even though it is installed under the dev Python on PATH.
-        # Installed pycryptodome 3.23.0 (matching the dev environment) into Python 3.11 so
-        # PyInstaller has something to bundle; bot/requirements.txt still does not list it
-        # for anyone re-provisioning that environment from scratch - out of this task's file
-        # list (spec/build.bat/exclude_dist.txt only), flagged in the report instead.
+        # pycryptodome: tools/stage_forge.py does `from Crypto.Cipher import AES` /
+        # `from Crypto.Util.Padding import pad`, reached from engine/flows.py's Stage and
+        # Level3 paths. (An earlier version of this comment blamed tools/new_account.py -
+        # wrong: that file's own docstring says stdlib only, and it has no Crypto import.
+        # The hiddenimports below were right either way, the reason was not.)
+        # Found by audit, not by this task's --engine smoke test: the import runs lazily
+        # inside the mode's function, and an empty input/ never reaches it. Confirmed
+        # missing by `import Crypto` under the Python 3.11 build environment directly
+        # (ModuleNotFoundError), though it is installed under the dev Python on PATH.
         'Crypto',
         'Crypto.Cipher',
         'Crypto.Cipher.AES',

@@ -8,3 +8,10 @@ psutil
 
 # Security / config encryption
 cryptography
+
+# Battle-log field crypto in tools/stage_forge.py (Stage and Level3 modes).
+# It is imported lazily inside the flow, so a missing install shows up as a mode that
+# fails mid-run rather than an engine that refuses to start - and PyInstaller can only
+# bundle what is installed, so a build environment without it silently ships an exe
+# whose Stage and Level3 modes cannot work.
+pycryptodome
