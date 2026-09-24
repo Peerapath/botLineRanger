@@ -22,13 +22,15 @@ import urllib.error
 import urllib.request
 
 import ratelimit
+import client_version
 
 HOST = "rangers-api.line-apps.com"
 
-# Keep this in step with the installed client. It is not cosmetic: the server routes each
-# version separately and older prefixes can be missing a handler. /v12.3/popup/reward/<seq>
-# returns 500 for a CLS_GACHA (Classic Gacha Ticket) reward while /v12.3 grants it fine -
-# same token, same body, only the prefix differs.
+# Old names, kept because standalone scripts still read them. Nothing in tools/ or bot/engine/
+# sends with them any more: every call takes its prefix and App-Version from client_version,
+# which learns from the server when a value stops being accepted (see that module). The server
+# does route each version separately - /v12.3/popup/reward/<seq> returns 500 for a CLS_GACHA
+# reward under an older prefix - which is exactly why the prefix is managed, not hardcoded.
 API = "/v12.3"
 CLIENT_VERSION = "12.3.0"
 
@@ -125,18 +127,30 @@ def _decode(raw: bytes, enc):
         return raw.decode("utf-8", "replace")
 
 
-def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None = None):
+def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None = None,
+         extra_headers: dict | None = None):
     """Return (status, parsed). `cookie` is the full 'LF_AC=...' value.
 
-    `path` is relative to the API prefix (see API above). Pass `api` to pin one call to a
-    different version prefix without changing the default. Uses a reused keep-alive connection;
-    a stale/closed connection is transparently reconnected once.
+    `path` is relative to the API prefix and must NOT carry it - client_version picks the
+    prefix and App-Version, and switches them when the server stops accepting them. `api` pins
+    this one call to a prefix that is never switched. `extra_headers` are added as-is (gacha
+    sends its UID this way).
     """
     if isinstance(body, (bytes, bytearray)):
         data = bytes(body)     # pre-serialized (e.g. /stage/save wants compact, key-sorted JSON)
     else:
         data = json.dumps(body).encode() if body is not None else (b"" if method == "POST" else None)
-    url = (api or API) + path
+
+    def send(prefix, app_version):
+        return _send_raw(cookie, prefix + path, method, data, app_version, extra_headers)
+
+    return client_version.request(path, send, pinned_prefix=api)
+
+
+def _send_raw(cookie, url, method, data, app_version, extra_headers=None):
+    """One logical request with this module's retry policy and no version logic at all - the
+    transport under call() and under the version oracle. Uses a reused keep-alive connection;
+    a stale/closed connection is transparently reconnected once."""
     lane = current_lane()
     status, parsed = 0, ""
     # http.client returns 4xx/5xx as a normal response (no exception), so no HTTPError branch is
@@ -152,12 +166,13 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
         else:
             ratelimit.bucket_for(HOST).acquire()   # เส้นทาง CLI: ไม่มี lane ใช้ถังไฟล์แบบเดิม
         now = int(time.time() * 1000)
+        version_headers = client_version.headers(app_version)
         headers = {
             "Host": HOST,
             "Accept": "*/*",
             "Content-Type": "application/json; charset=utf-8;",
-            "App-Version": "LGRGS/%s;android/12" % CLIENT_VERSION,
-            "User-Agent": "LGRGS/%s (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)" % CLIENT_VERSION,
+            "App-Version": version_headers["App-Version"],
+            "User-Agent": version_headers["User-Agent"],
             "Accept-Language": "en",
             "X-LINEGAME-MCC": "000",
             "X-LINEGAME-MNC": "00",
@@ -167,6 +182,8 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
             "Accept-Encoding": "gzip",
             "Connection": "keep-alive",
         }
+        if extra_headers:
+            headers.update(extra_headers)
         try:
             # _get_conn() itself can raise (bad proxy tuple, tunnel setup) same as the socket
             # ops below it - that must reach lane.note_fail() too, or a proxy that can never
@@ -197,6 +214,17 @@ def call(cookie: str, path: str, method: str = "GET", body=None, api: str | None
             continue               # rate-limited/overloaded: wait, then retry
         break
     return status, parsed
+
+
+def _oracle(prefix, app_version):
+    """client_version's probe: GET {prefix}/home with a token that is never valid. The server
+    checks the version before the token, so the answer says whether it knows `app_version`
+    (401 vs 400/119801) and whether `prefix` exists (401 vs 404) without touching an account."""
+    return _send_raw(client_version.ORACLE_COOKIE, prefix + client_version.ORACLE_PATH,
+                     "GET", None, app_version)
+
+
+client_version.set_oracle(_oracle)
 
 
 def add_session_args(parser):

@@ -37,6 +37,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import client_version
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -48,7 +49,7 @@ CAPTURE_GLOB = os.path.join(ROOT, "captures", "*.jsonl")
 OUT_DIR = os.path.join(ROOT, "roster")
 
 HOST = "rangers-api.line-apps.com"
-ROSTER_PATH = "/v12.3/player/units/equip?inven=true&team=true&deck=true"
+ROSTER_PATH = "/player/units/equip?inven=true&team=true&deck=true"
 
 EVOLUTION = {"": "base", "e": "evolved", "h": "hyper", "u": "ultra", "s": "special"}
 
@@ -116,38 +117,48 @@ def newest_auth_from_captures():
 
 
 def fetch_roster(cookie: str, uid: str) -> bytes:
-    now = int(time.time() * 1000)
-    headers = {
-        "Host": HOST,
-        "Accept": "*/*",
-        "Content-Type": "application/json; charset=utf-8;",
-        "App-Version": "LGRGS/12.3.0;android/12",
-        "User-Agent": "LGRGS/12.3.0 (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)",
-        "Accept-Language": "en",
-        "X-LINEGAME-MCC": "000",
-        "X-LINEGAME-MNC": "00",
-        "X-LINEGAME-TIMESTAMP": str(now),
-        "timeID": str(now),
-        "Cookie": cookie,
-        "Accept-Encoding": "gzip",
-    }
-    if uid:   # optional - the server derives the player from LF_AC, so device sessions omit it
-        headers["UID"] = uid
-    request = urllib.request.Request("https://" + HOST + ROSTER_PATH, headers=headers, method="GET")
-    try:
-        response = urllib.request.urlopen(request, timeout=25)
-        raw = response.read()
-        status = response.status
-        encoding = response.headers.get("Content-Encoding")
-    except urllib.error.HTTPError as err:
-        raw = err.read()
-        status = err.code
-        encoding = err.headers.get("Content-Encoding")
-    if encoding == "gzip":
+    def send(prefix, app_version):
+        now = int(time.time() * 1000)
+        version_headers = client_version.headers(app_version)
+        headers = {
+            "Host": HOST,
+            "Accept": "*/*",
+            "Content-Type": "application/json; charset=utf-8;",
+            "App-Version": version_headers["App-Version"],
+            "User-Agent": version_headers["User-Agent"],
+            "Accept-Language": "en",
+            "X-LINEGAME-MCC": "000",
+            "X-LINEGAME-MNC": "00",
+            "X-LINEGAME-TIMESTAMP": str(now),
+            "timeID": str(now),
+            "Cookie": cookie,
+            "Accept-Encoding": "gzip",
+        }
+        if uid:   # optional - the server derives the player from LF_AC, so device sessions omit it
+            headers["UID"] = uid
+        request = urllib.request.Request("https://" + HOST + prefix + ROSTER_PATH,
+                                         headers=headers, method="GET")
         try:
-            raw = gzip.decompress(raw)
-        except OSError:
-            pass
+            response = urllib.request.urlopen(request, timeout=25)
+            raw = response.read()
+            status = response.status
+            encoding = response.headers.get("Content-Encoding")
+        except urllib.error.HTTPError as err:
+            raw = err.read()
+            status = err.code
+            encoding = err.headers.get("Content-Encoding")
+        if encoding == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except OSError:
+                pass
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        return status, parsed, raw
+
+    status, _parsed, raw = client_version.request(ROSTER_PATH, send)
     if status != 200:
         raise SystemExit(
             "Server returned HTTP %s: %s\n"

@@ -35,6 +35,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import client_version
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -137,26 +138,30 @@ def get_lfac_from_device(device: str | None = None) -> str:
 
 
 def player_summary(lf_ac: str) -> dict:
-    now = int(time.time() * 1000)
-    headers = {
-        "Host": HOST, "Accept": "*/*",
-        "App-Version": "LGRGS/12.3.0;android/12",
-        "User-Agent": "LGRGS/12.3.0 (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)",
-        "Accept-Language": "en", "X-LINEGAME-MCC": "000", "X-LINEGAME-MNC": "00",
-        "X-LINEGAME-TIMESTAMP": str(now), "timeID": str(now),
-        "Cookie": "LF_AC=" + lf_ac, "Accept-Encoding": "gzip",
-    }
-    req = urllib.request.Request(
-        "https://" + HOST + "/v12.3/player/units/equip?inven=false&team=false&deck=false",
-        headers=headers, method="GET")
-    try:
-        resp = urllib.request.urlopen(req, timeout=25)
-        raw, status = resp.read(), resp.status
-        if resp.headers.get("Content-Encoding") == "gzip":
-            raw = gzip.decompress(raw)
-    except urllib.error.HTTPError as err:
-        raw, status = err.read(), err.code
-    data = json.loads(raw)
+    path = "/player/units/equip?inven=false&team=false&deck=false"
+
+    def send(prefix, app_version):
+        now = int(time.time() * 1000)
+        version_headers = client_version.headers(app_version)
+        headers = {
+            "Host": HOST, "Accept": "*/*",
+            "App-Version": version_headers["App-Version"],
+            "User-Agent": version_headers["User-Agent"],
+            "Accept-Language": "en", "X-LINEGAME-MCC": "000", "X-LINEGAME-MNC": "00",
+            "X-LINEGAME-TIMESTAMP": str(now), "timeID": str(now),
+            "Cookie": "LF_AC=" + lf_ac, "Accept-Encoding": "gzip",
+        }
+        req = urllib.request.Request("https://" + HOST + prefix + path, headers=headers, method="GET")
+        try:
+            resp = urllib.request.urlopen(req, timeout=25)
+            raw, status = resp.read(), resp.status
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+        except urllib.error.HTTPError as err:
+            raw, status = err.read(), err.code
+        return status, json.loads(raw)
+
+    status, data = client_version.request(path, send)
     if status != 200:
         raise SystemExit("LF_AC rejected (HTTP %s) - it likely expired. Re-open the game "
                          "so it refreshes the session, then run this again." % status)

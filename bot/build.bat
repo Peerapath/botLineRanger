@@ -95,7 +95,7 @@ REM engine (package): tested by hand before writing this line - pyarmor gen DOES
 REM package directory alongside flat scripts (verified with pyarmor 9.2.5), so engine/*.py
 REM gets obfuscated too instead of being left as plain source next to obfuscated callers.
 REM
-REM ..\tools\*.py (11 files): the reverse-engineered API layer - rangers_api, relogin,
+REM ..\tools\*.py (12 files): the reverse-engineered API layer - rangers_api, client_version, relogin,
 REM rewards, device_session, account_file, ratelimit, gacha, pull_roster, stage_forge,
 REM new_account, tutorial. Used to ship unobfuscated (xcopy'd beside the exe below - now
 REM removed) because they live outside bot/ and PyInstaller could never resolve the bare
@@ -113,7 +113,7 @@ REM ship at all, obfuscated or not (extract_battles also imports mitmproxy, not 
 REM in this build environment, so including it would break this very step).
 pyarmor gen --output dist_pyarmor ^
     main.py botLineRanger.py engine_main.py config_secure.py hwid.py protection.py engine ^
-    ..\tools\account_file.py ..\tools\device_session.py ..\tools\gacha.py ^
+    ..\tools\account_file.py ..\tools\client_version.py ..\tools\device_session.py ..\tools\gacha.py ^
     ..\tools\new_account.py ..\tools\pull_roster.py ..\tools\rangers_api.py ^
     ..\tools\ratelimit.py ..\tools\relogin.py ..\tools\rewards.py ..\tools\stage_forge.py ^
     ..\tools\tutorial.py

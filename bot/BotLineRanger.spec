@@ -97,7 +97,9 @@ a = Analysis(
         # export_account, extract_battles, gifts, newbie_quest, ratelimit_probe, sevendays,
         # summarize. grep across bot/ and every module below turns up no import of any of
         # them - they are CLI-only tools a human runs by hand, not code this build ships.
+        # client_version (2026-09-24): imported by rangers_api, i.e. by every mode.
         'account_file',
+        'client_version',
         'device_session',
         'gacha',
         'new_account',

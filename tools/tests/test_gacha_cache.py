@@ -33,7 +33,7 @@ def test_a_cache_dict_stops_the_second_fetch(monkeypatch):
     cache = {}
     gacha.gacha_info("c", "u", cache=cache)
     gacha.gacha_info("c", "u", cache=cache)
-    assert api.count("/v12.3/gacha/info") == 1
+    assert api.count("/gacha/info") == 1
 
 
 def test_without_a_cache_every_call_still_goes_out(monkeypatch):
@@ -43,7 +43,7 @@ def test_without_a_cache_every_call_still_goes_out(monkeypatch):
     monkeypatch.setattr(gacha, "call", api)
     gacha.gacha_info("c", "u")
     gacha.gacha_info("c", "u")
-    assert api.count("/v12.3/gacha/info") == 2
+    assert api.count("/gacha/info") == 2
 
 
 def test_two_accounts_do_not_share_one_cache(monkeypatch):
@@ -53,4 +53,4 @@ def test_two_accounts_do_not_share_one_cache(monkeypatch):
     monkeypatch.setattr(gacha, "call", api)
     gacha.gacha_info("a", "1", cache={})
     gacha.gacha_info("b", "2", cache={})
-    assert api.count("/v12.3/gacha/info") == 2
+    assert api.count("/gacha/info") == 2

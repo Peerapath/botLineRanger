@@ -54,7 +54,7 @@ class FakeGachaApi:
         bare = path.split("?")[0]
         self.calls.append(bare)
 
-        if bare == "/v12.3/gacha/info":
+        if bare == "/gacha/info":
             # pick_ticket_group filters on real time.time(), so the fixture's exposure
             # window has to bracket it too, not a baked-in timestamp that ages out.
             now_ms = int(time.time() * 1000)
@@ -73,7 +73,7 @@ class FakeGachaApi:
             }
             return 200, {"result": {"gachaGroupResponseList": [group] if self.machine_open else []}}
 
-        if bare == "/v12.3/player/item":
+        if bare == "/player/item":
             return 200, {"result": {
                 "premiumGachaTicketItems": [{"amount": self.tickets}],
                 "eventGachaTicketItems": [],
@@ -82,14 +82,14 @@ class FakeGachaApi:
         if bare == "/home":
             return 200, {"result": {"rubyBalance": {"total": self.ruby}}}
 
-        if bare == "/v12.3/gacha/group/reserve":
+        if bare == "/gacha/group/reserve":
             self.reserve_bodies.append(body)
             if self.reserve_fails:
                 return 400, {"result": {}}
             self._reserve_seq += 1
             return 200, {"result": {"reserveSeq": self._reserve_seq}}
 
-        if bare == "/v12.3/gacha/group/confirm":
+        if bare == "/gacha/group/confirm":
             use_ticket = body.get("useTicket")
             if use_ticket:
                 self.tickets -= self.ticket_price
@@ -133,7 +133,7 @@ def test_stops_without_spending_when_tickets_are_out_and_use_ruby_is_false(monke
     monkeypatch.setattr(gacha, "call", api)
     codes, status = gacha.draw_with_ticket("c", "u", cycles=3, cache={})
     assert codes == []
-    assert api.count("/v12.3/gacha/group/confirm") == 0
+    assert api.count("/gacha/group/confirm") == 0
     # Pre-existing quirk, preserved verbatim from apiGachaWithTicket: the specific
     # "no-resource:..." status set inside the loop is always overwritten by the
     # unconditional status line right before return, so the caller only ever sees
@@ -150,7 +150,7 @@ def test_stops_as_soon_as_a_target_ranger_is_drawn(monkeypatch):
         targets={"u2-brown": "Brown"}, cache={},
     )
     assert codes == ["u1-cony", "u2-brown"]
-    assert api.count("/v12.3/gacha/group/confirm") == 2
+    assert api.count("/gacha/group/confirm") == 2
 
 
 def test_keeps_drawing_the_full_cycle_count_when_nothing_matches(monkeypatch):
@@ -161,7 +161,7 @@ def test_keeps_drawing_the_full_cycle_count_when_nothing_matches(monkeypatch):
         "c", "u", cycles=3, stop_when_found=True, targets={"u9-nobody": "Nobody"}, cache={},
     )
     assert codes == ["u1-cony", "u2-brown", "u3-moon"]
-    assert api.count("/v12.3/gacha/group/confirm") == 3
+    assert api.count("/gacha/group/confirm") == 3
 
 
 def test_giveitall_mode_ignores_cycles_and_goes_until_resources_run_out(monkeypatch):
@@ -173,7 +173,7 @@ def test_giveitall_mode_ignores_cycles_and_goes_until_resources_run_out(monkeypa
         "c", "u", cycles=1, gacha_mode="giveItAll", cache={},
     )
     # 12 tickets / 5 per pull = 2 whole pulls, then stop - cycles=1 must NOT cap this.
-    assert api.count("/v12.3/gacha/group/confirm") == 2
+    assert api.count("/gacha/group/confirm") == 2
     assert len(codes) == 2
 
 
@@ -192,7 +192,7 @@ def test_an_unrecognised_gacha_mode_is_bounded_by_cycles_not_unlimited(monkeypat
     codes, status = gacha.draw_with_ticket(
         "c", "u", cycles=3, gacha_mode="LimitOfRuby", cache={},
     )
-    assert api.count("/v12.3/gacha/group/confirm") == 3
+    assert api.count("/gacha/group/confirm") == 3
     assert len(codes) == 3
 
 
@@ -203,7 +203,7 @@ def test_no_open_machine_returns_empty_list_with_no_machine_status_and_does_not_
     codes, status = gacha.draw_with_ticket("c", "u", cache={})
     assert codes == []
     assert status == "no-machine"
-    assert api.count("/v12.3/gacha/group/reserve") == 0
+    assert api.count("/gacha/group/reserve") == 0
 
 
 def test_a_failed_reserve_is_caught_not_raised(monkeypatch):
@@ -218,7 +218,7 @@ def test_a_failed_reserve_is_caught_not_raised(monkeypatch):
     codes, status = gacha.draw_with_ticket("c", "u", cycles=2, cache={})
     assert codes == []
     assert status == "empty"
-    assert api.count("/v12.3/gacha/group/confirm") == 0
+    assert api.count("/gacha/group/confirm") == 0
 
 
 def test_auto_pick_group_fetches_gacha_info_once_not_twice(monkeypatch):
@@ -231,7 +231,7 @@ def test_auto_pick_group_fetches_gacha_info_once_not_twice(monkeypatch):
     monkeypatch.setattr(gacha, "call", api)
     cache = {}
     gacha.draw_with_ticket("c", "u", group=None, cycles=1, cache=cache)
-    assert api.count("/v12.3/gacha/info") == 1
+    assert api.count("/gacha/info") == 1
     assert "info" in cache
 
 
@@ -241,7 +241,7 @@ def test_without_a_cache_auto_pick_still_fetches_gacha_info_twice(monkeypatch):
     api = FakeGachaApi()
     monkeypatch.setattr(gacha, "call", api)
     gacha.draw_with_ticket("c", "u", group=None, cycles=1)
-    assert api.count("/v12.3/gacha/info") == 2
+    assert api.count("/gacha/info") == 2
 
 
 def test_explicit_group_also_shares_the_cache_for_its_price_lookup(monkeypatch):
@@ -250,4 +250,4 @@ def test_explicit_group_also_shares_the_cache_for_its_price_lookup(monkeypatch):
     monkeypatch.setattr(gacha, "call", api)
     cache = {}
     gacha.draw_with_ticket("c", "u", group="grp_gacha_7", cycles=1, cache=cache)
-    assert api.count("/v12.3/gacha/info") == 1
+    assert api.count("/gacha/info") == 1

@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import gzip
-import http.client
 import io
 import json
 import os
@@ -50,58 +48,17 @@ HOST = "rangers-api.line-apps.com"
 
 
 def call(cookie, uid, path, method="GET", body=None):
-    # Reuse rangers_api's per-thread keep-alive connection (same HOST) so gacha rolls skip the
-    # TLS handshake on every call after the first, and its shared retry policy: reconnect on a
-    # dropped socket, back off (jittered) and retry on a 429/503 rate-limit/overload.
+    """(status, parsed) through rangers_api.call - its keep-alive connection, retry policy,
+    per-account pacing, lane bucket, and the App-Version/prefix client_version manages.
+
+    `path` must NOT carry the /v12.x prefix. `uid` is optional: the server derives the player
+    from LF_AC, so device sessions omit it. Before 2026-09-24 this function built its own
+    headers and loop and skipped the per-account pacer and lane bucket entirely; going through
+    rangers_api.call adds both, and the per-account HTTP 400 + errorCode 429 retry with them.
+    """
     import rangers_api
-    now = int(time.time() * 1000)
-    data = json.dumps(body).encode() if body is not None else None
-    headers = {
-        "Host": HOST,
-        "Accept": "*/*",
-        "Content-Type": "application/json; charset=utf-8;",
-        "App-Version": "LGRGS/12.3.0;android/12",
-        "User-Agent": "LGRGS/12.3.0 (Linux; U; Android 12; en-US; SM-S9110 Build/V417IR)",
-        "Accept-Language": "en",
-        "X-LINEGAME-MCC": "000",
-        "X-LINEGAME-MNC": "00",
-        "X-LINEGAME-TIMESTAMP": str(now),
-        "timeID": str(now),
-        "Cookie": cookie,
-        "Accept-Encoding": "gzip",
-        "Connection": "keep-alive",
-        **({"UID": uid} if uid else {}),   # optional: server derives player from LF_AC
-    }
-    raw = b""
-    status = 0
-    enc = None
-    for attempt in range(rangers_api.MAX_ATTEMPTS):
-        conn = rangers_api._get_conn()
-        try:
-            conn.request(method, path, body=data, headers=headers)
-            resp = conn.getresponse()
-            raw = resp.read()
-            status = resp.status
-            enc = resp.getheader("Content-Encoding")
-            retry_after = resp.getheader("Retry-After")
-        except (http.client.HTTPException, OSError):
-            rangers_api._drop_conn()
-            if attempt == rangers_api.MAX_ATTEMPTS - 1:
-                raise
-            continue               # dropped socket: reconnect and retry right away
-        if status in rangers_api.RETRY_STATUSES and attempt < rangers_api.MAX_ATTEMPTS - 1:
-            rangers_api._retry_sleep(attempt, retry_after)
-            continue               # rate-limited/overloaded: wait, then retry
-        break
-    if enc == "gzip":
-        try:
-            raw = gzip.decompress(raw)
-        except OSError:
-            pass
-    try:
-        return status, json.loads(raw)
-    except ValueError:
-        return status, raw.decode("utf-8", "replace")
+    return rangers_api.call(cookie, path, method, body,
+                            extra_headers={"UID": uid} if uid else None)
 
 
 def auth_or_die(from_device=False, device=None, cookie=None, xml=None):
@@ -126,7 +83,7 @@ def _ticket_items(cookie, uid=None):
     """The player-item response narrowed to the two gacha-ticket groups."""
     status, items = call(
         cookie, uid,
-        "/v12.3/player/item?pGacha=true&etGacha=true&battleAuto=false&battleManual=false&exp=false&evolve=false&equip=false",
+        "/player/item?pGacha=true&etGacha=true&battleAuto=false&battleManual=false&exp=false&evolve=false&equip=false",
     )
     # A rate-limited / maintenance response comes back as a non-JSON string (e.g. an HTML
     # "429 Too Many Requests" page). Indexing that as a dict raised a bare
@@ -157,7 +114,7 @@ def gacha_info(cookie, uid, cache=None):
     """
     if cache is not None and "info" in cache:
         return cache["info"]
-    _status, info = call(cookie, uid, "/v12.3/gacha/info")
+    _status, info = call(cookie, uid, "/gacha/info")
     if cache is not None:
         cache["info"] = info
     return info
@@ -195,7 +152,7 @@ def pick_ticket_group(cookie, uid=None, cache=None):
 
 
 def cmd_resources(cookie, uid):
-    _, roster = call(cookie, uid, "/v12.3/player/units/equip?inven=false&team=false&deck=false")
+    _, roster = call(cookie, uid, "/player/units/equip?inven=false&team=false&deck=false")
     player = roster["result"].get("player", {})
     ruby = roster["result"].get("rubyBalance", {}).get("total")
     print("account rsn=%s level=%s" % (player.get("rsn"), player.get("level")))
@@ -262,7 +219,7 @@ def cmd_roll(cookie, uid, group_id, index, pay_type, do_confirm, save=False):
     # reserve: side-effect free, just claims a slot
     use_ticket = pay_type == "TICKET"
     status, reserved = call(
-        cookie, uid, "/v12.3/gacha/group/reserve", "POST",
+        cookie, uid, "/gacha/group/reserve", "POST",
         {"groupId": group_id, "gachaIndex": index, "useTicket": use_ticket},
     )
     if status != 200 or not isinstance(reserved, dict) or "result" not in reserved:
@@ -276,7 +233,7 @@ def cmd_roll(cookie, uid, group_id, index, pay_type, do_confirm, save=False):
 
     # confirm: THIS SPENDS ruby/tickets and grants units
     status, result = call(
-        cookie, uid, "/v12.3/gacha/group/confirm", "POST",
+        cookie, uid, "/gacha/group/confirm", "POST",
         {"groupId": group_id, "gachaIndex": index, "reserveSeq": reserve_seq, "useTicket": use_ticket},
     )
     print("\nconfirm HTTP %s" % status)
