@@ -1,5 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_all
 
 # ===============================================
 # Enhanced Security Configuration for PyInstaller
@@ -8,28 +7,10 @@ from PyInstaller.utils.hooks import collect_dynamic_libs, collect_all
 block_cipher = None
 
 
-def _safe_collect_all(pkg):
-    """แพ็กเกจที่ไม่ได้ติดตั้งจะได้ tuple ว่างแทนที่จะทำให้ build ล้ม"""
-    try:
-        return collect_all(pkg)
-    except Exception:
-        return [], [], []
-
-
-# u2 มี asset ฝังในแพ็กเกจ (apk ของ server) ใส่แค่ hiddenimports ไม่พอ ต้อง collect datas ด้วย
-_u2_datas, _u2_bins, _u2_hidden = _safe_collect_all('uiautomator2')
-_adb_datas, _adb_bins, _adb_hidden = _safe_collect_all('adbutils')
-
 a = Analysis(
     ['main.py'],                    # entry point จริง (apply_pyarmor_patch จะ swap เป็น obfuscated)
     pathex=['.', 'dist_pyarmor'],   # ค้นหา modules จาก dist_pyarmor ด้วย
     binaries=[
-        # cv2 DLLs (collect automatically)
-        *collect_dynamic_libs('cv2'),
-        # uiautomator2 + adbutils: DLL ที่แพ็กเกจฝังมา (AdbWinApi.dll, AdbWinUsbApi.dll)
-        # adb.exe ไม่ได้อยู่ตรงนี้ — collect_all จัดมันเป็น datas ไปแล้ว
-        # u2 ตอนนี้ยัง 0 binaries แต่คง *_u2_bins ไว้ให้สมมาตร เผื่อเวอร์ชันหน้ามี native ext
-        *_u2_bins, *_adb_bins,
         # tkinter DLLs (จำเป็นสำหรับ GUI)
         (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\DLLs\_tkinter.pyd', '.'),
         (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\DLLs\tcl86t.dll', '.'),
@@ -42,14 +23,13 @@ a = Analysis(
         (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\tcl\tk8.6', 'tcl/tk8.6'),
         # customtkinter themes/fonts (ขาดแล้ว UI จะ crash)
         (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\Lib\site-packages\customtkinter', 'customtkinter'),
-        # ppadb (pure Python package)
-        (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\Lib\site-packages\ppadb', 'ppadb'),
-        # PIL/Pillow (customtkinter ต้องการ)
+        # PIL/Pillow (customtkinter ต้องการ) - tried replacing this blanket copy with the
+        # official hook-PIL.py + hiddenimports (which should be equivalent and ~16 MB
+        # smaller) while chasing the 60 MB target; it instead crashes PyInstaller itself
+        # with "re.error: invalid group reference 2" inside depend/bytecode.py's ctypes-DLL
+        # scan of main.py - a PyInstaller/Python-3.11 adaptive-bytecode bug, not a bug in
+        # this project. Reverted: a slightly bigger working build beats a smaller broken one.
         (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\Lib\site-packages\PIL', 'PIL'),
-        # pytesseract
-        (r'C:\Users\Benz\AppData\Local\Programs\Python\Python311\Lib\site-packages\pytesseract', 'pytesseract'),
-        # uiautomator2 + adbutils: resource files ที่แพ็กเกจฝังมา (apk/jar/sh)
-        *_u2_datas, *_adb_datas,
     ],
     hiddenimports=[
         # Obfuscated local modules (pathex=dist_pyarmor ทำให้ PyInstaller หาเจอ)
@@ -57,7 +37,6 @@ a = Analysis(
         'hwid',
         'protection',
         'botLineRanger',
-        'ADB',
         'pyarmor_runtime_009939',
         # GUI
         'tkinter',
@@ -69,20 +48,6 @@ a = Analysis(
         'PIL.ImageTk',
         'PIL.ImageDraw',
         'PIL.ImageFont',
-        # Android ADB
-        'ppadb',
-        'ppadb.client',
-        'ppadb.client_async',
-        'ppadb.connection',
-        'uiautomator2',
-        'adbutils',
-        *_u2_hidden, *_adb_hidden,
-        # Computer Vision / OCR
-        'cv2',
-        'numpy',
-        'numpy.core',
-        'numpy.core._multiarray_umath',
-        'pytesseract',
         # Network
         'requests',
         'requests.adapters',
@@ -91,14 +56,16 @@ a = Analysis(
         # System / Security
         'ctypes',
         'ctypes.wintypes',
-        'winreg',   # nemu_capture: หา install path ของ MuMu จาก registry
-        'atexit',   # nemu_capture: ปล่อย handle ตอนปิดโปรแกรม
+        'atexit',   # botLineRanger.py still imports this (nemu_capture, its old user, is gone - Task 11)
         'psutil',
         'cryptography',
         'cryptography.fernet',
         'cryptography.hazmat.primitives',
+        # default_backend is a function inside this package, not a submodule of its own -
+        # naming it here (pre-existing, predates Task 12) always logged a build-time
+        # "ERROR: Hidden import ... not found"; harmless (the package above already covers
+        # the real dependency) but noisy enough to look like a real failure, so it's gone.
         'cryptography.hazmat.backends',
-        'cryptography.hazmat.backends.default_backend',
         # Standard library (dynamic import ใน protection.py)
         'platform',
         'subprocess',
@@ -110,17 +77,70 @@ a = Analysis(
         'multiprocessing',
         'threading',
         'webbrowser',
+        # tools/*.py (rangers_api, relogin, rewards, device_session, account_file, ratelimit,
+        # gacha, pull_roster, stage_forge, new_account) are loose .py files copied beside the
+        # exe and imported at runtime via sys.path (see botLineRanger.py's TOOLSDIR / this
+        # spec's own datas comment) - PyInstaller's static analysis never reads their source,
+        # so it never learns what THEY import either. Verified by building: without this
+        # block, `BotLineRanger.exe --engine` dies with "ModuleNotFoundError: No module named
+        # 'concurrent'" the moment engine.flows imports relogin, which is always (every mode -
+        # flows.py imports rangers_api/relogin/rewards/device_session at module level, not
+        # lazily). Everything below is a stdlib or third-party import collected straight from
+        # tools/*.py's own `import` lines, so the frozen runtime carries it even though no
+        # bundled module visibly asks for it.
+        'concurrent',
+        'concurrent.futures',
+        'argparse',
+        'gzip',
+        'http.client',
+        'json',
+        'random',
+        'urllib.error',
+        'urllib.request',
+        'urllib.parse',
+        'glob',
+        'io',
+        're',
+        'csv',
+        'difflib',
+        'secrets',
+        'tempfile',
+        'html',
+        'shutil',
+        'os',
+        'sys',
+        'time',
+        # pycryptodome: tools/new_account.py (GenID mode, engine/flows.py:282) does
+        # `from Crypto.Cipher import AES` / `from Crypto.Util.Padding import pad`. Found by
+        # audit, not by this task's own --engine smoke test (GenID's import only runs lazily,
+        # inside that mode's function, and an empty input/ never reaches it) - confirmed
+        # missing by trying `import Crypto` under the Python 3.11 build environment directly
+        # (ModuleNotFoundError), even though it is installed under the dev Python on PATH.
+        # Installed pycryptodome 3.23.0 (matching the dev environment) into Python 3.11 so
+        # PyInstaller has something to bundle; bot/requirements.txt still does not list it
+        # for anyone re-provisioning that environment from scratch - out of this task's file
+        # list (spec/build.bat/exclude_dist.txt only), flagged in the report instead.
+        'Crypto',
+        'Crypto.Cipher',
+        'Crypto.Cipher.AES',
+        'Crypto.Util',
+        'Crypto.Util.Padding',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # ลบ modules ที่ไม่จำเป็นเพื่อลดขนาด
         'unittest',
         'pydoc',
+        # ไม่มีโหมดไหนใช้แล้วตั้งแต่ลบ ADB - ใส่ไว้กันการถูกลากเข้ามาทางอ้อม
+        'cv2', 'numpy', 'pytesseract', 'uiautomator2', 'adbutils', 'ppadb',
     ],
     noarchive=False,
-    optimize=0,  # ต้องเป็น 0 เพราะ numpy ต้องการ docstrings (add_docstring error)
+    # numpy (the original reason this was pinned to 0) is gone from the build entirely now -
+    # kept at 0 anyway because pyarmor's obfuscated runtime leans on assert/docstring tricks
+    # that -O/-OO can strip, and there is no upside left to chase since numpy is not in this
+    # bundle to begin with.
+    optimize=0,
 )
 
 # Pyarmor patch start:
@@ -184,21 +204,30 @@ pyz = PYZ(
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,      # onedir: binaries/datas ไปอยู่ใน COLLECT ไม่ใช่ในตัว exe
     name='BotLineRanger',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,  # ปิดเนื่องจาก strip ไม่มีใน Windows (ใช้ UPX แทน)
-    upx=True,     # Compress ด้วย UPX
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    strip=False,
+    upx=False,                  # onefile+UPX ต้องแตกตัวเองลง %TEMP% ทุกครั้งที่โปรเซสเริ่ม
     console=False,
-    disable_windowed_traceback=True,  # ปิด traceback เพื่อความปลอดภัย
+    disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=['src\\image\\home\\BotLineRanger_128.ico'],
+)
+
+# onedir: ไฟล์ทั้งหมดวางข้าง exe ไม่ต้องแตกบันเดิล 87 MB ลง %TEMP% ตอนสตาร์ท
+# และโปรแกรมป้องกันไวรัสไม่หวาดระแวงเท่า onefile ที่ถูกบีบด้วย UPX
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='BotLineRanger',
 )

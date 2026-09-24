@@ -1,0 +1,5 @@
+\Tesseract-OCR\
+\adb\
+\image\
+\log\
+\split-ID\

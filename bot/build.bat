@@ -77,8 +77,11 @@ echo [3.5/9] Obfuscating source code with PyArmor...
 REM ลบ output เก่าของ PyArmor
 if exist dist_pyarmor rmdir /s /q dist_pyarmor
 
+REM engine (package): tested by hand before writing this line - pyarmor gen DOES accept a
+REM package directory alongside flat scripts (verified with pyarmor 9.2.5), so engine/*.py
+REM gets obfuscated too instead of being left as plain source next to obfuscated callers.
 pyarmor gen --output dist_pyarmor ^
-    main.py botLineRanger.py config_secure.py hwid.py protection.py ADB.py nemu_capture.py
+    main.py botLineRanger.py engine_main.py config_secure.py hwid.py protection.py engine
 
 if %errorlevel% neq 0 (
     echo ERROR: PyArmor obfuscation failed!
@@ -96,9 +99,9 @@ for /f "usebackq delims=" %%m in ("exclude_modules.txt") do (
 
 echo [4/9] Building main executable with enhanced security...
 echo    - Source: PyArmor obfuscated files (dist_pyarmor\)
-echo    - Optimization level: 0 (numpy compatibility)
+echo    - Optimization level: 0 (pyarmor runtime compatibility)
 echo    - Symbol stripping: DISABLED (Windows compatibility)
-echo    - UPX compression: ENABLED
+echo    - UPX compression: DISABLED (onedir - see BotLineRanger.spec)
 echo    - Traceback: DISABLED
 echo    - Config encryption: ENABLED
 echo.
@@ -135,16 +138,7 @@ if %errorlevel% neq 0 (
 
 echo [6/9] Organizing build output...
 
-REM สร้าง main folder ถ้ายังไม่มี
-if not exist "dist\BotLineRanger" mkdir "dist\BotLineRanger"
-
-REM ย้าย BotLineRanger.exe
-if exist "dist\BotLineRanger.exe" (
-    echo    - Moving BotLineRanger.exe
-    move /Y "dist\BotLineRanger.exe" "dist\BotLineRanger\BotLineRanger.exe" >nul
-)
-
-REM ย้าย updater.exe
+REM onedir: PyInstaller วาง dist\BotLineRanger\ ให้ครบแล้ว ไม่ต้องย้าย exe เอง
 if exist "dist\updater.exe" (
     echo    - Moving updater.exe
     move /Y "dist\updater.exe" "dist\BotLineRanger\updater.exe" >nul
@@ -158,17 +152,25 @@ mkdir "dist\BotLineRanger\execute" 2>nul
 mkdir "dist\BotLineRanger\backup" 2>nul
 mkdir "dist\BotLineRanger\login failed" 2>nul
 
-REM copy src + README
-xcopy "src" "dist\BotLineRanger\src" /E /H /C /I /Y >nul
+REM copy src + README (skip Tesseract-OCR/adb/image/log/split-ID - see exclude_dist.txt;
+REM they stay in the repo, they just do not belong in a shipped build)
+xcopy "src" "dist\BotLineRanger\src" /E /H /C /I /Y /EXCLUDE:exclude_dist.txt >nul
 if exist README.md copy /Y README.md dist\BotLineRanger >nul
+
+REM exclude_dist.txt drops all of src\image\ (600+ old vision-template PNGs from the
+REM deleted OCR stack, ~8.5 MB) - but main.py:317 still does self.iconbitmap() on
+REM src\image\home\BotLineRanger_128.ico at GUI startup (try/except-guarded, so only the
+REM title-bar icon is at stake, not a crash). Copy just that 871 KB folder back so the
+REM window keeps its icon instead of silently falling back to the default Tk one.
+if exist "src\image\home" xcopy "src\image\home" "dist\BotLineRanger\src\image\home\" /E /H /C /I /Y >nul
 
 REM copy tools/ (API layer: rangers_api/rewards/gacha/device_session imported as loose .py at runtime via sys.path)
 if not exist "dist\BotLineRanger\tools" mkdir "dist\BotLineRanger\tools"
 xcopy "..\tools\*.py" "dist\BotLineRanger\tools\" /C /I /Y >nul
 
-REM clean logs and temp files
+REM clean logs and temp files (src\log is excluded above already - this is now only a
+REM backstop in case something writes into dist's own src\log before this line runs)
 if exist "dist\BotLineRanger\src\log" del /Q "dist\BotLineRanger\src\log\*" 2>nul
-if exist "dist\BotLineRanger\src\image\screen" del /Q "dist\BotLineRanger\src\image\screen\*" 2>nul
 
 REM ====================================
 REM Security: Reset sensitive config
@@ -276,8 +278,8 @@ echo  [x] Anti-debugging detection (IsDebuggerPresent, NtQuery, timing)
 echo  [x] Anti-RE tool detection (process and window scanning)
 echo  [x] Module integrity and function tamper detection
 echo  [x] Background protection guard (2-minute interval)
-echo  [x] Python bytecode optimization (level 0 - numpy compatible)
-echo  [x] UPX compression enabled
+echo  [x] Python bytecode optimization (level 0 - pyarmor runtime compatible)
+echo  [x] onedir build (no UPX, no self-extraction to %%TEMP%%)
 echo  [x] Traceback disabled
 echo  [x] Sensitive config reset
 echo  [x] Unnecessary modules excluded
