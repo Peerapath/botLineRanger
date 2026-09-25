@@ -44,11 +44,11 @@ class _GaugedQuota:
 
     def acquire(self) -> None:
         self._lane._check_stop()
-        self._lane._wait_begin()
+        self._lane._wait_begin(quota=True)
         try:
             self._quota.acquire()
         finally:
-            self._lane._wait_end()
+            self._lane._wait_end(quota=True)
         self._lane._check_stop()   # รอโควตาได้ถึงนาที - ห้าม mint ต่อถ้าระหว่างนั้นถูกสั่งหยุด
 
     def __getattr__(self, name):
@@ -90,19 +90,31 @@ class ProxyLane:
         self._lock = threading.Lock()
         self.auth_quota = _GaugedQuota(ratelimit.InMemoryQuota(limit, window, **kw), self)
         self._fails = 0
-        # ตัวนับให้ autoscaler: เธรดที่ยืนรอถัง/โควตาอยู่ตอนนี้, request ที่ได้โทเคนแล้ว (สะสม),
-        # การถูกตีกลับสะสม = 429/503 จากเซิร์ฟเวอร์ + ต่อไม่ติด/หลุดซ้ำ (note_fail)
+        # ตัวนับให้ autoscaler (ดู signals()): เธรดที่ยืนรอถัง/โควตาอยู่ตอนนี้ แยกสองแบบ เพราะรอถัง
+        # แก้ได้ด้วยการขยายงบ req/s แต่รอโควตา mint แก้ไม่ได้, request ที่ได้โทเคนแล้ว (สะสม),
+        # 429/503 จากเซิร์ฟเวอร์ (สะสม), ต่อไม่ติด/หลุดซ้ำ (สะสม)
         self._waiting = 0
+        self._waiting_quota = 0
         self._sent = 0
         self._limited = 0
+        self._neterr = 0
 
-    def _wait_begin(self) -> None:
+    def _wait_begin(self, quota: bool = False) -> None:
         with self._lock:
             self._waiting += 1
+            if quota:
+                self._waiting_quota += 1
 
-    def _wait_end(self) -> None:
+    def _wait_end(self, quota: bool = False) -> None:
         with self._lock:
             self._waiting -= 1
+            if quota:
+                self._waiting_quota -= 1
+
+    def set_rps(self, rps: float) -> None:
+        """งบ req/s ของ lane นี้ - autoscaler ขยายตอนเธรดยืนรอถังและเซิร์ฟเวอร์ยังไม่ตีกลับ หดตอนเจอ 429"""
+        self.rps = float(rps)
+        self.bucket.set_rate(self.rps)
 
     def stop(self) -> None:
         self.stopping = True
@@ -140,7 +152,15 @@ class ProxyLane:
     def counters(self) -> tuple[int, int, int]:
         """(เธรดที่รอถัง/โควตาอยู่ตอนนี้, request สะสม, ถูกตีกลับสะสม: 429/503 + ต่อไม่ติด)"""
         with self._lock:
-            return self._waiting, self._sent, self._limited
+            return self._waiting, self._sent, self._limited + self._neterr
+
+    def signals(self) -> dict:
+        """ทุกอย่างที่ autoscaler อ่าน: wait_bucket/wait_quota = เธรดที่ยืนรออยู่ตอนนี้,
+        sent/limited/neterr = ตัวนับสะสม (request ที่ส่ง, 429/503, ต่อไม่ติดหรือหลุดซ้ำ)"""
+        with self._lock:
+            return {"wait_bucket": self._waiting - self._waiting_quota,
+                    "wait_quota": self._waiting_quota, "sent": self._sent,
+                    "limited": self._limited, "neterr": self._neterr}
 
     def enter(self) -> None:
         with self._lock:
@@ -169,12 +189,12 @@ class ProxyLane:
     def note_fail(self) -> bool:
         """คืน True เฉพาะครั้งที่ทำให้ lane ตาย ผู้เรียกจะได้รายงานครั้งเดียว ไม่ใช่ทุกครั้ง
 
-        ต่อไม่ติดซ้ำ ๆ ยังเป็นสัญญาณให้ autoscaler ถอยเธรดด้วย (นับรวมกับ 429/503) - เธรดมากไป
+        ต่อไม่ติดซ้ำ ๆ ยังเป็นสัญญาณให้ autoscaler ถอยเธรดด้วย (signals()["neterr"]) - เธรดมากไป
         จนเซิร์ฟเวอร์/เน็ตรับไม่ไหวแสดงออกมาเป็น timeout และสายหลุด ไม่ใช่ 429 เสมอไป
         """
         with self._lock:
             self._fails += 1
-            self._limited += 1
+            self._neterr += 1
             if self.direct or not self.alive or self._fails < LANE_DEATH:
                 return False
             if self._last_ok is not None and self._clock() - self._last_ok < LANE_DEATH_SECONDS:

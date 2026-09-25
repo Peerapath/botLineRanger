@@ -26,7 +26,7 @@ import client_version  # noqa: E402
 BOOLS = ("gacharanger", "genidlevel3", "stopwhenfound", "useruby", "newbiequest", "autothreads")
 INTS = ("leveltarget", "stageend", "rewardpasses", "threadsperproxy", "maxthreads",
         "gachacycles", "threadcount")
-FLOATS = ("stagedelay",)
+FLOATS = ("stagedelay", "apirpsmax")
 
 # C4 (final review): "useruby" used to be missing from BOOLS. cfg["useruby"] then stayed the
 # raw ini STRING "False" all the way to flows.py's bool(cfg.get("useruby", False)) -  and
@@ -258,7 +258,10 @@ def main(argv):
     report_stream = sys.stdout
     if report_stream is not None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
-    reporter = Reporter(report_stream)
+    # engine-stats.jsonl: ยอด/สถานะ autoscaler ทุก 2 วิของรันล่าสุด (เขียนทับทุกรัน) ไว้ย้อนดูตอนจูน
+    os.makedirs(os.path.join(root, "src", "log"), exist_ok=True)
+    reporter = Reporter(report_stream,
+                        log_path=os.path.join(root, "src", "log", "engine-stats.jsonl"))
     setup_client_version(root, reporter)
 
     queue = WorkQueue(root, os.path.join(root, "src", "log", "run.jsonl"))

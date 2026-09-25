@@ -212,3 +212,32 @@ def test_connection_failures_count_as_pushback_for_the_autoscaler():
     lane.note_limited()
     assert lane.counters()[2] == 2
     assert lane.alive
+
+
+
+def test_signals_keep_bucket_waits_apart_from_mint_quota_waits(monkeypatch):
+    """รอถังแก้ได้ด้วยการขยายงบ req/s แต่รอโควตา mint แก้ไม่ได้ - autoscaler ต้องแยกสองอย่างนี้ออก"""
+    monkeypatch.setattr(ratelimit, "AUTH_QUOTA", "1/60")
+    clock = _FakeClock()
+    seen = []
+    lane = None
+
+    def sleep(seconds):
+        sig = lane.signals()
+        seen.append((sig["wait_bucket"], sig["wait_quota"]))
+        clock.advance(seconds)
+
+    lane = ProxyLane("direct", None, rps=1000, threads=8, clock=clock, sleep=sleep, direct=True)
+    lane.auth_quota.acquire()
+    lane.auth_quota.acquire()        # รอโควตา
+    assert seen and seen[0] == (0, 1)
+    lane.note_limited()
+    lane.note_fail()
+    sig = lane.signals()
+    assert (sig["limited"], sig["neterr"], sig["wait_bucket"], sig["wait_quota"]) == (1, 1, 0, 0)
+
+
+def test_set_rps_retunes_the_lanes_own_bucket():
+    lane = ProxyLane("direct", None, rps=80, threads=8, direct=True)
+    lane.set_rps(120)
+    assert lane.rps == 120 and lane.bucket.rate == 120

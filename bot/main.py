@@ -1364,8 +1364,9 @@ class EmulatorManager(ctk.CTk):
     }
     # สถานะของ autoscaler (bot/engine/autoscale.py) -> ข้อความสั้น ๆ ข้างเลขเธรด
     SCALE_LABELS = {
-        "grow": "กำลังเพิ่ม", "full": "เต็มเพดาน IP", "plateau": "เพิ่มแล้วไม่เร็วขึ้น",
-        "backoff": "โดน 429 ถอย", "max": "สูงสุดแล้ว",
+        "grow": "กำลังเพิ่ม", "full": "เต็มเพดาน", "plateau": "เพิ่มแล้วไม่เร็วขึ้น",
+        "backoff": "ต่อไม่ติด ถอยเธรด", "max": "สูงสุดแล้ว",
+        "raise": "ขยายงบ req/s", "cut": "โดน 429 ลดงบ req/s",
     }
 
     def _build_thread_panel(self):
@@ -1814,6 +1815,9 @@ class EmulatorManager(ctk.CTk):
             text = "⏹ กำลังหยุด… · " + " · ".join(parts)
         else:
             parts.append("%s ไอดี/นาที" % row.get("rpm", round(float(row.get("rate") or 0) * 60, 1)))
+            if row.get("reqs") is not None:
+                # ยิงจริง / งบที่ autoscaler ให้ตอนนี้ - ห่างกันมาก = เธรดยังไม่พอใช้งบ
+                parts.append("%s/%s req/s" % (int(round(row["reqs"])), row.get("rps", "-")))
             if (row.get("lanes") or 1) > 1:
                 parts.append("proxy %s" % row["lanes"])
             text = " · ".join(parts)

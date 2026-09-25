@@ -158,6 +158,20 @@ class TokenBucket:
         self._tokens = float(self.burst)
         self._stamp = clock()
 
+    def set_rate(self, rate: float) -> None:
+        """เปลี่ยนงบ req/s ระหว่างรัน (autoscaler ของ engine ขยับตาม 429 ที่เซิร์ฟเวอร์ตอบ)
+
+        เติมโทเคนที่สะสมถึงตอนนี้ด้วยอัตราเดิมก่อน แล้วค่อยสลับ ไม่งั้นช่วงที่ผ่านมาจะถูกคิดด้วยอัตราใหม่
+        ย้อนหลัง เธรดที่กำลังหลับรอโทเคนอยู่ตื่นมาคำนวณใหม่ด้วยอัตราใหม่เองในรอบถัดไปของ acquire()
+        """
+        with self._lock:
+            if not self._disabled:
+                now = self._clock()
+                self._tokens = min(float(self.burst), self._tokens + (now - self._stamp) * self.rate)
+                self._stamp = now
+            self.rate = float(rate)
+            self._disabled = self.rate <= 0
+
     def acquire(self) -> None:
         """รอจนถึงคิวของตัวเองแล้วหักหนึ่งโทเคน
 

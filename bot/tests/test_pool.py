@@ -417,7 +417,7 @@ def test_active_rows_show_each_in_flight_account_and_end_empty(tmp_path, monkeyp
                for row in live)
     assert active[-1]["rows"] == []
     stat = [r for r in got if r["t"] == "stat" and not r.get("final")]
-    assert stat and {"rpm", "target", "auto", "scale", "threads"} <= set(stat[-1])
+    assert stat and {"rpm", "target", "auto", "scale", "threads", "rps", "reqs"} <= set(stat[-1])
 
 
 def test_auto_threads_start_where_each_mode_is_expected_to_need_them(tmp_path):
@@ -573,3 +573,16 @@ def test_an_account_waiting_to_retry_wakes_up_on_stop_instead_of_sleeping_it_out
     assert time.time() - began < 2
     assert summary["stopped"] == 1
     assert os.listdir(tmp_path / "input") == ["000.xml"]
+
+
+def test_stat_lane_and_note_rows_are_also_kept_on_disk_for_tuning(tmp_path):
+    """GUI ไม่เก็บอะไรลงดิสก์ - ยอดและสถานะ autoscaler ของรันที่แล้วต้องย้อนดูได้จากไฟล์"""
+    log = tmp_path / "engine-stats.jsonl"
+    r = Reporter(io.StringIO(), log_path=str(log))
+    r.stat(done=1, rps=80)
+    r.account(status="OK")
+    r.active(rows=[])
+    r.note("hello")
+    kept = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    assert [x["t"] for x in kept] == ["stat", "note"]
+    assert all("ts" in x for x in kept)

@@ -360,13 +360,16 @@ class EnginePool:
 
         threads: list[threading.Thread] = []
         self._fill(threads)
+        # apirpsmax: เพดานที่ autoscaler ขยายงบ req/s ไปได้ (ใส่เท่ากับ apirps = งบคงที่แบบเดิม)
         scaler = (autoscale.AutoScaler(self.pool.lanes, lane_max=self._lane_max,
                                        total_max=int(self.cfg.get("maxthreads") or 4096),
-                                       now=started)
+                                       now=started,
+                                       rps_max=float(self.cfg.get("apirpsmax") or autoscale.RPS_MAX))
                   if self._auto else None)
 
         announced = set()
         last_stat = 0.0
+        sent_mark = (started, 0)   # (เวลา, request สะสมทุก lane) ตอน stat ก่อน - ไว้คิด req/s จริง
         last_active = 0.0
         last_retry = time.time()
         down_since = None          # เวลาที่ proxy ล่มครบทุกตัว (None = ยังมี lane ที่ใช้ได้)
@@ -435,6 +438,9 @@ class EnginePool:
                 while len(done_hist) > 2 and now - done_hist[1][0] >= RPM_WINDOW:
                     done_hist.popleft()
                 t0, d0 = done_hist[0]
+                sent_total = sum(x.signals()["sent"] for x in self.pool.lanes)
+                reqs = (sent_total - sent_mark[1]) / max(0.001, now - sent_mark[0])
+                sent_mark = (now, sent_total)
                 self.reporter.stat(done=done, fail=fail, stuck=stuck,
                                    left=self.queue.remaining(),
                                    rate=round(done / elapsed, 2),
@@ -443,6 +449,8 @@ class EnginePool:
                                    target=sum(x.threads for x in alive),
                                    auto=self._auto,
                                    scale=scaler.summary() if scaler is not None else "",
+                                   rps=round(sum(x.rps for x in alive)),     # งบ req/s ตอนนี้
+                                   reqs=round(reqs, 1),                        # ยิงจริง req/s
                                    lanes=len(alive))
 
             if (self._stop.is_set() and self._stop_at is not None

@@ -565,3 +565,21 @@ def test_proxy_url_from_parts_round_trips_credentials_through_proxy_parts():
     this must recover the same URL proxy_url() would have built from the original string."""
     parts = ratelimit.proxy_parts("10.0.0.1:8080:bob:hunter2")
     assert ratelimit.proxy_url_from_parts(parts) == ratelimit.proxy_url("10.0.0.1:8080:bob:hunter2")
+
+
+def test_token_bucket_rate_can_change_mid_run_without_rewriting_the_past():
+    """autoscaler ขยาย/หดงบ req/s ระหว่างรัน: โทเคนที่สะสมไว้ก่อนเปลี่ยนต้องคิดด้วยอัตราเดิม"""
+    clock, waits = _FakeClock(), []
+    # เลขเลือกให้ลงตัวในเลขฐานสอง: นาฬิกาปลอมเดินเท่าที่ถูกสั่งพอดี เศษทศนิยมเล็ก ๆ จาก 0.05*10
+    # จะค้าง acquire() ไว้กับการรอ 1e-18 วิที่ไม่ขยับนาฬิกาเลย (นาฬิกาจริงเดินเองจึงไม่เป็นปัญหา)
+    b = ratelimit.TokenBucket(rate=4, burst=1, clock=clock, sleep=lambda s: (waits.append(s), clock.advance(s)))
+    b.acquire()                       # ถังว่าง
+    clock.advance(0.125)              # สะสมได้ครึ่งโทเคนที่ 4 req/s
+    b.set_rate(16)
+    b.acquire()                       # อีกครึ่งโทเคนที่ 16 req/s = 1/32 วิ
+    assert sum(waits) == 0.03125
+    b.set_rate(0)                     # 0 = ปิดถัง ไม่รออีกเลย
+    waits.clear()
+    for _ in range(5):
+        b.acquire()
+    assert waits == []

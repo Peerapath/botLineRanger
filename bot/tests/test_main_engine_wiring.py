@@ -808,3 +808,14 @@ def test_pressing_stop_turns_every_row_status_to_stopped_at_once(tmp_path):
     # แถว active ที่ engine ยังส่งมาระหว่างปิดตัวต้องไม่พลิกกลับเป็นขั้นเดิม
     main.EmulatorManager._dispatch_engine_row(gui, {"t": "active", "rows": rows[:1]})
     assert list(gui._active_tree.rows) == ["1"] and gui._active_tree.rows["1"][0][1] == "หยุด"
+
+
+
+def test_stats_line_shows_requests_sent_against_the_budget():
+    gui = _make_fake_gui()
+    main.EmulatorManager._updateEngineStats(gui, {
+        "t": "stat", "done": 10, "fail": 0, "stuck": 0, "left": 5, "rate": 4.0, "rpm": 250.0,
+        "threads": 108, "target": 108, "auto": True, "scale": "raise", "rps": 92, "reqs": 91.6,
+        "lanes": 1})
+    assert "92/92 req/s" in gui.worker_summary_label.texts[-1]
+    assert gui._scale_label.texts[-1] == "auto · ขยายงบ req/s"
